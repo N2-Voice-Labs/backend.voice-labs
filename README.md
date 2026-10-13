@@ -26,6 +26,20 @@ uv run --directory runtime --locked --extra voice --extra test pytest -q
 uv run --directory evals --locked --extra test pytest -q
 ```
 
+For deterministic cross-service acceptance, start the stack's local LiveKit service
+and run this from the backend workspace using the local development credentials shown
+in `stack.voice-labs/.env.example`:
+
+```sh
+LIVEKIT_URL=ws://localhost:7880 LIVEKIT_API_KEY=devkey LIVEKIT_API_SECRET=secret \
+  uv run --directory runtime --locked --extra voice --extra test pytest -q \
+  ../../stack.voice-labs/tests
+```
+
+This exercises synthetic media and stubbed speech providers; it does not verify
+provider-backed STT/LLM/TTS. The real-provider acceptance test is opt-in and requires
+the documented credentials and a consented audio fixture.
+
 Run Platform migrations only with a disposable/local database configured through the
 Platform settings:
 
