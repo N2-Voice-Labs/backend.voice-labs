@@ -20,6 +20,9 @@ RuntimeEventType = Literal[
     "SessionFailed",
     "RuntimeFailed",
     "RuntimeStarted",
+    "ToolCalled",
+    "HandoffRequested",
+    "OutcomeRecorded",
 ]
 
 

@@ -17,13 +17,17 @@ from .db import Base, engine, get_db
 from .models import Agent as AgentRecord
 from .models import (
     Conversation,
+    Deployment,
     Message,
     ProviderConfig,
     RuntimeEvent,
+    Voice,
     VoiceSession,
     utcnow,
 )
+from . import analytics, campaigns, deployments, knowledge, templates, tools, voices
 from .livekit import create_participant_token
+from .validation import OUTCOMES, reject_secret_configuration
 
 
 @asynccontextmanager
@@ -41,10 +45,30 @@ RUNTIME_PROVIDER_SETTINGS = {
 }
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[os.getenv("PLATFORM_WEB_ORIGIN", "http://localhost:3000")],
-    allow_methods=["GET", "POST", "PATCH", "DELETE"],
+    allow_origins=[
+        origin.strip()
+        for origin in os.getenv("PLATFORM_WEB_ORIGIN", "http://localhost:3000").split(",")
+        if origin.strip()
+    ],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
     allow_headers=["content-type", "x-runtime-token"],
+    # Opt-in for a hosted web origin calling a Platform on the viewer's localhost.
+    **(
+        {"allow_private_network": True}
+        if os.getenv("PLATFORM_ALLOW_PRIVATE_NETWORK") == "1"
+        else {}
+    ),
 )
+for router in (
+    analytics.router,
+    voices.router,
+    deployments.router,
+    campaigns.router,
+    tools.router,
+    knowledge.router,
+    templates.router,
+):
+    app.include_router(router)
 
 
 class AgentIn(BaseModel):
@@ -56,6 +80,7 @@ class AgentIn(BaseModel):
     llm_provider_id: UUID | None = None
     tts_provider_id: UUID | None = None
     voice_id: str | None = None
+    voice_profile_id: UUID | None = None
     status: str = "enabled"
 
 
@@ -75,6 +100,7 @@ class AgentPatch(BaseModel):
     llm_provider_id: UUID | None = None
     tts_provider_id: UUID | None = None
     voice_id: str | None = None
+    voice_profile_id: UUID | None = None
     status: str | None = None
 
     @field_validator("name", "enabled_languages", "status", mode="before")
@@ -95,24 +121,7 @@ class ProviderIn(BaseModel):
     @field_validator("configuration")
     @classmethod
     def reject_secret_values(cls, value: dict[str, Any]) -> dict[str, Any]:
-        secret_names = ("secret", "password", "token", "api_key", "apikey")
-
-        def contains_secret_key(candidate: Any) -> bool:
-            if isinstance(candidate, dict):
-                return any(
-                    any(part in key.casefold() for part in secret_names)
-                    or contains_secret_key(nested)
-                    for key, nested in candidate.items()
-                )
-            if isinstance(candidate, list):
-                return any(contains_secret_key(item) for item in candidate)
-            return False
-
-        if contains_secret_key(value):
-            raise ValueError(
-                "provider secrets must use secret_reference, not configuration"
-            )
-        return value
+        return reject_secret_configuration(value)
 
 
 class Provider(BaseModel):
@@ -127,6 +136,14 @@ class Provider(BaseModel):
 
 class SessionIn(BaseModel):
     agent_id: UUID
+    deployment_id: UUID | None = None
+
+
+class OutcomeIn(BaseModel):
+    outcome: str
+    summary: str | None = None
+    intent: str | None = Field(default=None, max_length=200)
+    actions: list[dict[str, Any]] | None = None
 
 
 def agent_response(agent: AgentRecord) -> Agent:
@@ -148,6 +165,12 @@ def provider_ids_for_agent(values: dict[str, Any], db: Session) -> dict[str, Any
         if provider is None or provider.kind != kind or not provider.enabled:
             raise HTTPException(status_code=422, detail=f"invalid_{field}")
         values[field] = str(provider_id)
+    voice_profile_id = values.get("voice_profile_id")
+    if voice_profile_id is not None:
+        voice = db.get(Voice, str(voice_profile_id))
+        if voice is None or voice.status == "disabled":
+            raise HTTPException(status_code=422, detail="invalid_voice_profile_id")
+        values["voice_profile_id"] = str(voice_profile_id)
     return values
 
 
@@ -225,10 +248,25 @@ async def create_session(
     agent = db.get(AgentRecord, str(payload.agent_id))
     if agent is None or agent.status != "enabled":
         raise HTTPException(status_code=409, detail="agent_not_enabled")
+    deployment = None
+    if payload.deployment_id is not None:
+        deployment = db.get(Deployment, str(payload.deployment_id))
+        if deployment is None:
+            raise HTTPException(status_code=404, detail="deployment_not_found")
+        if deployment.status != "active":
+            raise HTTPException(status_code=409, detail="deployment_not_active")
+        if deployment.agent_id != agent.id:
+            raise HTTPException(status_code=409, detail="deployment_agent_mismatch")
     runtime_url = os.getenv("RUNTIME_API_URL")
     runtime_token = os.getenv("PLATFORM_RUNTIME_TOKEN", "")
     if runtime_url and not runtime_token:
         raise HTTPException(status_code=503, detail="runtime_auth_not_configured")
+    runtime_voice_id = agent.voice_id
+    if agent.voice_profile_id:
+        voice = db.get(Voice, agent.voice_profile_id)
+        if voice is None or voice.status != "ready" or not voice.provider_voice_id:
+            raise HTTPException(status_code=409, detail="selected_voice_unavailable")
+        runtime_voice_id = voice.provider_voice_id
     providers = {}
     provider_settings = {}
     for kind in ("stt", "llm", "tts"):
@@ -248,7 +286,11 @@ async def create_session(
             if settings:
                 provider_settings[kind] = settings
 
-    conversation = Conversation(agent_id=agent.id)
+    conversation = Conversation(
+        agent_id=agent.id,
+        deployment_id=deployment.id if deployment else None,
+        channel=deployment.channel if deployment else "web",
+    )
     db.add(conversation)
     db.flush()
     session_id = str(uuid4())
@@ -271,7 +313,7 @@ async def create_session(
         "agent_id": agent.id,
         "room_name": session.room_name,
         "system_prompt": agent.system_prompt,
-        "voice_id": agent.voice_id,
+        "voice_id": runtime_voice_id,
     }
     if providers:
         request_payload["providers"] = providers
@@ -351,8 +393,26 @@ async def create_session(
 
 
 @app.get("/conversations")
-async def list_conversations(db: Session = Depends(get_db)) -> list[dict[str, Any]]:
-    return [conversation_dict(item) for item in db.query(Conversation).all()]
+async def list_conversations(
+    agent_id: UUID | None = None,
+    status: str | None = None,
+    outcome: str | None = None,
+    channel: str | None = None,
+    db: Session = Depends(get_db),
+) -> list[dict[str, Any]]:
+    query = db.query(Conversation)
+    if agent_id is not None:
+        query = query.filter(Conversation.agent_id == str(agent_id))
+    if status is not None:
+        query = query.filter(Conversation.status == status)
+    if outcome is not None:
+        query = query.filter(Conversation.outcome == outcome)
+    if channel is not None:
+        query = query.filter(Conversation.channel == channel)
+    return [
+        conversation_dict(item)
+        for item in query.order_by(Conversation.started_at.desc()).all()
+    ]
 
 
 @app.get("/voice/sessions/{session_id}")
@@ -508,7 +568,48 @@ def conversation_dict(conversation: Conversation) -> dict[str, Any]:
         "started_at": conversation.started_at,
         "ended_at": conversation.ended_at,
         "metadata": conversation.metadata_json,
+        "deployment_id": conversation.deployment_id,
+        "channel": conversation.channel,
+        "outcome": conversation.outcome,
+        "summary": conversation.summary,
+        "intent": conversation.intent,
+        "actions": conversation.actions or [],
+        "outcome_recorded_at": conversation.outcome_recorded_at,
     }
+
+
+def apply_outcome(
+    conversation: Conversation,
+    outcome: str,
+    summary: str | None = None,
+    intent: str | None = None,
+    actions: list[dict[str, Any]] | None = None,
+) -> None:
+    conversation.outcome = outcome
+    if summary is not None:
+        conversation.summary = summary
+    if intent is not None:
+        conversation.intent = intent
+    if actions is not None:
+        conversation.actions = list(actions)
+    conversation.outcome_recorded_at = utcnow()
+
+
+@app.put("/conversations/{conversation_id}/outcome")
+async def put_conversation_outcome(
+    conversation_id: UUID, payload: OutcomeIn, db: Session = Depends(get_db)
+) -> dict[str, Any]:
+    if payload.outcome not in OUTCOMES:
+        raise HTTPException(status_code=422, detail="invalid_outcome")
+    record = db.get(Conversation, str(conversation_id))
+    if record is None:
+        raise HTTPException(status_code=404, detail="conversation_not_found")
+    apply_outcome(
+        record, payload.outcome, payload.summary, payload.intent, payload.actions
+    )
+    db.commit()
+    db.refresh(record)
+    return conversation_dict(record)
 
 
 @app.get("/conversations/{conversation_id}")
@@ -550,6 +651,9 @@ async def get_conversation_runtime_state(
                     "SessionEnded",
                     "SessionFailed",
                     "RuntimeFailed",
+                    "ToolCalled",
+                    "HandoffRequested",
+                    "OutcomeRecorded",
                 }
             ),
         )
@@ -595,6 +699,39 @@ async def get_messages(
     ]
 
 
+def validate_action_event_payload(event_type: str, payload: dict[str, Any]) -> None:
+    def optional_str(key: str, detail: str, max_length: int | None = None) -> None:
+        value = payload.get(key)
+        if value is not None and (
+            not isinstance(value, str) or (max_length and len(value) > max_length)
+        ):
+            raise HTTPException(status_code=422, detail=detail)
+
+    if event_type == "ToolCalled":
+        name = payload.get("tool_name")
+        if not isinstance(name, str) or not name.strip():
+            raise HTTPException(status_code=422, detail="invalid_tool_event")
+        arguments = payload.get("arguments")
+        if arguments is not None and not isinstance(arguments, dict):
+            raise HTTPException(status_code=422, detail="invalid_tool_event")
+        optional_str("status", "invalid_tool_event")
+        optional_str("error", "invalid_tool_event")
+    elif event_type == "HandoffRequested":
+        optional_str("reason", "invalid_handoff_event")
+        optional_str("target", "invalid_handoff_event")
+    elif event_type == "OutcomeRecorded":
+        if payload.get("outcome") not in OUTCOMES:
+            raise HTTPException(status_code=422, detail="invalid_outcome")
+        optional_str("summary", "invalid_outcome_event")
+        optional_str("intent", "invalid_outcome_event", 200)
+        actions = payload.get("actions")
+        if actions is not None and (
+            not isinstance(actions, list)
+            or not all(isinstance(item, dict) for item in actions)
+        ):
+            raise HTTPException(status_code=422, detail="invalid_outcome_event")
+
+
 @app.post("/runtime/events", status_code=status.HTTP_202_ACCEPTED)
 async def ingest_runtime_event(
     event: dict[str, Any],
@@ -619,6 +756,9 @@ async def ingest_runtime_event(
         "SessionFailed",
         "RuntimeFailed",
         "RuntimeStarted",
+        "ToolCalled",
+        "HandoffRequested",
+        "OutcomeRecorded",
     }:
         raise HTTPException(status_code=422, detail="unsupported_runtime_event_type")
     schema_version = event.get("schema_version", 1)
@@ -657,6 +797,7 @@ async def ingest_runtime_event(
             isinstance(language, str) for language in detected_languages
         ):
             raise HTTPException(status_code=422, detail="invalid_detected_languages")
+    validate_action_event_payload(event["event_type"], payload)
     if db.query(RuntimeEvent).filter(RuntimeEvent.event_id == event_id).first():
         return {"status": "duplicate"}
     session_id = event_identity["session_id"]
@@ -697,6 +838,25 @@ async def ingest_runtime_event(
             )
         )
     event_type = event.get("event_type")
+    if event_type == "HandoffRequested":
+        conversation.outcome = "escalated"
+        conversation.outcome_recorded_at = utcnow()
+        conversation.actions = [
+            *(conversation.actions or []),
+            {
+                "type": "handoff_requested",
+                "reason": payload.get("reason"),
+                "target": payload.get("target"),
+            },
+        ]
+    elif event_type == "OutcomeRecorded":
+        apply_outcome(
+            conversation,
+            payload["outcome"],
+            payload.get("summary"),
+            payload.get("intent"),
+            payload.get("actions"),
+        )
     if (
         session
         and event_type == "RuntimeStarted"
