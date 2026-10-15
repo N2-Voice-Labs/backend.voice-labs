@@ -47,6 +47,8 @@ class Agent(Base):
     voice_profile_id: Mapped[str | None] = mapped_column(
         ForeignKey("voices.id"), nullable=True
     )
+    mode: Mapped[str] = mapped_column(String(20), default="agent", server_default="agent")
+    interpreter: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     status: Mapped[str] = mapped_column(String(30), default="enabled")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow

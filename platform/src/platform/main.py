@@ -9,7 +9,7 @@ from uuid import UUID, uuid4
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -31,7 +31,12 @@ from .models import (
 )
 from . import analytics, campaigns, deployments, knowledge, templates, tools, voices
 from .livekit import create_participant_token
-from .validation import OUTCOMES, reject_secret_configuration
+from .validation import (
+    OUTCOMES,
+    AUTO_DIRECTION_LANGUAGES,
+    INTERPRETER_LANGUAGES,
+    reject_secret_configuration,
+)
 
 
 @asynccontextmanager
@@ -75,6 +80,41 @@ for router in (
     app.include_router(router)
 
 
+class InterpreterConfig(BaseModel):
+    languages: list[str]
+    direction: str = "auto"
+
+    @field_validator("languages", mode="before")
+    @classmethod
+    def validate_languages(cls, value: list[str]) -> list[str]:
+        if not isinstance(value, list):
+            raise ValueError("languages must be a list")
+        if len(value) != 2 or len(set(value)) != 2:
+            raise ValueError("languages must contain exactly 2 distinct items")
+        for lang in value:
+            if lang not in INTERPRETER_LANGUAGES:
+                raise ValueError(f"unknown language: {lang}")
+        return [lang.lower() for lang in value]
+
+    @field_validator("direction", mode="before")
+    @classmethod
+    def validate_direction(cls, value: str) -> str:
+        if value not in ("auto", "one_way"):
+            raise ValueError("direction must be 'auto' or 'one_way'")
+        return value
+
+    @field_validator("direction", mode="after")
+    @classmethod
+    def validate_auto_direction_languages(cls, value: str, info) -> str:
+        if value == "auto" and "languages" in info.data:
+            languages = info.data["languages"]
+            if not all(lang in AUTO_DIRECTION_LANGUAGES for lang in languages):
+                raise ValueError(
+                    "auto direction requires both languages in Deepgram's code-switching set"
+                )
+        return value
+
+
 class AgentIn(BaseModel):
     name: str = Field(min_length=1)
     description: str = ""
@@ -85,7 +125,24 @@ class AgentIn(BaseModel):
     tts_provider_id: UUID | None = None
     voice_id: str | None = None
     voice_profile_id: UUID | None = None
+    mode: str = "agent"
+    interpreter: InterpreterConfig | None = None
     status: str = "enabled"
+
+    @field_validator("mode", mode="before")
+    @classmethod
+    def validate_mode(cls, value: str) -> str:
+        if value not in ("agent", "interpreter"):
+            raise ValueError("mode must be 'agent' or 'interpreter'")
+        return value
+
+    @model_validator(mode="after")
+    def validate_interpreter_config_required(self) -> "AgentIn":
+        if self.mode == "interpreter" and self.interpreter is None:
+            raise ValueError("interpreter_config_required")
+        if self.mode == "agent" and self.interpreter is not None:
+            raise ValueError("interpreter_config_not_allowed")
+        return self
 
 
 class Agent(AgentIn):
@@ -105,6 +162,8 @@ class AgentPatch(BaseModel):
     tts_provider_id: UUID | None = None
     voice_id: str | None = None
     voice_profile_id: UUID | None = None
+    mode: str | None = None
+    interpreter: InterpreterConfig | None = None
     status: str | None = None
 
     @field_validator("name", "enabled_languages", "status", mode="before")
@@ -112,6 +171,13 @@ class AgentPatch(BaseModel):
     def reject_null_for_required_fields(cls, value: Any) -> Any:
         if value is None:
             raise ValueError("field cannot be null")
+        return value
+
+    @field_validator("mode", mode="before")
+    @classmethod
+    def validate_mode(cls, value: str | None) -> str | None:
+        if value is not None and value not in ("agent", "interpreter"):
+            raise ValueError("mode must be 'agent' or 'interpreter'")
         return value
 
 
@@ -175,6 +241,12 @@ def provider_ids_for_agent(values: dict[str, Any], db: Session) -> dict[str, Any
         if voice is None or voice.status == "disabled":
             raise HTTPException(status_code=422, detail="invalid_voice_profile_id")
         values["voice_profile_id"] = str(voice_profile_id)
+
+    # Convert interpreter config to dict if present
+    interpreter = values.get("interpreter")
+    if interpreter is not None and isinstance(interpreter, InterpreterConfig):
+        values["interpreter"] = interpreter.model_dump()
+
     return values
 
 
@@ -185,7 +257,8 @@ async def health() -> dict[str, str]:
 
 @app.post("/agents", response_model=Agent, status_code=status.HTTP_201_CREATED)
 async def create_agent(payload: AgentIn, db: Session = Depends(get_db)) -> Agent:
-    record = AgentRecord(**provider_ids_for_agent(payload.model_dump(), db))
+    data = provider_ids_for_agent(payload.model_dump(), db)
+    record = AgentRecord(**data)
     db.add(record)
     db.commit()
     db.refresh(record)
@@ -212,7 +285,18 @@ async def update_agent(
     record = db.get(AgentRecord, str(agent_id))
     if record is None:
         raise HTTPException(status_code=404, detail="agent_not_found")
+
     changes = provider_ids_for_agent(payload.model_dump(exclude_unset=True), db)
+
+    # Validate merged state for mode/interpreter
+    current_mode = changes.get("mode", record.mode)
+    current_interpreter = changes.get("interpreter", record.interpreter)
+
+    if current_mode == "interpreter" and current_interpreter is None:
+        raise HTTPException(status_code=422, detail="interpreter_config_required")
+    if current_mode == "agent" and current_interpreter is not None:
+        raise HTTPException(status_code=422, detail="interpreter_config_not_allowed")
+
     for key, value in changes.items():
         setattr(record, key, value)
     db.commit()
@@ -356,6 +440,8 @@ async def create_session(
         "room_name": session.room_name,
         "system_prompt": agent.system_prompt,
         "voice_id": runtime_voice_id,
+        "mode": agent.mode,
+        "interpreter": agent.interpreter,
         "tools": runtime_tools_for_agent(agent.id, db),
         "knowledge_enabled": agent_has_knowledge(agent.id, db),
     }

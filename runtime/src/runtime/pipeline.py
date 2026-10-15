@@ -27,6 +27,8 @@ class PipelineConfig:
     provider_settings: dict[str, dict[str, Any]] = field(default_factory=dict)
     tools: list[dict[str, Any]] = field(default_factory=list)
     knowledge_enabled: bool = False
+    mode: str = "agent"
+    interpreter: dict[str, Any] | None = None
 
     @classmethod
     def from_environment(
@@ -97,6 +99,14 @@ class PipelineConfig:
         tools = session.get("tools") or []
         if not isinstance(tools, list):
             raise RuntimeError("session tools must be a list")
+        mode = session.get("mode") or "agent"
+        if mode not in {"agent", "interpreter"}:
+            raise RuntimeError(f"unsupported session mode: {mode}")
+        interpreter = session.get("interpreter") if mode == "interpreter" else None
+        if mode == "interpreter":
+            from .interpreter import InterpreterSettings
+
+            InterpreterSettings.from_mapping(interpreter)
         if not values["livekit_token"]:
             values["livekit_token"] = create_runtime_token(values["room_name"])
         missing = [name for field, name in names.items() if not values[field]]
@@ -114,6 +124,8 @@ class PipelineConfig:
             provider_settings=provider_settings,
             tools=tools,
             knowledge_enabled=bool(session.get("knowledge_enabled", False)),
+            mode=mode,
+            interpreter=dict(interpreter) if interpreter else None,
         )
 
 
@@ -165,6 +177,8 @@ def build_livekit_pipeline(config: PipelineConfig, session=None):
     """
 
     require_pipecat()
+    if config.mode == "interpreter":
+        return build_interpreter_pipeline(config, session)
     from .frame_events import RuntimeEventProcessor
 
     from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import (
@@ -261,6 +275,106 @@ def build_livekit_pipeline(config: PipelineConfig, session=None):
     pipeline = Pipeline(processors)
     worker = PipelineWorker(
         pipeline,
+        params=PipelineParams(enable_metrics=True, enable_usage_metrics=True),
+    )
+    return transport, worker
+
+
+INTERPRETER_TURN_PAUSE_SECS = 0.5
+
+
+def build_interpreter_pipeline(config: PipelineConfig, session=None):
+    """Build the cascaded interpreter pipeline (no LLM context, tools or barge-in).
+
+    ``transport.input -> VAD -> Deepgram STT -> user turn processor -> translation ->
+    Cartesia TTS -> events -> transport.output``. Interruptions are disabled by
+    constructing the turn start strategies with ``enable_interruptions=False``, so no
+    ``InterruptionFrame`` is ever broadcast and a translation is never cut off.
+    ``TranslationProcessor`` consumes the transcripts and emits the user and
+    assistant ``TranscriptFinal`` events itself, so the single
+    ``RuntimeEventProcessor`` (after TTS) only contributes lifecycle and latency events.
+    """
+
+    require_pipecat()
+    from .interpreter import (
+        DEFAULT_TRANSLATION_MODEL,
+        InterpreterSettings,
+        OpenAITranslator,
+        TranslationProcessor,
+    )
+
+    from pipecat.audio.vad.silero import SileroVADAnalyzer
+    from pipecat.audio.vad.vad_analyzer import VADParams
+    from pipecat.pipeline.pipeline import Pipeline
+    from pipecat.pipeline.worker import PipelineParams, PipelineWorker
+    from pipecat.processors.audio.vad_processor import VADProcessor
+    from pipecat.services.cartesia.tts import CartesiaTTSService
+    from pipecat.services.deepgram.stt import DeepgramSTTService
+    from pipecat.transports.livekit.transport import LiveKitParams, LiveKitTransport
+    from pipecat.turns.user_start import (
+        TranscriptionUserTurnStartStrategy,
+        VADUserTurnStartStrategy,
+    )
+    from pipecat.turns.user_stop import SpeechTimeoutUserTurnStopStrategy
+    from pipecat.turns.user_turn_processor import UserTurnProcessor
+    from pipecat.turns.user_turn_strategies import UserTurnStrategies
+
+    settings = InterpreterSettings.from_mapping(config.interpreter)
+    source, target = settings.languages
+    transport = LiveKitTransport(
+        url=config.livekit_url,
+        token=config.livekit_token,
+        room_name=config.room_name,
+        params=LiveKitParams(audio_in_enabled=True, audio_out_enabled=True),
+    )
+    stt_settings = config.provider_settings.get("stt", {}).copy()
+    # Deepgram "multi" detects the language per utterance; one_way fixes the source.
+    stt_settings["language"] = "multi" if settings.direction == "auto" else source
+    stt = DeepgramSTTService(
+        api_key=config.deepgram_api_key,
+        settings=DeepgramSTTService.Settings(**stt_settings),
+    )
+    tts_settings = config.provider_settings.get("tts", {}).copy()
+    tts_settings["voice"] = config.cartesia_voice_id
+    tts_settings["language"] = target
+    tts = CartesiaTTSService(
+        api_key=config.cartesia_api_key,
+        settings=CartesiaTTSService.Settings(**tts_settings),
+    )
+    model = config.provider_settings.get("llm", {}).get("model") or DEFAULT_TRANSLATION_MODEL
+    translation = TranslationProcessor(
+        settings=settings,
+        translate=OpenAITranslator(
+            api_key=config.openai_api_key,
+            model=model,
+            base_url=os.getenv("OPENAI_BASE_URL") or None,
+        ),
+        model=model,
+        session=session,
+        initial_tts_language=target,
+    )
+    vad = VADProcessor(vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.2)))
+    user_turns = UserTurnProcessor(
+        user_turn_strategies=UserTurnStrategies(
+            start=[
+                VADUserTurnStartStrategy(enable_interruptions=False),
+                TranscriptionUserTurnStartStrategy(enable_interruptions=False),
+            ],
+            stop=[
+                SpeechTimeoutUserTurnStopStrategy(
+                    user_speech_timeout=INTERPRETER_TURN_PAUSE_SECS
+                )
+            ],
+        )
+    )
+    processors = [transport.input(), vad, stt, user_turns, translation, tts]
+    if session is not None:
+        from .frame_events import RuntimeEventProcessor
+
+        processors.append(RuntimeEventProcessor(session))
+    processors.append(transport.output())
+    worker = PipelineWorker(
+        Pipeline(processors),
         params=PipelineParams(enable_metrics=True, enable_usage_metrics=True),
     )
     return transport, worker

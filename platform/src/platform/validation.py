@@ -19,6 +19,10 @@ OUTCOMES = frozenset(
         "other",
     }
 )
+INTERPRETER_LANGUAGES = frozenset(
+    {"en", "ru", "ko", "ja", "zh", "es", "fr", "de", "it", "pt", "nl", "hi", "tr", "pl"}
+)
+AUTO_DIRECTION_LANGUAGES = frozenset({"en", "es", "fr", "de", "hi", "ru", "pt", "ja", "it", "nl"})
 E164_PATTERN = r"^\+[1-9]\d{6,14}$"
 _E164_RE = re.compile(E164_PATTERN)
 

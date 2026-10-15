@@ -136,6 +136,8 @@ def test_session_creation_hands_off_exact_session_contract(monkeypatch) -> None:
                 "room_name": session["room_name"],
                 "system_prompt": "Be concise",
                 "voice_id": "voice-7",
+                "mode": "agent",
+                "interpreter": None,
                 "providers": {
                     "stt": "deepgram",
                     "llm": "openai-compatible",
@@ -360,6 +362,8 @@ def test_session_created_without_runtime_configuration_can_handoff_later(
             "room_name": session["room_name"],
             "system_prompt": "Resume this exact contract.",
             "voice_id": "deferred-voice",
+            "mode": "agent",
+            "interpreter": None,
             "tools": [],
             "knowledge_enabled": False,
         }

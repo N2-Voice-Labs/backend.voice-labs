@@ -63,6 +63,8 @@ class SessionStart(BaseModel):
     provider_settings: dict[str, dict[str, Any]] = Field(default_factory=dict)
     tools: list[dict[str, Any]] = Field(default_factory=list)
     knowledge_enabled: bool = False
+    mode: str = "agent"
+    interpreter: dict[str, Any] | None = None
 
 
 async def run_session(request: SessionStart) -> None:
@@ -95,6 +97,8 @@ async def run_session(request: SessionStart) -> None:
                 "provider_settings": request.provider_settings,
                 "tools": request.tools,
                 "knowledge_enabled": request.knowledge_enabled,
+                "mode": request.mode,
+                "interpreter": request.interpreter,
             }
         )
         _session_states[session_key] = "connecting"
