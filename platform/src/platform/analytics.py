@@ -15,8 +15,8 @@ from .models import Conversation, Message, RuntimeEvent
 
 router = APIRouter(tags=["analytics"])
 
-# Runtime does not emit LatencyMeasured yet; accept the documented shape
-# {"metric"|"stage"|"name": str, "value_ms"|"latency_ms"|"duration_ms"|"value": number}.
+# Runtime emits {"metric": "stt_ttfb"|"llm_ttfb"|"tts_ttfb"|"turn_to_first_audio", "value_ms": n};
+# the alternative keys below are tolerated for other emitters.
 METRIC_KEYS = ("metric", "stage", "name")
 VALUE_KEYS = ("value_ms", "latency_ms", "duration_ms", "value")
 

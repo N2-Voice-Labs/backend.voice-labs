@@ -16,11 +16,15 @@ from sqlalchemy.orm import Session
 from .db import Base, engine, get_db
 from .models import Agent as AgentRecord
 from .models import (
+    AgentKnowledgeDocument,
+    AgentTool,
     Conversation,
     Deployment,
+    KnowledgeDocument,
     Message,
     ProviderConfig,
     RuntimeEvent,
+    Tool as ToolRecord,
     Voice,
     VoiceSession,
     utcnow,
@@ -241,6 +245,44 @@ async def list_providers(db: Session = Depends(get_db)) -> list[Provider]:
     return [Provider.model_validate(item) for item in db.query(ProviderConfig).all()]
 
 
+def runtime_tools_for_agent(agent_id: str, db: Session) -> list[dict[str, Any]]:
+    """Assigned, enabled tools in the shape the Runtime registers as LLM functions."""
+
+    records = (
+        db.query(ToolRecord)
+        .join(AgentTool, AgentTool.tool_id == ToolRecord.id)
+        .filter(AgentTool.agent_id == agent_id, ToolRecord.enabled.is_(True))
+        .order_by(ToolRecord.name)
+        .all()
+    )
+    return [
+        {
+            "name": tool.name,
+            "description": tool.description,
+            "tool_type": tool.tool_type,
+            "input_schema": tool.input_schema or {},
+            "configuration": tool.configuration or {},
+        }
+        for tool in records
+    ]
+
+
+def agent_has_knowledge(agent_id: str, db: Session) -> bool:
+    return (
+        db.query(AgentKnowledgeDocument.document_id)
+        .join(
+            KnowledgeDocument,
+            KnowledgeDocument.id == AgentKnowledgeDocument.document_id,
+        )
+        .filter(
+            AgentKnowledgeDocument.agent_id == agent_id,
+            KnowledgeDocument.enabled.is_(True),
+        )
+        .first()
+        is not None
+    )
+
+
 @app.post("/voice/sessions", status_code=status.HTTP_201_CREATED)
 async def create_session(
     payload: SessionIn, db: Session = Depends(get_db)
@@ -314,6 +356,8 @@ async def create_session(
         "room_name": session.room_name,
         "system_prompt": agent.system_prompt,
         "voice_id": runtime_voice_id,
+        "tools": runtime_tools_for_agent(agent.id, db),
+        "knowledge_enabled": agent_has_knowledge(agent.id, db),
     }
     if providers:
         request_payload["providers"] = providers

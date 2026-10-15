@@ -1,23 +1,43 @@
 """Translate native Pipecat frames into the platform's versioned events."""
 
+import math
+import time
+
 from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
     InterruptionFrame,
     LLMFullResponseEndFrame,
+    MetricsFrame,
     TextFrame,
     TranscriptionFrame,
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
 )
+from pipecat.metrics.metrics import TTFBMetricsData
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
 from .events import RuntimeEventType
 from .session import RuntimeSession, SessionState
 
 
+def latency_stage(processor_name: str) -> str:
+    """Classify a Pipecat processor name such as ``DeepgramSTTService#0``."""
+
+    for marker, stage in (("STT", "stt"), ("LLM", "llm"), ("TTS", "tts")):
+        if marker in processor_name:
+            return stage
+    return "other"
+
+
 class RuntimeEventProcessor(FrameProcessor):
-    """Forward Pipecat frames and emit transcript and lifecycle events."""
+    """Forward Pipecat frames and emit transcript, lifecycle, and latency events.
+
+    ``LatencyMeasured`` events are emitted only by the instance with
+    ``control_events=True`` and ``assistant_output=False`` (the final instance in
+    the pipeline, after TTS). Pipecat metrics frames travel downstream through
+    every instance, so restricting emission to one avoids duplicates.
+    """
 
     def __init__(
         self,
@@ -32,6 +52,8 @@ class RuntimeEventProcessor(FrameProcessor):
         self._control_events = control_events
         self._assistant_text: list[str] = []
         self._assistant_speaking = False
+        self._latency_events = control_events and not assistant_output
+        self._user_stopped_at: float | None = None
 
     async def process_frame(self, frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
@@ -55,12 +77,21 @@ class RuntimeEventProcessor(FrameProcessor):
             self._assistant_text.clear()
             if text.strip():
                 await self._emit("TranscriptFinal", {"content": text, "role": "assistant"})
+        elif self._latency_events and isinstance(frame, MetricsFrame):
+            await self._emit_ttfb_latency(frame)
         elif self._control_events and isinstance(frame, UserStartedSpeakingFrame):
+            self._user_stopped_at = None
             self._session.begin_listening()
             await self._emit("SpeechStarted")
         elif self._control_events and isinstance(frame, UserStoppedSpeakingFrame):
+            if self._latency_events:
+                self._user_stopped_at = time.monotonic()
             await self._emit("SpeechStopped")
         elif self._control_events and isinstance(frame, BotStartedSpeakingFrame):
+            if self._latency_events and self._user_stopped_at is not None:
+                elapsed = time.monotonic() - self._user_stopped_at
+                self._user_stopped_at = None
+                await self._emit_latency("turn_to_first_audio", elapsed, "runtime", None)
             self._assistant_speaking = True
             self._session.state = SessionState.SPEAKING
             await self._emit("AgentSpeechStarted")
@@ -78,6 +109,46 @@ class RuntimeEventProcessor(FrameProcessor):
                 await self._emit("AgentSpeechCancelled")
 
         await self.push_frame(frame, direction)
+
+    async def _emit_ttfb_latency(self, frame: MetricsFrame) -> None:
+        for data in frame.data:
+            if isinstance(data, TTFBMetricsData):
+                await self._emit_latency(
+                    f"{latency_stage(data.processor)}_ttfb",
+                    data.value,
+                    data.processor,
+                    data.model,
+                )
+
+    async def _emit_latency(
+        self,
+        metric: str,
+        seconds: object,
+        processor: str,
+        model: str | None,
+    ) -> None:
+        """Emit LatencyMeasured; invalid values are skipped and never raise."""
+
+        if (
+            isinstance(seconds, bool)
+            or not isinstance(seconds, (int, float))
+            or not math.isfinite(seconds)
+            or seconds < 0
+        ):
+            return
+        try:
+            await self._emit(
+                "LatencyMeasured",
+                {
+                    "metric": metric,
+                    "value_ms": round(seconds * 1000, 1),
+                    "processor": processor,
+                    "model": model,
+                },
+            )
+        except RuntimeError:
+            # Telemetry must not break the media pipeline (e.g. event queue closed).
+            pass
 
     async def _emit(
         self,

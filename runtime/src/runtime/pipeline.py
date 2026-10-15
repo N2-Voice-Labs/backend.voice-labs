@@ -25,6 +25,8 @@ class PipelineConfig:
         }
     )
     provider_settings: dict[str, dict[str, Any]] = field(default_factory=dict)
+    tools: list[dict[str, Any]] = field(default_factory=list)
+    knowledge_enabled: bool = False
 
     @classmethod
     def from_environment(
@@ -92,6 +94,9 @@ class PipelineConfig:
                     valid = isinstance(value, expected_type)
                 if not valid:
                     raise RuntimeError(f"invalid {kind} provider setting type: {name}")
+        tools = session.get("tools") or []
+        if not isinstance(tools, list):
+            raise RuntimeError("session tools must be a list")
         if not values["livekit_token"]:
             values["livekit_token"] = create_runtime_token(values["room_name"])
         missing = [name for field, name in names.items() if not values[field]]
@@ -107,6 +112,8 @@ class PipelineConfig:
             ),
             providers=providers,
             provider_settings=provider_settings,
+            tools=tools,
+            knowledge_enabled=bool(session.get("knowledge_enabled", False)),
         )
 
 
@@ -198,7 +205,17 @@ def build_livekit_pipeline(config: PipelineConfig, session=None):
     llm_service = llm_services[config.providers["llm"]]
     tts_service = tts_services[config.providers["tts"]]
     llm_settings = config.provider_settings.get("llm", {}).copy()
-    llm_settings["system_instruction"] = config.system_instruction
+    tool_runtime = None
+    system_instruction = config.system_instruction
+    if session is not None:
+        from .tool_runtime import INSTRUCTION_SUFFIX, build_tool_runtime
+
+        tool_runtime = build_tool_runtime(
+            config.tools, config.knowledge_enabled, session
+        )
+        if tool_runtime:
+            system_instruction = f"{system_instruction}\n\n{INSTRUCTION_SUFFIX}"
+    llm_settings["system_instruction"] = system_instruction
     llm = llm_service(
         api_key=config.openai_api_key,
         base_url=os.getenv("OPENAI_BASE_URL") or None,
@@ -210,7 +227,11 @@ def build_livekit_pipeline(config: PipelineConfig, session=None):
         api_key=config.cartesia_api_key,
         settings=tts_service.Settings(**tts_settings),
     )
-    context = LLMContext()
+    if tool_runtime:
+        tool_runtime.register(llm)
+        context = LLMContext(tools=tool_runtime.tools_schema())
+    else:
+        context = LLMContext()
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(

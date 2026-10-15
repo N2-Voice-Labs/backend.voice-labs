@@ -278,3 +278,130 @@ def test_pipeline_places_frame_observers_at_pipecat_consumption_boundaries(
     assert [
         (observer._assistant_output, observer._control_events) for observer in observers
     ] == [(False, False), (True, False), (False, True)]
+
+
+def _pipeline_config(**kwargs) -> PipelineConfig:
+    return PipelineConfig(
+        "ws://localhost:7880",
+        "token",
+        "room",
+        "deepgram",
+        "openai",
+        "cartesia",
+        "voice",
+        "prompt",
+        **kwargs,
+    )
+
+
+def test_pipeline_config_carries_tools_and_knowledge_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for key, value in {
+        "LIVEKIT_URL": "ws://localhost:7880",
+        "DEEPGRAM_API_KEY": "deepgram",
+        "OPENAI_API_KEY": "openai",
+        "CARTESIA_API_KEY": "cartesia",
+        "CARTESIA_VOICE_ID": "voice",
+    }.items():
+        monkeypatch.setenv(key, value)
+    tools = [{"name": "lookup", "tool_type": "http"}]
+    config = PipelineConfig.from_environment(
+        {
+            "room_name": "room",
+            "livekit_token": "token",
+            "tools": tools,
+            "knowledge_enabled": True,
+        }
+    )
+    assert config.tools == tools
+    assert config.knowledge_enabled is True
+    legacy = PipelineConfig.from_environment({"room_name": "room", "livekit_token": "t"})
+    assert legacy.tools == [] and legacy.knowledge_enabled is False
+
+
+def test_pipeline_registers_tools_and_extends_system_instruction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("pipecat")
+    from pipecat.audio.turn.smart_turn import local_smart_turn_v3
+    from pipecat.audio.vad import silero
+    from pipecat.processors.aggregators import llm_context
+    from pipecat.services.openai import llm as openai_llm
+
+    class LightweightAnalyzer:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+    monkeypatch.setattr(
+        local_smart_turn_v3, "LocalSmartTurnAnalyzerV3", LightweightAnalyzer
+    )
+    monkeypatch.setattr(silero, "SileroVADAnalyzer", LightweightAnalyzer)
+    captured: dict[str, object] = {}
+    real_context = llm_context.LLMContext
+
+    class capture_context(real_context):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            captured["context"] = self
+
+    real_llm = openai_llm.OpenAILLMService
+
+    def capture_llm(*args, **kwargs):
+        service = real_llm(*args, **kwargs)
+        captured["llm"] = service
+        captured["settings"] = kwargs["settings"]
+        return service
+
+    capture_llm.Settings = real_llm.Settings
+    monkeypatch.setattr(llm_context, "LLMContext", capture_context)
+    monkeypatch.setattr(openai_llm, "OpenAILLMService", capture_llm)
+    config = _pipeline_config(
+        tools=[
+            {
+                "name": "lookup_order",
+                "description": "Look up an order",
+                "tool_type": "http",
+                "input_schema": {"type": "object", "properties": {}},
+                "configuration": {"url": "https://orders.test/lookup"},
+            }
+        ],
+        knowledge_enabled=True,
+    )
+
+    build_livekit_pipeline(config, RuntimeSession(uuid4(), uuid4(), uuid4()))
+
+    names = {tool.name for tool in captured["context"].tools.standard_tools}
+    assert names == {"record_outcome", "search_knowledge", "lookup_order"}
+    assert set(captured["llm"]._functions) >= names
+    assert captured["settings"].system_instruction.endswith("call record_outcome.")
+    assert captured["settings"].system_instruction.startswith("prompt")
+
+
+def test_pipeline_without_session_registers_no_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("pipecat")
+    from pipecat.audio.turn.smart_turn import local_smart_turn_v3
+    from pipecat.audio.vad import silero
+    from pipecat.processors.aggregators import llm_context
+
+    class LightweightAnalyzer:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+    monkeypatch.setattr(
+        local_smart_turn_v3, "LocalSmartTurnAnalyzerV3", LightweightAnalyzer
+    )
+    monkeypatch.setattr(silero, "SileroVADAnalyzer", LightweightAnalyzer)
+    captured: dict[str, object] = {}
+    real_context = llm_context.LLMContext
+
+    class capture_context(real_context):
+        def __init__(self, *args, **kwargs):
+            captured["kwargs"] = kwargs
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(llm_context, "LLMContext", capture_context)
+    build_livekit_pipeline(_pipeline_config())
+    assert "tools" not in captured["kwargs"]

@@ -6,12 +6,13 @@ from contextlib import asynccontextmanager
 from typing import Any
 from uuid import UUID
 
-from fastapi import FastAPI, Header, HTTPException, status
+from fastapi import FastAPI, Header, HTTPException, Response, status
 from pydantic import BaseModel, Field
 
 from .events_client import PlatformEventClient
 from .pipeline import PipelineConfig
 from .session import RuntimeSession, SessionState
+from .tts_preview import TTSPreviewError, synthesize_preview
 
 _active_sessions: dict[str, asyncio.Task[None]] = {}
 _session_states: dict[str, str] = {}
@@ -60,6 +61,8 @@ class SessionStart(BaseModel):
     voice_id: str | None = None
     providers: dict[str, str] = Field(default_factory=dict)
     provider_settings: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    tools: list[dict[str, Any]] = Field(default_factory=list)
+    knowledge_enabled: bool = False
 
 
 async def run_session(request: SessionStart) -> None:
@@ -90,6 +93,8 @@ async def run_session(request: SessionStart) -> None:
                 "voice_id": request.voice_id or "",
                 "providers": request.providers,
                 "provider_settings": request.provider_settings,
+                "tools": request.tools,
+                "knowledge_enabled": request.knowledge_enabled,
             }
         )
         _session_states[session_key] = "connecting"
@@ -229,6 +234,44 @@ async def end_session(
         _session_states[key] = "ended"
     _remember_terminal_session(key)
     return {"status": _session_states.get(key, "ended")}
+
+
+class TTSPreviewRequest(BaseModel):
+    provider: str = Field(min_length=1, max_length=100)
+    provider_voice_id: str = Field(min_length=1, max_length=200)
+    text: str = Field(min_length=1, max_length=300)
+    language: str | None = Field(default=None, max_length=50)
+    model: str | None = Field(default=None, max_length=100)
+
+
+@app.post("/tts/preview")
+async def tts_preview(
+    payload: TTSPreviewRequest,
+    x_runtime_token: str | None = Header(default=None),
+) -> Response:
+    expected = os.getenv("RUNTIME_PLATFORM_TOKEN")
+    if (
+        not expected
+        or not x_runtime_token
+        or not hmac.compare_digest(x_runtime_token, expected)
+    ):
+        raise HTTPException(status_code=401, detail="invalid_runtime_token")
+    if payload.provider != "cartesia":
+        raise HTTPException(status_code=422, detail="unsupported_tts_provider")
+    api_key = os.getenv("CARTESIA_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=503, detail="tts_not_configured")
+    try:
+        audio = await synthesize_preview(
+            api_key=api_key,
+            provider_voice_id=payload.provider_voice_id,
+            text=payload.text,
+            language=payload.language,
+            model=payload.model,
+        )
+    except TTSPreviewError as exc:
+        raise HTTPException(status_code=502, detail="tts_provider_error") from exc
+    return Response(content=audio, media_type="audio/wav")
 
 
 @app.get("/health")

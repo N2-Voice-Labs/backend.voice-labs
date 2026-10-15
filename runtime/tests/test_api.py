@@ -230,3 +230,43 @@ def test_end_session_preserves_an_existing_failure(
     assert response.status_code == 200
     assert response.json() == {"status": "failed"}
     assert api._session_states[str(session_id)] == "failed"
+
+
+def test_session_start_accepts_tools_and_knowledge_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("RUNTIME_PLATFORM_TOKEN", "test-runtime-token")
+    started: list[api.SessionStart] = []
+
+    async def hold_session(request: api.SessionStart) -> None:
+        started.append(request)
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(api, "run_session", hold_session)
+    tool = {
+        "name": "lookup_order",
+        "description": "Look up",
+        "tool_type": "http",
+        "input_schema": {"type": "object"},
+        "configuration": {"url": "https://orders.test"},
+    }
+    payload = {
+        "session_id": str(uuid4()),
+        "conversation_id": str(uuid4()),
+        "agent_id": str(uuid4()),
+        "room_name": "voice-test-room",
+        "tools": [tool],
+        "knowledge_enabled": True,
+    }
+    legacy = {**payload, "session_id": str(uuid4())}
+    del legacy["tools"], legacy["knowledge_enabled"]
+    headers = {"X-Runtime-Token": "test-runtime-token"}
+
+    with TestClient(api.app) as client:
+        assert client.post("/sessions", json=payload, headers=headers).status_code == 202
+        assert client.post("/sessions", json=legacy, headers=headers).status_code == 202
+    assert [(r.tools, r.knowledge_enabled) for r in started] == [([tool], True), ([], False)]
+    for key in (payload["session_id"], legacy["session_id"]):
+        api._active_sessions.pop(key, None)
+        api._session_states.pop(key, None)
+        api._session_contracts.pop(key, None)

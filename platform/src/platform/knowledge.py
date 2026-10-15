@@ -1,5 +1,6 @@
 """Knowledge API."""
 
+import re
 from datetime import datetime
 from typing import Any
 from uuid import UUID
@@ -11,6 +12,7 @@ from sqlalchemy.orm import Session
 from .db import get_db
 from .models import Agent as AgentRecord
 from .models import AgentKnowledgeDocument, KnowledgeDocument
+from .runtime_auth import require_runtime_token
 from .validation import reject_secret_configuration
 
 router = APIRouter(tags=["knowledge"])
@@ -193,3 +195,157 @@ async def list_agent_knowledge(
         .all()
     )
     return [summary_dict(doc) for doc in docs]
+
+
+class SearchRequest(BaseModel):
+    query: str = Field(min_length=1, max_length=500)
+    limit: int = Field(default=3, ge=1, le=10)
+
+
+class SearchResult(BaseModel):
+    document_id: UUID
+    title: str
+    source: str
+    snippet: str
+    score: float
+
+
+class SearchResponse(BaseModel):
+    results: list[SearchResult]
+
+
+def _tokenize(text: str) -> list[str]:
+    """Tokenize text using unicode-aware regex, filtering short tokens."""
+    tokens = re.findall(r"\w+", text.lower())
+    return [t for t in tokens if len(t) >= 2]
+
+
+def _split_into_chunks(content: str, chunk_size: int = 800) -> list[str]:
+    """Split content into chunks of approximately chunk_size characters.
+
+    Attempts to break at paragraph boundaries (double newline), then sentence
+    boundaries (period, question mark, exclamation mark), and finally word
+    boundaries if necessary.
+    """
+    if len(content) <= chunk_size:
+        return [content]
+
+    chunks = []
+    # First, split by paragraphs (double newline)
+    paragraphs = content.split("\n\n")
+    current_chunk = ""
+
+    for para in paragraphs:
+        if not para.strip():
+            continue
+
+        # If adding this paragraph would exceed chunk_size, finalize current chunk
+        if current_chunk and len(current_chunk) + len(para) + 2 > chunk_size:
+            chunks.append(current_chunk.strip())
+            current_chunk = ""
+
+        # If the paragraph itself is larger than chunk_size, split by sentences
+        if len(para) > chunk_size:
+            sentences = re.split(r"(?<=[.!?])\s+", para)
+            for sentence in sentences:
+                if current_chunk and len(current_chunk) + len(sentence) + 1 > chunk_size:
+                    chunks.append(current_chunk.strip())
+                    current_chunk = ""
+                if current_chunk:
+                    current_chunk += " " + sentence
+                else:
+                    current_chunk = sentence
+        else:
+            if current_chunk:
+                current_chunk += "\n\n" + para
+            else:
+                current_chunk = para
+
+    if current_chunk.strip():
+        chunks.append(current_chunk.strip())
+
+    return chunks if chunks else [content]
+
+
+def _score_chunk(
+    chunk: str, query_tokens: list[str], title: str, title_tokens: list[str]
+) -> float:
+    """Score a chunk based on query token occurrences and title matches."""
+    chunk_tokens = _tokenize(chunk)
+    score = 0.0
+
+    # Count occurrences of each query token in the chunk
+    for query_token in query_tokens:
+        score += chunk_tokens.count(query_token)
+
+    # Add bonus for distinct tokens that appear in the title
+    distinct_title_matches = set(query_tokens) & set(title_tokens)
+    score += 2.0 * len(distinct_title_matches)
+
+    return score
+
+
+@router.post(
+    "/runtime/agents/{agent_id}/knowledge/search",
+    response_model=SearchResponse,
+    dependencies=[Depends(require_runtime_token)],
+)
+async def search_agent_knowledge(
+    agent_id: UUID,
+    payload: SearchRequest,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Search through an agent's assigned knowledge documents.
+
+    Returns snippets from enabled documents assigned to the agent,
+    ranked by keyword relevance.
+    """
+    # Verify agent exists
+    get_agent_or_404(agent_id, db)
+
+    # Get all enabled documents assigned to this agent
+    docs = (
+        db.query(KnowledgeDocument)
+        .join(
+            AgentKnowledgeDocument,
+            AgentKnowledgeDocument.document_id == KnowledgeDocument.id,
+        )
+        .filter(
+            AgentKnowledgeDocument.agent_id == str(agent_id),
+            KnowledgeDocument.enabled == True,
+        )
+        .all()
+    )
+
+    # Tokenize query
+    query_tokens = _tokenize(payload.query)
+
+    # Collect and score all chunks
+    scored_chunks: list[tuple[float, str, UUID, str, str]] = []
+
+    for doc in docs:
+        title_tokens = _tokenize(doc.title)
+        chunks = _split_into_chunks(doc.content)
+
+        for chunk in chunks:
+            score = _score_chunk(chunk, query_tokens, doc.title, title_tokens)
+            if score > 0:
+                scored_chunks.append((score, chunk, doc.id, doc.title, doc.source))
+
+    # Sort by score descending and take top limit
+    scored_chunks.sort(key=lambda x: x[0], reverse=True)
+    top_chunks = scored_chunks[: payload.limit]
+
+    # Format response
+    results = [
+        {
+            "document_id": doc_id,
+            "title": title,
+            "source": source,
+            "snippet": chunk[:800],  # Ensure max 800 chars
+            "score": score,
+        }
+        for score, chunk, doc_id, title, source in top_chunks
+    ]
+
+    return {"results": results}

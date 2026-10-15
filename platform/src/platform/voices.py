@@ -1,10 +1,12 @@
 """Voice API: library, cloned, and designed voices with a validated lifecycle."""
 
+import os
 import re
 from typing import Any, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+import httpx
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -243,3 +245,52 @@ async def delete_voice(voice_id: UUID, db: Session = Depends(get_db)) -> None:
     record = get_voice_or_404(voice_id, db)
     record.status = "disabled"
     db.commit()
+
+
+class VoicePreviewIn(BaseModel):
+    text: str = Field(min_length=1, max_length=300)
+
+
+@router.post("/voices/{voice_id}/preview")
+async def preview_voice(
+    voice_id: UUID, payload: VoicePreviewIn, db: Session = Depends(get_db)
+) -> Response:
+    record = get_voice_or_404(voice_id, db)
+    if record.status != "ready" or not record.provider_voice_id:
+        raise HTTPException(status_code=409, detail="voice_not_ready")
+    provider = (
+        db.get(ProviderConfig, record.tts_provider_id)
+        if record.tts_provider_id
+        else None
+    )
+    runtime_url = os.getenv("RUNTIME_API_URL")
+    if not runtime_url:
+        raise HTTPException(status_code=503, detail="runtime_not_configured")
+    runtime_token = os.getenv("PLATFORM_RUNTIME_TOKEN", "")
+    if not runtime_token:
+        raise HTTPException(status_code=503, detail="runtime_auth_not_configured")
+
+    body: dict[str, Any] = {
+        "provider": (provider.provider if provider else None) or "cartesia",
+        "provider_voice_id": record.provider_voice_id,
+        "text": payload.text,
+    }
+    configuration = (provider.configuration if provider else None) or {}
+    for key in ("model", "language"):
+        value = configuration.get(key)
+        if isinstance(value, str) and value:
+            body[key] = value
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.post(
+                f"{runtime_url.rstrip('/')}/tts/preview",
+                headers={"X-Runtime-Token": runtime_token},
+                json=body,
+            )
+            response.raise_for_status()
+            audio = response.content
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail="voice_preview_failed") from exc
+    if not audio:
+        raise HTTPException(status_code=502, detail="voice_preview_failed")
+    return Response(content=audio, media_type="audio/wav")
