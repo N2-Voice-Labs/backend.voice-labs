@@ -57,11 +57,16 @@ INSTRUCTION_SUFFIX = (
     "When the conversation's goal is reached or the caller ends, call record_outcome."
 )
 
-# Wave C plugs SIP transfer in here: ``async def handler(session, reason) -> None``.
+# SIP transfer plugs in here (see sip_transfer.py, installed at API startup): ``async def handler(session, reason) -> None``.
 # ``session`` is the RuntimeSession; ``reason`` is the LLM-supplied string or None.
 # A session attribute of the same name takes precedence over this module default.
 TransferHandler = Callable[["RuntimeSession", "str | None"], Awaitable[object]]
 transfer_handler: TransferHandler | None = None
+
+
+# Specific, safe codes a transfer handler may raise (as the exception message) so the LLM
+# is told the transfer is unavailable rather than merely "failed".
+_TRANSFER_ERROR_CODES = frozenset({"transfer_not_configured", "invalid_transfer_destination"})
 
 
 def set_transfer_handler(handler: TransferHandler | None) -> None:
@@ -343,8 +348,15 @@ def _builtin_transfer_to_human(
         if handler is not None:
             try:
                 await handler(session, reason)
-            except Exception:
+            except Exception as exc:
                 _logger.exception("transfer_handler failed")
+                code = str(exc)
+                if code in _TRANSFER_ERROR_CODES:
+                    return {
+                        "status": "error",
+                        "error": code,
+                        "data": "The transfer could not be completed; no human is being connected.",
+                    }
                 return _error("transfer_failed")
         return {"status": "ok", "data": "Handoff to a human has been requested."}
 

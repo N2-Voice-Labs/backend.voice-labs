@@ -45,9 +45,12 @@ class RuntimeEventProcessor(FrameProcessor):
         *,
         assistant_output: bool = False,
         control_events: bool = True,
+        transcript_events: bool = True,
     ) -> None:
         super().__init__()
         self._session = session
+        # Off when another processor owns the transcripts (agent + translator).
+        self._transcript_events = transcript_events
         self._assistant_output = assistant_output
         self._control_events = control_events
         self._assistant_text: list[str] = []
@@ -57,7 +60,7 @@ class RuntimeEventProcessor(FrameProcessor):
 
     async def process_frame(self, frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
-        if isinstance(frame, TranscriptionFrame) and frame.finalized:
+        if self._transcript_events and isinstance(frame, TranscriptionFrame) and frame.finalized:
             language = frame.language.value if frame.language is not None else None
             await self._emit(
                 "TranscriptFinal",

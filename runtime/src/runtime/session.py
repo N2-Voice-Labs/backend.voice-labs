@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 from uuid import UUID
 
 from .events import RuntimeEvent, RuntimeEventType
+from .participants import ParticipantDirectory
 
 _EVENT_QUEUE_CAPACITY = 128
 _EVENT_DRAIN_TIMEOUT_SECONDS = 5
@@ -41,10 +42,13 @@ class RuntimeSession:
         self.cancel_requested = False
         self.output_queue: list[object] = []
         self.event_client = event_client
+        # Set for two-person interpreter sessions (shared with the HTTP layer).
+        self.participants: ParticipantDirectory | None = None
         self._pipeline_worker = None
         self._pipeline_cancel_task: asyncio.Task[bool] | None = None
         self._pipeline_cancel_requested = False
         self._requested_end_reason: str | None = None
+        self._failure_reason: str | None = None
         self._event_queue: asyncio.Queue[RuntimeEvent] = asyncio.Queue(
             maxsize=_EVENT_QUEUE_CAPACITY
         )
@@ -81,6 +85,11 @@ class RuntimeSession:
 
     def end(self) -> None:
         self.state = SessionState.ENDED
+
+    def fail(self, reason: str) -> None:
+        """Mark the session failed: the terminal event becomes ``SessionFailed``."""
+
+        self._failure_reason = self._failure_reason or reason
 
     async def request_end(self, reason: str = "Session ended by request") -> bool:
         """Ask Pipecat to stop the pipeline through its native cancellation frame."""
@@ -288,9 +297,21 @@ class RuntimeSession:
                 if self.state != SessionState.ENDED:
                     await self.request_end("LiveKit disconnected")
 
-            async def on_participant_disconnected(
-                _transport: object, _participant_sid: str
+            present: set[str] = set()
+
+            async def on_participant_present(
+                _transport: object, participant_id: str
             ) -> None:
+                present.add(participant_id)
+
+            async def on_participant_disconnected(
+                _transport: object, participant_id: str
+            ) -> None:
+                present.discard(participant_id)
+                if self.participants is not None and present:
+                    # Two-person call: the remaining participant keeps the session.
+                    _logger.info("LiveKit participant left; session continues")
+                    return
                 if self.state != SessionState.ENDED:
                     _logger.info("LiveKit participant disconnected; ending voice session")
                     await self.request_end("participant_disconnected")
@@ -300,6 +321,14 @@ class RuntimeSession:
             transport.add_event_handler(
                 "on_participant_disconnected", on_participant_disconnected
             )
+            if self.participants is not None:
+                # Existing participants are reported by their audio track subscription.
+                transport.add_event_handler(
+                    "on_participant_connected", on_participant_present
+                )
+                transport.add_event_handler(
+                    "on_audio_track_subscribed", on_participant_present
+                )
             runner = WorkerRunner(handle_sigint=False)
             await runner.add_workers(worker)
             await runner.run()
@@ -335,6 +364,10 @@ class RuntimeSession:
                 self.end()
                 if self.event_client:
                     dispatcher_stopped = await self.close_event_dispatcher()
+                    if self._failure_reason and event_type == "SessionEnded":
+                        event_type = "SessionFailed"
+                        outcome = "failed"
+                        reason = self._failure_reason
                     if self._event_delivery_error:
                         event_type = "SessionFailed"
                         outcome = "failed"

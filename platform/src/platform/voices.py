@@ -1,7 +1,9 @@
 """Voice API: library, cloned, and designed voices with a validated lifecycle."""
 
+import logging
 import os
 import re
+from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 from uuid import UUID
 
@@ -19,6 +21,7 @@ from sqlalchemy.orm import Session
 from .db import get_db
 from .models import ProviderConfig, Voice as VoiceRecord, utcnow
 
+_logger = logging.getLogger(__name__)
 router = APIRouter(tags=["voices"])
 
 # Allowed status transitions: current -> permitted next statuses.
@@ -294,3 +297,124 @@ async def preview_voice(
     if not audio:
         raise HTTPException(status_code=502, detail="voice_preview_failed")
     return Response(content=audio, media_type="audio/wav")
+
+
+PROVISION_TIMEOUT_SECONDS = 60.0
+# A voice stuck in ``processing`` this long (the request died mid-flight) may be retried.
+PROVISION_STALE_AFTER = timedelta(minutes=5)
+CLONE_LANGUAGE_RE = re.compile(r"^[a-z]{2}$")
+# Runtime error codes that are safe to persist verbatim as failure_reason.
+_RUNTIME_CLONE_ERRORS = {
+    "unsupported_sample_url",
+    "sample_unavailable",
+    "clone_provider_error",
+    "tts_not_configured",
+    "unsupported_tts_provider",
+    "invalid_runtime_token",
+}
+
+
+def _provision_failure_reason(exc: Exception) -> str:
+    if isinstance(exc, httpx.HTTPStatusError):
+        try:
+            detail = exc.response.json().get("detail")
+        except (ValueError, AttributeError):
+            detail = None
+        if isinstance(detail, str) and detail in _RUNTIME_CLONE_ERRORS:
+            return detail
+        return f"runtime_error_{exc.response.status_code}"
+    if isinstance(exc, httpx.HTTPError):
+        return "runtime_unreachable"
+    if isinstance(exc, (ValueError, AttributeError, TypeError)):
+        return "runtime_invalid_response"
+    return "runtime_error"
+
+
+def _clone_language(languages: list[str] | None) -> str | None:
+    """Primary subtag of the first language ("en-US" -> "en"), or None if not ISO 639-1."""
+
+    candidate = ((languages or ["en"])[0] or "").strip().split("-")[0].lower()
+    return candidate if CLONE_LANGUAGE_RE.match(candidate) else None
+
+
+def _is_stale_processing(record: VoiceRecord) -> bool:
+    if record.status != "processing" or record.updated_at is None:
+        return False
+    updated_at = record.updated_at
+    if updated_at.tzinfo is None:  # SQLite drops the zone; values are stored as UTC
+        updated_at = updated_at.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) - updated_at > PROVISION_STALE_AFTER
+
+
+@router.post("/voices/{voice_id}/provision", response_model=Voice)
+async def provision_voice(voice_id: UUID, db: Session = Depends(get_db)) -> Voice:
+    """Clone a consented sample at the TTS provider via Runtime (Platform never touches audio)."""
+
+    record = get_voice_or_404(voice_id, db)
+    if record.source != "clone" or not (
+        record.status in {"pending", "failed"} or _is_stale_processing(record)
+    ):
+        raise HTTPException(status_code=409, detail="invalid_voice_status_transition")
+    consent = record.consent
+    if not isinstance(consent, dict) or consent.get("confirmed") is not True:
+        raise HTTPException(status_code=409, detail="voice_consent_required")
+    sample_reference = record.sample_reference or ""
+    if not sample_reference.startswith("https://"):
+        raise HTTPException(status_code=422, detail="unsupported_sample_url")
+    runtime_url = os.getenv("RUNTIME_API_URL")
+    if not runtime_url:
+        raise HTTPException(status_code=503, detail="runtime_not_configured")
+    runtime_token = os.getenv("PLATFORM_RUNTIME_TOKEN", "")
+    if not runtime_token:
+        raise HTTPException(status_code=503, detail="runtime_auth_not_configured")
+    provider = (
+        db.get(ProviderConfig, record.tts_provider_id)
+        if record.tts_provider_id
+        else None
+    )
+    language = _clone_language(record.languages)
+    if language is None:
+        raise HTTPException(status_code=422, detail="invalid_voice_language")
+    body = {
+        "provider": (provider.provider if provider else None) or "cartesia",
+        "name": record.name,
+        "language": language,
+        "sample_url": sample_reference,
+    }
+
+    record.status = "processing"
+    record.failure_reason = None
+    db.commit()
+
+    failure_reason: str | None = None
+    provider_voice_id: str | None = None
+    try:
+        async with httpx.AsyncClient(timeout=PROVISION_TIMEOUT_SECONDS) as client:
+            response = await client.post(
+                f"{runtime_url.rstrip('/')}/voices/clone",
+                headers={"X-Runtime-Token": runtime_token},
+                json=body,
+            )
+            response.raise_for_status()
+            candidate = response.json().get("provider_voice_id")
+    except Exception as exc:  # never leave the voice stuck in ``processing``
+        failure_reason = _provision_failure_reason(exc)
+        if failure_reason == "runtime_error":
+            _logger.exception("unexpected error provisioning voice %s", voice_id)
+    else:
+        if isinstance(candidate, str) and 0 < len(candidate) <= 200:
+            provider_voice_id = candidate
+        else:
+            failure_reason = "runtime_invalid_response"
+
+    if provider_voice_id is None:
+        record.status = "failed"
+        record.failure_reason = failure_reason
+        db.commit()
+        raise HTTPException(status_code=502, detail="voice_provisioning_failed")
+    record.status = "ready"
+    record.provider_voice_id = provider_voice_id
+    record.failure_reason = None
+    db.commit()
+    db.refresh(record)
+    return Voice.model_validate(record)

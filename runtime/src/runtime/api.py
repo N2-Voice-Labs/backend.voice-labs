@@ -7,17 +7,27 @@ from typing import Any
 from uuid import UUID
 
 from fastapi import FastAPI, Header, HTTPException, Response, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_serializer
 
 from .events_client import PlatformEventClient
+from .participants import ParticipantDirectory, ParticipantError
 from .pipeline import PipelineConfig
+from . import sip_transfer
 from .session import RuntimeSession, SessionState
 from .tts_preview import TTSPreviewError, synthesize_preview
+from .voice_cloning import (
+    CloneProviderError,
+    SampleUnavailable,
+    UnsupportedSampleURL,
+    clone_voice,
+    download_sample,
+)
 
 _active_sessions: dict[str, asyncio.Task[None]] = {}
 _session_states: dict[str, str] = {}
 _runtime_sessions: dict[str, RuntimeSession] = {}
 _session_contracts: dict[str, dict[str, Any]] = {}
+_participant_directories: dict[str, ParticipantDirectory] = {}
 _terminal_session_order: OrderedDict[str, None] = OrderedDict()
 _TERMINAL_SESSION_STATES = {"ended", "failed", "cancelled"}
 _MAX_TERMINAL_SESSION_HISTORY = 1024
@@ -29,16 +39,19 @@ def _remember_terminal_session(session_key: str) -> None:
     if _session_states.get(session_key) not in _TERMINAL_SESSION_STATES:
         return
     _session_contracts.pop(session_key, None)
+    _participant_directories.pop(session_key, None)
     _terminal_session_order[session_key] = None
     _terminal_session_order.move_to_end(session_key)
     while len(_terminal_session_order) > _MAX_TERMINAL_SESSION_HISTORY:
         expired_key, _ = _terminal_session_order.popitem(last=False)
         _session_states.pop(expired_key, None)
         _session_contracts.pop(expired_key, None)
+        _participant_directories.pop(expired_key, None)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    sip_transfer.install_if_configured()
     yield
     tasks = list(_active_sessions.items())
     for key, task in tasks:
@@ -50,6 +63,18 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="Voice Labs Runtime", version="0.1.0", lifespan=lifespan)
+
+
+class ParticipantSpec(BaseModel):
+    """One interpreter participant: spoken language and the voice their words get."""
+
+    language: str = Field(min_length=2, max_length=16)
+    voice_id: str | None = Field(default=None, max_length=200)
+    display_name: str | None = Field(default=None, max_length=100)
+
+
+class ParticipantIn(ParticipantSpec):
+    identity: str = Field(min_length=1, max_length=255)
 
 
 class SessionStart(BaseModel):
@@ -65,6 +90,23 @@ class SessionStart(BaseModel):
     knowledge_enabled: bool = False
     mode: str = "agent"
     interpreter: dict[str, Any] | None = None
+    transfer_to: str | None = Field(default=None, max_length=255)
+    # Two-person interpreter sessions: LiveKit identity -> participant. Absent for
+    # single-participant sessions, which behave exactly as before.
+    participants: dict[str, ParticipantSpec] | None = None
+    # Agent + translator (TR-040): {working_language, caller_languages}. Absent for
+    # ordinary agents, which keep the contract exactly as before.
+    translation: dict[str, Any] | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_optional_blocks(self, handler):
+        # Sessions without participants (TR-020) or translation (TR-040) keep the
+        # contract exactly as before those features.
+        data = handler(self)
+        for key in ("participants", "translation"):
+            if data.get(key) is None:
+                data.pop(key, None)
+        return data
 
 
 async def run_session(request: SessionStart) -> None:
@@ -87,6 +129,7 @@ async def run_session(request: SessionStart) -> None:
             request.agent_id,
             event_client,
         )
+        runtime_session.participants = _participant_directories.get(session_key)
         _runtime_sessions[session_key] = runtime_session
         config = PipelineConfig.from_environment(
             {
@@ -99,6 +142,12 @@ async def run_session(request: SessionStart) -> None:
                 "knowledge_enabled": request.knowledge_enabled,
                 "mode": request.mode,
                 "interpreter": request.interpreter,
+                "translation": request.translation,
+                "participants": request.participants
+                and {
+                    identity: spec.model_dump()
+                    for identity, spec in request.participants.items()
+                },
             }
         )
         _session_states[session_key] = "connecting"
@@ -166,6 +215,9 @@ async def start_session(
     session_status = _session_states.get(key)
     if session_status in _TERMINAL_SESSION_STATES:
         return {"status": "already_finished", "session_status": session_status}
+    directory: ParticipantDirectory | None = None
+    if payload.participants:
+        directory = _build_participant_directory(payload)
     contract = payload.model_dump(mode="json")
     existing_contract = _session_contracts.get(key)
     if existing_contract is not None and existing_contract != contract:
@@ -174,11 +226,37 @@ async def start_session(
     if task and not task.done():
         return {"status": "already_running"}
     _session_contracts[key] = contract
+    if directory is not None:
+        _participant_directories[key] = directory
     _session_states[key] = "starting"
     task = asyncio.create_task(run_session(payload), name=f"voice-session-{key}")
     _active_sessions[key] = task
     task.add_done_callback(_consume_session_result)
     return {"status": "accepted"}
+
+
+def _build_participant_directory(payload: SessionStart) -> ParticipantDirectory:
+    """Validate and index ``participants`` (422 when they do not fit the session)."""
+
+    interpreter = payload.interpreter or {}
+    if (
+        payload.mode != "interpreter"
+        or (interpreter.get("engine") or "cascaded") != "cascaded"
+    ):
+        raise HTTPException(
+            status_code=422, detail="participants_require_cascaded_interpreter"
+        )
+    try:
+        return ParticipantDirectory.from_mapping(
+            interpreter.get("languages") or [],
+            {
+                identity: spec.model_dump()
+                for identity, spec in (payload.participants or {}).items()
+            },
+        )
+    except ParticipantError as exc:
+        status_code = 409 if exc.code == "session_full" else 422
+        raise HTTPException(status_code=status_code, detail=exc.code) from exc
 
 
 def _consume_session_result(task: asyncio.Task[None]) -> None:
@@ -240,6 +318,38 @@ async def end_session(
     return {"status": _session_states.get(key, "ended")}
 
 
+@app.post("/sessions/{session_id}/participants")
+async def add_session_participant(
+    session_id: UUID,
+    payload: ParticipantIn,
+    x_runtime_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Add or update a participant of a running two-person interpreter session."""
+
+    expected = os.getenv("RUNTIME_PLATFORM_TOKEN")
+    if (
+        not expected
+        or not x_runtime_token
+        or not hmac.compare_digest(x_runtime_token, expected)
+    ):
+        raise HTTPException(status_code=401, detail="invalid_runtime_token")
+    key = str(session_id)
+    if key not in _session_contracts or _session_states.get(key) in _TERMINAL_SESSION_STATES:
+        raise HTTPException(status_code=404, detail="session_not_found")
+    directory = _participant_directories.get(key)
+    if directory is None:
+        raise HTTPException(status_code=409, detail="participants_not_enabled")
+    spec = payload.model_dump(exclude={"identity"})
+    try:
+        await directory.update(payload.identity, spec)
+    except ParticipantError as exc:
+        status_code = 409 if exc.code == "session_full" else 422
+        raise HTTPException(status_code=status_code, detail=exc.code) from exc
+    # Keep the stored start contract equal to what the Platform would resend on a retry.
+    _session_contracts[key]["participants"] = directory.as_contract()
+    return {"status": "updated", "participants": len(directory)}
+
+
 class TTSPreviewRequest(BaseModel):
     provider: str = Field(min_length=1, max_length=100)
     provider_voice_id: str = Field(min_length=1, max_length=200)
@@ -276,6 +386,51 @@ async def tts_preview(
     except TTSPreviewError as exc:
         raise HTTPException(status_code=502, detail="tts_provider_error") from exc
     return Response(content=audio, media_type="audio/wav")
+
+
+class VoiceCloneRequest(BaseModel):
+    provider: str = Field(min_length=1, max_length=100)
+    name: str = Field(min_length=1, max_length=200)
+    language: str = Field(pattern=r"^[a-z]{2}$")
+    sample_url: str = Field(min_length=1, max_length=1024)
+    description: str | None = Field(default=None, max_length=500)
+
+
+@app.post("/voices/clone")
+async def voices_clone(
+    payload: VoiceCloneRequest,
+    x_runtime_token: str | None = Header(default=None),
+) -> dict[str, str]:
+    expected = os.getenv("RUNTIME_PLATFORM_TOKEN")
+    if (
+        not expected
+        or not x_runtime_token
+        or not hmac.compare_digest(x_runtime_token, expected)
+    ):
+        raise HTTPException(status_code=401, detail="invalid_runtime_token")
+    if payload.provider != "cartesia":
+        raise HTTPException(status_code=422, detail="unsupported_tts_provider")
+    api_key = os.getenv("CARTESIA_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=503, detail="tts_not_configured")
+    try:
+        sample, content_type, filename = await download_sample(payload.sample_url)
+        provider_voice_id = await clone_voice(
+            api_key=api_key,
+            name=payload.name,
+            language=payload.language,
+            sample=sample,
+            content_type=content_type,
+            filename=filename,
+            description=payload.description,
+        )
+    except UnsupportedSampleURL as exc:
+        raise HTTPException(status_code=422, detail="unsupported_sample_url") from exc
+    except SampleUnavailable as exc:
+        raise HTTPException(status_code=422, detail="sample_unavailable") from exc
+    except CloneProviderError as exc:
+        raise HTTPException(status_code=502, detail="clone_provider_error") from exc
+    return {"provider_voice_id": provider_voice_id}
 
 
 @app.get("/health")

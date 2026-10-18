@@ -1,10 +1,23 @@
-"""Campaign API.
+"""Campaign API and outbound dialer.
 
-Campaigns and their targets are durable records only. There is no dialer or call
-queue: changing a campaign to ``running`` places no calls and moves no target out of
-``pending``; a future worker is expected to drive that state.
+Campaigns and their targets are durable records. Dialing is opt-in: only when
+``LIVEKIT_SIP_TRUNK_ID`` (plus the LiveKit URL/key/secret) is configured does moving a
+campaign to ``running`` start an in-process dispatcher that opens a voice session per
+pending target and dials it through LiveKit SIP (see :mod:`.sip`). Without that
+configuration nothing dials and targets stay ``pending``.
+
+Target lifecycle: ``pending -> calling -> completed | failed | no_answer``. A failed
+or unanswered attempt goes back to ``pending`` while ``attempts < max_attempts``.
+``completed`` means the callee answered and was connected to the agent; the call
+itself is tracked on the conversation (``conversation_id``).
+
+Limitations: the dispatcher is per-process (not safe to run on several replicas), does
+not honour the schedule window or ``retry_delay_*`` configuration, and a crash leaves
+the in-flight target in ``calling``.
 """
 
+import asyncio
+import logging
 from datetime import datetime, timezone
 from typing import Any, Literal
 from uuid import UUID
@@ -12,11 +25,12 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-from sqlalchemy import func
+from sqlalchemy import func, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from .db import get_db
+from . import sip
+from .db import SessionLocal, get_db
 from .models import Agent as AgentRecord
 from .models import Campaign as CampaignRecord
 from .models import CampaignTarget as TargetRecord
@@ -24,6 +38,7 @@ from .models import Deployment as DeploymentRecord
 from .validation import reject_secret_configuration, validate_e164
 
 router = APIRouter(tags=["campaigns"])
+_logger = logging.getLogger(__name__)
 
 CampaignStatus = Literal[
     "draft", "scheduled", "running", "paused", "completed", "cancelled"
@@ -99,6 +114,7 @@ class Campaign(BaseModel):
 
 class CampaignDetail(Campaign):
     target_counts: dict[str, int]
+    dialing: Literal["disabled", "active"] = "disabled"
 
 
 class CampaignPatch(BaseModel):
@@ -161,6 +177,11 @@ class Target(BaseModel):
     updated_at: Any
 
 
+class DialNextResult(BaseModel):
+    result: Literal["completed", "failed", "no_answer"]
+    target: Target
+
+
 class StatusIn(BaseModel):
     status: CampaignStatus
 
@@ -180,7 +201,9 @@ def campaign_detail(record: CampaignRecord, db: Session) -> CampaignDetail:
         .all()
     )
     return CampaignDetail(
-        **Campaign.model_validate(record).model_dump(), target_counts=counts
+        **Campaign.model_validate(record).model_dump(),
+        target_counts=counts,
+        dialing="active" if sip.sip_configured() else "disabled",
     )
 
 
@@ -330,4 +353,199 @@ async def change_campaign_status(
     record.status = payload.status
     db.commit()
     db.refresh(record)
+    if payload.status == "running" and sip.sip_configured():
+        start_dispatcher(record.id, max_concurrent_calls(record))
     return campaign_detail(record, db)
+
+
+@router.post("/campaigns/{campaign_id}/dial-next", response_model=DialNextResult)
+async def dial_next(campaign_id: UUID, db: Session = Depends(get_db)) -> DialNextResult:
+    """Dial exactly one pending target and wait for the attempt to resolve.
+
+    For demos and tests. Returns once the callee answered or the attempt failed; it does
+    not wait for the call to end.
+    """
+
+    record = get_campaign_or_404(campaign_id, db)
+    if not sip.sip_configured():
+        raise HTTPException(status_code=409, detail="sip_not_configured")
+    if record.status != "running":
+        raise HTTPException(status_code=409, detail="campaign_not_running")
+    target = claim_next_target(db, record)
+    if target is None:
+        raise HTTPException(status_code=409, detail="no_pending_targets")
+    result = await process_target(db, record, target, wait_for_end=False)
+    finish_if_drained(db, record)
+    return DialNextResult(result=result, target=Target.model_validate(target))
+
+
+# -- dispatcher -------------------------------------------------------------------
+
+MAX_CONCURRENT_CALLS = 10
+POLL_INTERVAL_S = 3.0
+CALL_WAIT_TIMEOUT_S = 3600.0
+_TERMINAL_SESSION_STATUSES = {"ended", "failed"}
+_dispatchers: dict[str, "asyncio.Task[None]"] = {}
+
+
+def max_concurrent_calls(record: CampaignRecord) -> int:
+    """``configuration.max_concurrent_calls`` (default 1, capped)."""
+    value = (record.configuration or {}).get("max_concurrent_calls", 1)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 1
+    return max(1, min(value, MAX_CONCURRENT_CALLS))
+
+
+def claim_next_target(db: Session, record: CampaignRecord) -> TargetRecord | None:
+    """Atomically move the next dialable target to ``calling`` and count the attempt.
+
+    Never-tried targets go first, then retries; ties break by creation order.
+    """
+
+    candidates = (
+        db.query(TargetRecord)
+        .filter(
+            TargetRecord.campaign_id == record.id,
+            TargetRecord.status == "pending",
+            TargetRecord.attempts < record.max_attempts,
+        )
+        .order_by(TargetRecord.attempts, TargetRecord.created_at, TargetRecord.id)
+        .limit(5)
+        .all()
+    )
+    for candidate in candidates:
+        claimed = db.execute(
+            update(TargetRecord)
+            .where(TargetRecord.id == candidate.id, TargetRecord.status == "pending")
+            .values(status="calling", attempts=TargetRecord.attempts + 1)
+        )
+        db.commit()
+        if claimed.rowcount == 1:
+            db.refresh(candidate)
+            return candidate
+    return None
+
+
+async def _wait_for_session_end(session_id: str) -> None:
+    waited = 0.0
+    unreadable = 0
+    while waited < CALL_WAIT_TIMEOUT_S:
+        status_value = await sip.get_session_status(session_id)
+        unreadable = unreadable + 1 if status_value is None else 0
+        if status_value in _TERMINAL_SESSION_STATUSES or unreadable >= 3:
+            return
+        await asyncio.sleep(POLL_INTERVAL_S)
+        waited += POLL_INTERVAL_S
+
+
+async def process_target(
+    db: Session,
+    record: CampaignRecord,
+    target: TargetRecord,
+    *,
+    wait_for_end: bool,
+) -> Literal["completed", "failed", "no_answer"]:
+    """Run one claimed attempt: open a session, dial into its room, record the result."""
+
+    outcome: Literal["completed", "failed", "no_answer"] = "failed"
+    session_id: str | None = None
+    try:
+        session = await sip.create_voice_session(record.agent_id, record.deployment_id)
+        session_id = str(session["session_id"])
+        target.conversation_id = str(session["conversation_id"])
+        db.commit()
+        await sip.dial(
+            target.phone_number,
+            str(session["room_name"]),
+            f"{sip.SIP_IDENTITY_PREFIX}{target.id}",
+            display_name=target.name or None,
+        )
+        outcome = "completed"
+    except sip.SipDialError as exc:
+        outcome = "no_answer" if exc.no_answer else "failed"
+        _logger.warning("Dial failed for target %s: %s", target.id, exc)
+    except (sip.SessionCreateError, sip.SipError) as exc:
+        _logger.warning("Attempt failed for target %s: %s", target.id, exc)
+    except Exception:
+        _logger.exception("Unexpected dialer error for target %s", target.id)
+    if outcome != "completed" and session_id is not None:
+        await sip.end_voice_session(session_id)
+    db.refresh(target)
+    if outcome == "completed" or target.attempts >= record.max_attempts:
+        target.status = outcome
+    else:
+        target.status = "pending"  # retry later
+    db.commit()
+    if outcome == "completed" and wait_for_end and session_id is not None:
+        await _wait_for_session_end(session_id)
+    return outcome
+
+
+def finish_if_drained(db: Session, record: CampaignRecord) -> bool:
+    """Mark a running campaign ``completed`` once no target is pending or calling."""
+
+    db.refresh(record)
+    if record.status != "running":
+        return False
+    open_targets = (
+        db.query(TargetRecord.id)
+        .filter(
+            TargetRecord.campaign_id == record.id,
+            TargetRecord.status.in_(("pending", "calling")),
+        )
+        .first()
+    )
+    if open_targets is not None:
+        return False
+    record.status = "completed"
+    db.commit()
+    return True
+
+
+async def run_campaign_batch(campaign_id: str, max_concurrent: int = 1) -> None:
+    """Dial a running campaign's pending targets, ``max_concurrent`` calls at a time.
+
+    Each worker re-reads the campaign before taking a target, so pausing or cancelling
+    stops new calls (calls already connected keep going). When nothing is left the
+    campaign is marked ``completed``.
+    """
+
+    async def worker() -> None:
+        while True:
+            with SessionLocal() as db:
+                record = db.get(CampaignRecord, campaign_id)
+                if record is None or record.status != "running":
+                    return
+                target = claim_next_target(db, record)
+                if target is None:
+                    return
+                await process_target(db, record, target, wait_for_end=True)
+
+    await asyncio.gather(*(worker() for _ in range(max(1, max_concurrent))))
+    with SessionLocal() as db:
+        record = db.get(CampaignRecord, campaign_id)
+        if record is not None:
+            finish_if_drained(db, record)
+
+
+def start_dispatcher(campaign_id: str, max_concurrent: int = 1) -> bool:
+    """Start :func:`run_campaign_batch` in the background unless one is running."""
+
+    existing = _dispatchers.get(campaign_id)
+    if existing is not None and not existing.done():
+        return False
+    task = asyncio.create_task(
+        run_campaign_batch(campaign_id, max_concurrent), name=f"campaign-{campaign_id}"
+    )
+    _dispatchers[campaign_id] = task
+
+    def done(finished: "asyncio.Task[None]") -> None:
+        if _dispatchers.get(campaign_id) is finished:
+            _dispatchers.pop(campaign_id, None)
+        if not finished.cancelled() and finished.exception() is not None:
+            _logger.error(
+                "Campaign dispatcher %s crashed", campaign_id, exc_info=finished.exception()
+            )
+
+    task.add_done_callback(done)
+    return True

@@ -28,7 +28,7 @@ def test_create_interpreter_agent_auto_en_ru() -> None:
         assert response.status_code == 201
         agent = response.json()
         assert agent["mode"] == "interpreter"
-        assert agent["interpreter"] == {"languages": ["en", "ru"], "direction": "auto"}
+        assert agent["interpreter"] == {"languages": ["en", "ru"], "direction": "auto", "engine": "cascaded"}
 
 
 def test_create_interpreter_agent_one_way_ko_en() -> None:
@@ -44,7 +44,7 @@ def test_create_interpreter_agent_one_way_ko_en() -> None:
         assert response.status_code == 201
         agent = response.json()
         assert agent["mode"] == "interpreter"
-        assert agent["interpreter"] == {"languages": ["ko", "en"], "direction": "one_way"}
+        assert agent["interpreter"] == {"languages": ["ko", "en"], "direction": "one_way", "engine": "cascaded"}
 
 
 def test_create_interpreter_agent_auto_with_unsupported_language_ko() -> None:
@@ -178,7 +178,7 @@ def test_patch_agent_to_interpreter_mode() -> None:
         assert response.status_code == 200
         updated = response.json()
         assert updated["mode"] == "interpreter"
-        assert updated["interpreter"] == {"languages": ["en", "ru"], "direction": "auto"}
+        assert updated["interpreter"] == {"languages": ["en", "ru"], "direction": "auto", "engine": "cascaded"}
 
 
 def test_patch_interpreter_to_agent_mode() -> None:
@@ -267,7 +267,7 @@ def test_session_contract_includes_mode_and_interpreter_interpreter() -> None:
         assert "mode" in contract
         assert contract["mode"] == "interpreter"
         assert "interpreter" in contract
-        assert contract["interpreter"] == {"languages": ["en", "ru"], "direction": "auto"}
+        assert contract["interpreter"] == {"languages": ["en", "ru"], "direction": "auto", "engine": "cascaded"}
 
 
 def test_get_agent_includes_mode_and_interpreter() -> None:
@@ -283,7 +283,7 @@ def test_get_agent_includes_mode_and_interpreter() -> None:
 
         retrieved = client.get(f"/agents/{created['id']}").json()
         assert retrieved["mode"] == "interpreter"
-        assert retrieved["interpreter"] == {"languages": ["en", "ru"], "direction": "auto"}
+        assert retrieved["interpreter"] == {"languages": ["en", "ru"], "direction": "auto", "engine": "cascaded"}
 
 
 def test_list_agents_includes_mode_and_interpreter() -> None:
@@ -317,3 +317,108 @@ def test_auto_direction_languages_subset() -> None:
 
     assert AUTO_DIRECTION_LANGUAGES.issubset(INTERPRETER_LANGUAGES)
     assert AUTO_DIRECTION_LANGUAGES == {"en", "es", "fr", "de", "hi", "ru", "pt", "ja", "it", "nl"}
+
+
+# -- realtime engine (TR-010) ---------------------------------------------------------
+
+
+def _realtime_agent(languages, direction="one_way", engine="realtime", **extra):
+    return {
+        "name": "Realtime Interpreter",
+        "mode": "interpreter",
+        "interpreter": {"languages": languages, "direction": direction, "engine": engine},
+        **extra,
+    }
+
+
+def test_realtime_output_languages_constant_is_the_verified_list() -> None:
+    from src.platform.validation import REALTIME_TRANSLATE_OUTPUT_LANGUAGES
+
+    assert REALTIME_TRANSLATE_OUTPUT_LANGUAGES == {
+        "es", "pt", "fr", "ja", "ru", "zh", "de", "ko", "hi", "id", "vi", "it", "en",
+    }  # fmt: skip
+
+
+def test_interpreter_engine_defaults_to_cascaded() -> None:
+    with TestClient(app) as client:
+        agent = client.post(
+            "/agents",
+            json={
+                "name": "Default Engine",
+                "mode": "interpreter",
+                "interpreter": {"languages": ["en", "ru"], "direction": "one_way"},
+            },
+        ).json()
+        assert agent["interpreter"]["engine"] == "cascaded"
+
+
+def test_stored_interpreter_without_engine_reads_back_as_cascaded() -> None:
+    from src.platform.models import Agent as AgentRecord
+
+    with TestClient(app) as client:
+        agent = client.post("/agents", json=_realtime_agent(["ru", "en"], engine="cascaded")).json()
+        with SessionLocal() as db:
+            record = db.get(AgentRecord, agent["id"])
+            record.interpreter = {"languages": ["ru", "en"], "direction": "one_way"}
+            db.commit()
+        assert client.get(f"/agents/{agent['id']}").json()["interpreter"]["engine"] == "cascaded"
+
+
+def test_create_realtime_agent_one_way_reaches_runtime_contract() -> None:
+    with TestClient(app) as client:
+        response = client.post("/agents", json=_realtime_agent(["ru", "en"]))
+        assert response.status_code == 201
+        agent = response.json()
+        assert agent["interpreter"] == {
+            "languages": ["ru", "en"],
+            "direction": "one_way",
+            "engine": "realtime",
+        }
+        session = client.post("/voice/sessions", json={"agent_id": agent["id"]}).json()
+        assert contract_for(session["session_id"])["interpreter"]["engine"] == "realtime"
+
+
+def test_realtime_agent_rejects_auto_direction() -> None:
+    with TestClient(app) as client:
+        response = client.post("/agents", json=_realtime_agent(["en", "ru"], direction="auto"))
+        assert response.status_code == 422
+        assert response.json()["detail"] == "invalid_interpreter_config"
+
+
+def test_realtime_agent_rejects_unsupported_output_language() -> None:
+    with TestClient(app) as client:
+        # nl and tr are valid cascaded languages but not realtime output languages.
+        for target in ("nl", "tr", "pl"):
+            response = client.post("/agents", json=_realtime_agent(["en", target]))
+            assert response.status_code == 422, target
+            assert response.json()["detail"] == "invalid_interpreter_config"
+        # The source language is not limited: the model detects 70+ input languages.
+        assert client.post("/agents", json=_realtime_agent(["nl", "en"])).status_code == 201
+
+
+def test_patch_to_realtime_validates_engine_rules() -> None:
+    with TestClient(app) as client:
+        agent = client.post("/agents", json=_realtime_agent(["en", "ru"], engine="cascaded")).json()
+        bad = client.patch(
+            f"/agents/{agent['id']}",
+            json={"interpreter": {"languages": ["ru", "en"], "direction": "auto", "engine": "realtime"}},
+        )
+        assert bad.status_code == 422
+        assert bad.json()["detail"] == "invalid_interpreter_config"
+        bad_target = client.patch(
+            f"/agents/{agent['id']}",
+            json={"interpreter": {"languages": ["en", "nl"], "direction": "one_way", "engine": "realtime"}},
+        )
+        assert bad_target.status_code == 422
+        good = client.patch(
+            f"/agents/{agent['id']}",
+            json={"interpreter": {"languages": ["ru", "en"], "direction": "one_way", "engine": "realtime"}},
+        )
+        assert good.status_code == 200
+        assert good.json()["interpreter"]["engine"] == "realtime"
+
+
+def test_unknown_engine_is_rejected() -> None:
+    with TestClient(app) as client:
+        response = client.post("/agents", json=_realtime_agent(["en", "ru"], engine="whisper"))
+        assert response.status_code == 422

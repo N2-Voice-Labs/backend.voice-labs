@@ -17,11 +17,15 @@ from pipecat.tests.utils import SleepFrame, run_test
 from pipecat.transcriptions.language import Language
 
 from src.runtime.api import SessionStart
+from src.runtime import interpreter as interpreter_module
 from src.runtime.interpreter import (
     InterpreterSettings,
     OpenAITranslator,
+    SentenceChunker,
     TranslationProcessor,
+    as_streaming_translator,
     build_translation_messages,
+    estimate_max_tokens,
     guess_language_from_script,
     normalize_language,
 )
@@ -202,25 +206,38 @@ def _utt(text, language):
 
 
 class FakeCompletions:
-    def __init__(self) -> None:
+    """Mimics ``chat.completions.create(stream=True)``: an async iterator of chunks."""
+
+    def __init__(self, deltas=(" При", "вет ", None)) -> None:
         self.calls: list[dict] = []
+        self.deltas = deltas
+        self.closed = False
 
     async def create(self, **kwargs):
         self.calls.append(kwargs)
+        completions = self
 
-        class Message:
-            content = " Привет "
+        class Stream:
+            def __aiter__(self):
+                return self._iterate()
 
-        class Choice:
-            message = Message()
+            async def _iterate(self):
+                for delta in completions.deltas:
+                    delta_obj = type("Delta", (), {"content": delta})()
+                    yield type("Chunk", (), {"choices": [type("Choice", (), {"delta": delta_obj})()]})()
+                yield type("Chunk", (), {"choices": []})()  # trailing usage-style chunk
 
-        class Response:
-            choices = [Choice()]
+            async def close(self):
+                completions.closed = True
 
-        return Response()
+        return Stream()
 
 
-def test_openai_translator_uses_temperature_zero_and_configured_model() -> None:
+async def collect(iterator) -> list[str]:
+    return [delta async for delta in iterator]
+
+
+def test_openai_translator_streams_with_temperature_zero_model_and_token_cap() -> None:
     completions = FakeCompletions()
 
     class Client:
@@ -228,8 +245,115 @@ def test_openai_translator_uses_temperature_zero_and_configured_model() -> None:
 
     translator = OpenAITranslator(api_key="k", model="gpt-x", client=Client())
     messages = build_translation_messages("hi", "en", "ru")
-    assert asyncio.run(translator(messages)) == " Привет "
-    assert completions.calls == [{"model": "gpt-x", "messages": messages, "temperature": 0}]
+    assert asyncio.run(collect(translator(messages))) == [" При", "вет "]
+    assert completions.calls == [
+        {
+            "model": "gpt-x",
+            "messages": messages,
+            "temperature": 0,
+            "stream": True,
+            "max_tokens": 64,
+        }
+    ]
+    assert completions.closed
+
+
+def test_default_model_is_gpt_4_1_mini() -> None:
+    assert interpreter_module.DEFAULT_TRANSLATION_MODEL == "gpt-4.1-mini"
+    assert OpenAITranslator(api_key="k", client=object()).model == "gpt-4.1-mini"
+
+
+def test_max_tokens_is_twice_estimated_input_clamped() -> None:
+    assert estimate_max_tokens("hi") == 64  # min
+    assert estimate_max_tokens("x" * 100) == 100
+    assert estimate_max_tokens("x" * 101) == 102
+    assert estimate_max_tokens("x" * 5000) == 512  # max
+
+
+def test_adapter_wraps_plain_translator_and_passes_streams_through() -> None:
+    async def plain(messages):
+        return "whole"
+
+    async def empty(messages):
+        return ""
+
+    async def streaming(messages):
+        yield "a"
+        yield "b"
+
+    assert asyncio.run(collect(as_streaming_translator(plain)([]))) == ["whole"]
+    assert asyncio.run(collect(as_streaming_translator(empty)([]))) == []
+    assert asyncio.run(collect(as_streaming_translator(streaming)([]))) == ["a", "b"]
+
+
+# -- chunking -------------------------------------------------------------------
+
+
+def chunks_of(text: str, step: int | None = None) -> list[str]:
+    chunker = SentenceChunker()
+    out: list[str] = []
+    pieces = [text] if step is None else [text[i : i + step] for i in range(0, len(text), step)]
+    for piece in pieces:
+        out += chunker.feed(piece)
+    return out + chunker.flush()
+
+
+def test_chunker_splits_sentences_on_terminators_followed_by_space_or_end() -> None:
+    text = "Hello there. How are you? Fine! Wait... Really\u2026 Yes"
+    expected = ["Hello there.", "How are you?", "Fine!", "Wait...", "Really\u2026", "Yes"]
+    assert chunks_of(text) == expected
+    # Same result however the stream is sliced, including one character at a time.
+    for step in (1, 2, 3, 7):
+        assert chunks_of(text, step) == expected
+
+
+def test_chunker_does_not_split_decimals_or_short_clauses() -> None:
+    assert chunks_of("It costs 3.5 dollars, maybe 4,000 later") == [
+        "It costs 3.5 dollars, maybe 4,000 later"
+    ]
+    # Fewer than 40 chars pending: a comma, semicolon or colon is not a boundary.
+    assert chunks_of("Well, yes; sure: ok") == ["Well, yes; sure: ok"]
+
+
+def test_chunker_splits_clauses_once_forty_chars_are_pending() -> None:
+    text = "When the meeting finally starts tomorrow morning, please bring the report; thanks"
+    first = text.index(",") + 1
+    assert first >= 40
+    assert chunks_of(text) == [
+        "When the meeting finally starts tomorrow morning,",
+        "please bring the report; thanks",
+    ]
+    long_semicolon = "x" * 38 + "ab; and then more words follow"
+    assert chunks_of(long_semicolon) == ["x" * 38 + "ab;", "and then more words follow"]
+    assert chunks_of("x" * 36 + "ab: rest") == ["x" * 36 + "ab: rest"]  # 39 chars incl. colon
+    assert chunks_of("x" * 37 + "ab: rest") == ["x" * 37 + "ab:", "rest"]  # 40 chars
+
+
+def test_chunker_handles_cjk_punctuation_without_spaces() -> None:
+    assert chunks_of("\u4f60\u597d\u3002\u4eca\u5929\u600e\u4e48\u6837\uff1f\u5f88\u597d\uff01\u8c22\u8c22") == [
+        "\u4f60\u597d\u3002",
+        "\u4eca\u5929\u600e\u4e48\u6837\uff1f",
+        "\u5f88\u597d\uff01",
+        "\u8c22\u8c22",
+    ]
+    # Trailing closing quotes stay with their sentence.
+    assert chunks_of("\u300c\u3053\u3093\u306b\u3061\u306f\u3002\u300d\u3068\u8a00\u3063\u305f\u3002") == [
+        "\u300c\u3053\u3093\u306b\u3061\u306f\u3002\u300d",
+        "\u3068\u8a00\u3063\u305f\u3002",
+    ]
+    assert chunks_of("\u3053\u3093\u306b\u3061\u306f\u3002\u3053\u3093\u306b\u3061\u306f\u3002", 1) == [
+        "\u3053\u3093\u306b\u3061\u306f\u3002",
+        "\u3053\u3093\u306b\u3061\u306f\u3002",
+    ]
+
+
+def test_chunker_waits_for_text_after_a_trailing_terminator() -> None:
+    chunker = SentenceChunker()
+    assert chunker.feed("Version 3.") == []  # could be "3.5"
+    assert chunker.feed("5 is out.") == []
+    assert chunker.feed(" Next") == ["Version 3.5 is out."]
+    assert chunker.flush() == ["Next"]
+    assert chunker.flush() == []
 
 
 # -- pipeline behaviour --------------------------------------------------------
@@ -370,11 +494,17 @@ def test_events_use_roles_languages_and_translation_latency() -> None:
     ]
     assert transcripts[0]["user_id"] == "speaker"
     latency = session.of("LatencyMeasured")
-    assert len(latency) == 2
-    assert latency[0]["metric"] == "translation_ms"
-    assert latency[0]["processor"] == "interpreter"
-    assert latency[0]["model"] == "test-model"
-    assert isinstance(latency[0]["value_ms"], float) and latency[0]["value_ms"] >= 0
+    assert [p["metric"] for p in latency] == [
+        "translation_first_chunk_ms",
+        "translation_ms",
+        "translation_first_chunk_ms",
+        "translation_ms",
+    ]
+    for payload in latency:
+        assert payload["processor"] == "interpreter"
+        assert payload["model"] == "test-model"
+        assert isinstance(payload["value_ms"], float) and payload["value_ms"] >= 0
+    assert latency[0]["value_ms"] <= latency[1]["value_ms"]
 
 
 def test_one_way_translates_to_fixed_target() -> None:
@@ -397,6 +527,241 @@ def test_event_loss_never_breaks_interpretation() -> None:
 
     down, _ = run(make_processor(session=ClosedSession()), utterance("Hello", "en"))
     assert spoken(down) == ["T:Hello"]
+
+
+def test_streamed_chunks_are_spoken_in_order_and_full_text_emitted_once() -> None:
+    async def translate(messages):
+        for delta in ("Privet. ", "Kak ", "dela? ", "Horosho"):
+            yield delta
+
+    session = FakeSession()
+    processor = make_processor(translate, session=session)
+    down, _ = run(processor, utterance("Hello", "en"))
+
+    assert spoken(down) == ["Privet.", "Kak dela?", "Horosho"]
+    assistant = [p for p in session.of("TranscriptFinal") if p["role"] == "assistant"]
+    assert [p["content"] for p in assistant] == ["Privet. Kak dela? Horosho"]
+
+
+def _process_directly(processor):
+    frames: list = []
+
+    async def capture(frame, direction=None) -> None:
+        frames.append(frame)
+
+    processor.push_frame = capture
+    return frames
+
+
+def test_first_chunk_is_spoken_before_the_translation_completes() -> None:
+    async def scenario():
+        release = asyncio.Event()
+
+        async def translate(messages):
+            yield "First sentence. Sec"
+            await release.wait()  # the rest of the translation is "slow"
+            yield "ond sentence."
+
+        session = FakeSession()
+        processor = make_processor(translate, session=session)
+        frames = _process_directly(processor)
+        task = asyncio.create_task(processor.process_utterance(_utt("hello", "en")))
+        for _ in range(100):
+            await asyncio.sleep(0.005)
+            if any(isinstance(f, TTSSpeakFrame) for f in frames):
+                break
+        assert [f.text for f in frames if isinstance(f, TTSSpeakFrame)] == ["First sentence."]
+        assert not task.done()
+        # Only the first-chunk latency exists so far; the assistant transcript is still
+        # pending and no complete-translation metric has been emitted.
+        assert [p["metric"] for p in session.of("LatencyMeasured")] == ["translation_first_chunk_ms"]
+        assert not [p for p in session.of("TranscriptFinal") if p["role"] == "assistant"]
+        release.set()
+        await task
+        return frames, session
+
+    frames, session = asyncio.run(scenario())
+    assert [f.text for f in frames if isinstance(f, TTSSpeakFrame)] == [
+        "First sentence.",
+        "Second sentence.",
+    ]
+    metrics = {p["metric"]: p["value_ms"] for p in session.of("LatencyMeasured")}
+    assert set(metrics) == {"translation_first_chunk_ms", "translation_ms"}
+    assert metrics["translation_first_chunk_ms"] < metrics["translation_ms"]
+
+
+def test_language_update_precedes_first_chunk_only() -> None:
+    async def translate(messages):
+        yield "One. Two. "
+        yield "Three."
+
+    processor = make_processor(translate, initial_tts_language="en")
+    down, _ = run(processor, utterance("hello", "en"))  # en -> ru, TTS currently en
+
+    kinds = [
+        ("lang", f.delta.language) if isinstance(f, TTSUpdateSettingsFrame) else ("say", f.text)
+        for f in down
+        if isinstance(f, (TTSUpdateSettingsFrame, TTSSpeakFrame))
+    ]
+    assert kinds == [("lang", "ru"), ("say", "One."), ("say", "Two."), ("say", "Three.")]
+
+
+def test_streaming_utterances_stay_in_order_when_the_first_is_slow() -> None:
+    async def translate(messages):
+        text = messages[-1]["content"]
+        if text == "first":
+            await asyncio.sleep(0.12)
+        yield f"{text}-a. "
+        await asyncio.sleep(0.01)
+        yield f"{text}-b."
+
+    down, _ = run(make_processor(translate), sum((utterance(t, "en") for t in ("first", "second")), []))
+    assert spoken(down) == ["first-a.", "first-b.", "second-a.", "second-b."]
+
+
+def test_mid_stream_error_speaks_nothing_further_and_continues() -> None:
+    async def translate(messages):
+        text = messages[-1]["content"]
+        if text == "boom":
+            yield "Spoken. Half a sen"
+            raise RuntimeError("stream dropped")
+        yield f"ok-{text}."
+
+    session = FakeSession()
+    down, _ = run(
+        make_processor(translate, session=session),
+        sum((utterance(t, "en") for t in ("boom", "next")), []),
+    )
+
+    assert spoken(down) == ["Spoken.", "ok-next."]  # the unfinished fragment is never spoken
+    assistant = [p["content"] for p in session.of("TranscriptFinal") if p["role"] == "assistant"]
+    assert assistant == ["Spoken.", "ok-next."]
+    metrics = [p["metric"] for p in session.of("LatencyMeasured")]
+    assert metrics.count("translation_ms") == 1  # only the successful utterance
+
+
+def test_failed_stream_does_not_enter_translation_history() -> None:
+    async def translate(messages):
+        yield "Partial. "
+        raise RuntimeError("boom")
+
+    processor = make_processor(translate)
+    processor.push_frame = _discard
+    asyncio.run(processor.process_utterance(_utt("hello", "en")))
+    assert len(processor._history) == 0
+
+
+# -- turn end ------------------------------------------------------------------
+
+
+def test_finalized_segment_after_stop_is_translated_immediately(monkeypatch) -> None:
+    monkeypatch.setattr(interpreter_module, "LATE_SEGMENT_GRACE_SECONDS", 5.0)
+    received: list[str] = []
+
+    async def translate(messages):
+        received.append(messages[-1]["content"])
+        return "ok"
+
+    frames = [
+        UserStartedSpeakingFrame(),
+        SleepFrame(sleep=0.02),
+        UserStoppedSpeakingFrame(),
+        SleepFrame(sleep=0.02),
+        transcript("late but finalized", "en", finalized=True),
+        SleepFrame(sleep=0.05),  # far shorter than the grace period
+    ]
+    run(make_processor(translate), frames)
+    assert received == ["late but finalized"]
+
+
+def test_late_non_finalized_segment_waits_for_its_finalized_continuation(monkeypatch) -> None:
+    monkeypatch.setattr(interpreter_module, "LATE_SEGMENT_GRACE_SECONDS", 5.0)
+    received: list[str] = []
+
+    async def translate(messages):
+        received.append(messages[-1]["content"])
+        return "ok"
+
+    frames = [
+        UserStartedSpeakingFrame(),
+        SleepFrame(sleep=0.02),
+        UserStoppedSpeakingFrame(),
+        SleepFrame(sleep=0.02),
+        transcript("where is", "en", finalized=False),
+        SleepFrame(sleep=0.05),
+        transcript("the station", "en", finalized=True),
+        SleepFrame(sleep=0.05),
+    ]
+    run(make_processor(translate), frames)
+    assert received == ["where is the station"]  # one sentence, one translation
+
+
+def test_late_non_finalized_segment_is_translated_after_the_grace_period(monkeypatch) -> None:
+    monkeypatch.setattr(interpreter_module, "LATE_SEGMENT_GRACE_SECONDS", 0.05)
+    received: list[str] = []
+
+    async def translate(messages):
+        received.append(messages[-1]["content"])
+        return "ok"
+
+    frames = [
+        UserStartedSpeakingFrame(),
+        SleepFrame(sleep=0.02),
+        UserStoppedSpeakingFrame(),
+        SleepFrame(sleep=0.02),
+        transcript("never finalized", "en", finalized=False),
+        SleepFrame(sleep=0.25),
+    ]
+    run(make_processor(translate), frames)
+    assert received == ["never finalized"]
+
+
+def test_pending_late_segment_is_not_merged_into_the_next_turn(monkeypatch) -> None:
+    monkeypatch.setattr(interpreter_module, "LATE_SEGMENT_GRACE_SECONDS", 5.0)
+    received: list[str] = []
+
+    async def translate(messages):
+        received.append(messages[-1]["content"])
+        return "ok"
+
+    frames = [
+        UserStartedSpeakingFrame(),
+        UserStoppedSpeakingFrame(),
+        transcript("old turn", "en", finalized=False),
+        SleepFrame(sleep=0.02),
+        UserStartedSpeakingFrame(),
+        SleepFrame(sleep=0.02),
+        transcript("new turn", "en"),
+        UserStoppedSpeakingFrame(),
+        SleepFrame(sleep=0.05),
+    ]
+    run(make_processor(translate), frames)
+    assert received == ["old turn", "new turn"]
+
+
+def test_one_sentence_is_never_translated_twice() -> None:
+    """A finalized segment mid-turn, the stop signal and a duplicate stop yield one call."""
+
+    received: list[str] = []
+
+    async def translate(messages):
+        received.append(messages[-1]["content"])
+        yield "Where is the station?"
+
+    frames = [
+        UserStartedSpeakingFrame(),
+        SleepFrame(sleep=0.02),
+        transcript("where is", "en", finalized=False),
+        transcript("the station", "en", finalized=True),  # VAD finalize while turn is open
+        SleepFrame(sleep=0.05),
+        UserStoppedSpeakingFrame(),
+        SleepFrame(sleep=0.02),
+        UserStoppedSpeakingFrame(),
+        SleepFrame(sleep=0.4),  # longer than the late-segment grace period
+    ]
+    down, _ = run(make_processor(translate), frames)
+    assert received == ["where is the station"]
+    assert spoken(down) == ["Where is the station?"]
 
 
 # -- pipeline builder ----------------------------------------------------------
@@ -476,6 +841,9 @@ def test_interpreter_pipeline_disables_interruptions_and_fixes_one_way_source(li
     user_turns = processors[3]
     starts = user_turns._user_turn_controller._user_turn_strategies.start
     assert starts and all(strategy._enable_interruptions is False for strategy in starts)
+    stops = user_turns._user_turn_controller._user_turn_strategies.stop
+    assert [type(strategy).__name__ for strategy in stops] == ["SpeechTimeoutUserTurnStopStrategy"]
+    assert stops[0]._user_speech_timeout == 0.3
 
 
 def test_builder_keeps_agent_pipeline_for_agent_mode(light_models) -> None:

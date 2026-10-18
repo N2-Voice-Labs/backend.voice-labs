@@ -49,6 +49,8 @@ class Agent(Base):
     )
     mode: Mapped[str] = mapped_column(String(20), default="agent", server_default="agent")
     interpreter: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # Agent + translator (TR-040): {working_language, caller_languages}.
+    translation: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     status: Mapped[str] = mapped_column(String(30), default="enabled")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow

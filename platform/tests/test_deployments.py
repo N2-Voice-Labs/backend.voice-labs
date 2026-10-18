@@ -153,3 +153,62 @@ def test_delete_archives_and_archived_is_terminal() -> None:
             response = client.patch(f"/deployments/{deployment['id']}", json=patch)
             assert response.status_code == 409
             assert response.json()["detail"] == "deployment_archived"
+
+
+VALID_TRANSFER_TO = ["+14155550123", "tel:+14155550123", "sip:support@example.com", "sips:s@example.com"]
+INVALID_TRANSFER_TO = [
+    "555-1234",
+    "14155550123",
+    "+0123",
+    "",
+    " +14155550123",
+    "http://example.com",
+    "sip:",
+    "sip:has space@example.com",
+    "sip:" + "a" * 252,
+    12345,
+    ["+14155550123"],
+]
+
+
+def test_transfer_to_validated_on_create_and_patch() -> None:
+    with TestClient(app) as client:
+        agent = make_agent(client)
+        for value in VALID_TRANSFER_TO:
+            created = make_deployment(
+                client, agent["id"], configuration={"transfer_to": value}
+            )
+            assert created["configuration"]["transfer_to"] == value
+        # Optional: absent or null is fine.
+        make_deployment(client, agent["id"], configuration={"theme": "dark"})
+        make_deployment(client, agent["id"], configuration={"transfer_to": None})
+
+        deployment = make_deployment(client, agent["id"])
+        for value in INVALID_TRANSFER_TO:
+            body = {"agent_id": agent["id"], "name": "x", "channel": "web",
+                    "configuration": {"transfer_to": value}}
+            response = client.post("/deployments", json=body)
+            assert response.status_code == 422, value
+            assert "invalid_transfer_to" in response.text, value
+            response = client.patch(
+                f"/deployments/{deployment['id']}",
+                json={"configuration": {"transfer_to": value}},
+            )
+            assert response.status_code == 422, value
+            assert "invalid_transfer_to" in response.text, value
+        ok = client.patch(
+            f"/deployments/{deployment['id']}",
+            json={"configuration": {"transfer_to": "+442071234567"}},
+        )
+        assert ok.status_code == 200
+        assert ok.json()["configuration"]["transfer_to"] == "+442071234567"
+        # The 255-character limit is inclusive.
+        boundary = "sip:" + "a" * 251
+        assert len(boundary) == 255
+        assert (
+            client.patch(
+                f"/deployments/{deployment['id']}",
+                json={"configuration": {"transfer_to": boundary}},
+            ).status_code
+            == 200
+        )

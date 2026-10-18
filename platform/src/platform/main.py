@@ -3,7 +3,7 @@
 import hmac
 import os
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
 import httpx
@@ -35,6 +35,7 @@ from .validation import (
     OUTCOMES,
     AUTO_DIRECTION_LANGUAGES,
     INTERPRETER_LANGUAGES,
+    REALTIME_TRANSLATE_OUTPUT_LANGUAGES,
     reject_secret_configuration,
 )
 
@@ -49,7 +50,7 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="Voice Labs Platform", version="0.1.0", lifespan=lifespan)
 RUNTIME_PROVIDER_SETTINGS = {
     "stt": {"model", "language", "interim_results", "smart_format"},
-    "llm": {"model", "temperature", "max_tokens", "top_p"},
+    "llm": {"model", "temperature", "max_tokens", "top_p", "translation_model"},
     "tts": {"model", "language"},
 }
 app.add_middleware(
@@ -83,6 +84,7 @@ for router in (
 class InterpreterConfig(BaseModel):
     languages: list[str]
     direction: str = "auto"
+    engine: Literal["cascaded", "realtime"] = "cascaded"
 
     @field_validator("languages", mode="before")
     @classmethod
@@ -115,6 +117,85 @@ class InterpreterConfig(BaseModel):
         return value
 
 
+def validate_interpreter_engine(interpreter: Any) -> None:
+    """Reject engine/direction/language combinations the engine cannot serve (422).
+
+    ``realtime`` (OpenAI gpt-realtime-translate) translates one audio stream into one
+    fixed output language per session and does not report the spoken language, so it
+    supports ``one_way`` only and its target (``languages[1]``) must be one of the
+    model's output languages.
+    """
+
+    if interpreter is None:
+        return
+    if isinstance(interpreter, InterpreterConfig):
+        interpreter = interpreter.model_dump()
+    if interpreter.get("engine", "cascaded") != "realtime":
+        return
+    languages = interpreter.get("languages") or []
+    if (
+        interpreter.get("direction") != "one_way"
+        or len(languages) != 2
+        or languages[1] not in REALTIME_TRANSLATE_OUTPUT_LANGUAGES
+    ):
+        raise HTTPException(status_code=422, detail="invalid_interpreter_config")
+
+
+MAX_CALLER_LANGUAGES = 4
+
+
+def validate_agent_translation(
+    mode: str, translation: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    """Validate an agent's ``translation`` block (TR-040) and return it normalized.
+
+    ``{"working_language": code, "caller_languages": [codes]}``: the agent reasons in
+    the working language while callers speak 1-4 other languages. Caller languages are
+    detected per utterance only when every caller language and the working language are
+    in Deepgram's code-switching set (``AUTO_DIRECTION_LANGUAGES``); otherwise exactly
+    one (fixed) caller language is allowed.
+
+    Raises 422 ``translation_not_allowed_for_interpreter`` or ``invalid_translation_config``.
+    """
+
+    if translation is None:
+        return None
+    if mode == "interpreter":
+        raise HTTPException(
+            status_code=422, detail="translation_not_allowed_for_interpreter"
+        )
+    invalid = HTTPException(status_code=422, detail="invalid_translation_config")
+    if not isinstance(translation, dict) or set(translation) != {
+        "working_language",
+        "caller_languages",
+    }:
+        raise invalid
+    working = translation["working_language"]
+    callers = translation["caller_languages"]
+    if (
+        not isinstance(working, str)
+        or not isinstance(callers, list)
+        or not all(isinstance(code, str) for code in callers)
+    ):
+        raise invalid
+    working = working.lower()
+    callers = [code.lower() for code in callers]
+    if (
+        working not in INTERPRETER_LANGUAGES
+        or not 1 <= len(callers) <= MAX_CALLER_LANGUAGES
+        or len(set(callers)) != len(callers)
+        or any(code not in INTERPRETER_LANGUAGES for code in callers)
+        or working in callers
+    ):
+        raise invalid
+    automatic = working in AUTO_DIRECTION_LANGUAGES and all(
+        code in AUTO_DIRECTION_LANGUAGES for code in callers
+    )
+    if not automatic and len(callers) != 1:
+        raise invalid
+    return {"working_language": working, "caller_languages": callers}
+
+
 class AgentIn(BaseModel):
     name: str = Field(min_length=1)
     description: str = ""
@@ -127,6 +208,7 @@ class AgentIn(BaseModel):
     voice_profile_id: UUID | None = None
     mode: str = "agent"
     interpreter: InterpreterConfig | None = None
+    translation: dict[str, Any] | None = None
     status: str = "enabled"
 
     @field_validator("mode", mode="before")
@@ -164,6 +246,7 @@ class AgentPatch(BaseModel):
     voice_profile_id: UUID | None = None
     mode: str | None = None
     interpreter: InterpreterConfig | None = None
+    translation: dict[str, Any] | None = None
     status: str | None = None
 
     @field_validator("name", "enabled_languages", "status", mode="before")
@@ -204,9 +287,24 @@ class Provider(BaseModel):
     enabled: bool
 
 
+class ParticipantIn(BaseModel):
+    """A person in a two-participant interpreter call (TR-020).
+
+    ``language`` must be one of the agent's interpreter languages. Their translated
+    words are spoken in ``voice_profile_id``'s voice (a ready, consented voice profile);
+    without one the agent's voice is used.
+    """
+
+    language: str = Field(min_length=1, max_length=16)
+    voice_profile_id: UUID | None = None
+    display_name: str | None = Field(default=None, max_length=100)
+
+
 class SessionIn(BaseModel):
     agent_id: UUID
     deployment_id: UUID | None = None
+    # The creating browser participant of a two-person interpreter call.
+    participant: ParticipantIn | None = None
 
 
 class OutcomeIn(BaseModel):
@@ -244,6 +342,7 @@ def provider_ids_for_agent(values: dict[str, Any], db: Session) -> dict[str, Any
 
     # Convert interpreter config to dict if present
     interpreter = values.get("interpreter")
+    validate_interpreter_engine(interpreter)
     if interpreter is not None and isinstance(interpreter, InterpreterConfig):
         values["interpreter"] = interpreter.model_dump()
 
@@ -258,6 +357,9 @@ async def health() -> dict[str, str]:
 @app.post("/agents", response_model=Agent, status_code=status.HTTP_201_CREATED)
 async def create_agent(payload: AgentIn, db: Session = Depends(get_db)) -> Agent:
     data = provider_ids_for_agent(payload.model_dump(), db)
+    data["translation"] = validate_agent_translation(
+        data["mode"], data.get("translation")
+    )
     record = AgentRecord(**data)
     db.add(record)
     db.commit()
@@ -296,6 +398,10 @@ async def update_agent(
         raise HTTPException(status_code=422, detail="interpreter_config_required")
     if current_mode == "agent" and current_interpreter is not None:
         raise HTTPException(status_code=422, detail="interpreter_config_not_allowed")
+    if "translation" in changes or "mode" in changes:
+        changes["translation"] = validate_agent_translation(
+            current_mode, changes.get("translation", record.translation)
+        )
 
     for key, value in changes.items():
         setattr(record, key, value)
@@ -351,6 +457,40 @@ def runtime_tools_for_agent(agent_id: str, db: Session) -> list[dict[str, Any]]:
     ]
 
 
+MAX_SESSION_PARTICIPANTS = 2
+
+
+def participant_entry(
+    mode: str | None,
+    interpreter: dict[str, Any] | None,
+    participant: ParticipantIn,
+    db: Session,
+) -> dict[str, Any]:
+    """Validate a participant against an interpreter and build its contract entry.
+
+    Raises 422 ``participants_require_cascaded_interpreter`` / ``invalid_participant_language``
+    and 409 ``selected_voice_unavailable``. Only the cascaded engine can speak in a
+    chosen voice and take a language per speaker.
+    """
+
+    interpreter = interpreter or {}
+    if mode != "interpreter" or interpreter.get("engine", "cascaded") != "cascaded":
+        raise HTTPException(
+            status_code=422, detail="participants_require_cascaded_interpreter"
+        )
+    language = participant.language.strip().lower()
+    if language not in (interpreter.get("languages") or []):
+        raise HTTPException(status_code=422, detail="invalid_participant_language")
+    voice_id = None
+    if participant.voice_profile_id is not None:
+        voice = db.get(Voice, str(participant.voice_profile_id))
+        if voice is None or voice.status != "ready" or not voice.provider_voice_id:
+            raise HTTPException(status_code=409, detail="selected_voice_unavailable")
+        voice_id = voice.provider_voice_id
+    display_name = (participant.display_name or "").strip() or None
+    return {"language": language, "voice_id": voice_id, "display_name": display_name}
+
+
 def agent_has_knowledge(agent_id: str, db: Session) -> bool:
     return (
         db.query(AgentKnowledgeDocument.document_id)
@@ -383,6 +523,11 @@ async def create_session(
             raise HTTPException(status_code=409, detail="deployment_not_active")
         if deployment.agent_id != agent.id:
             raise HTTPException(status_code=409, detail="deployment_agent_mismatch")
+    creator_entry = None
+    if payload.participant is not None:
+        creator_entry = participant_entry(
+            agent.mode, agent.interpreter, payload.participant, db
+        )
     runtime_url = os.getenv("RUNTIME_API_URL")
     runtime_token = os.getenv("PLATFORM_RUNTIME_TOKEN", "")
     if runtime_url and not runtime_token:
@@ -430,8 +575,9 @@ async def create_session(
         for name in ("LIVEKIT_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET")
     )
     token = ""
+    creator_identity = f"browser-{session.id}"
     if configured:
-        token = create_participant_token(session.room_name, f"browser-{session.id}")
+        token = create_participant_token(session.room_name, creator_identity)
     runtime_status = "not_configured"
     request_payload = {
         "session_id": session.id,
@@ -445,10 +591,18 @@ async def create_session(
         "tools": runtime_tools_for_agent(agent.id, db),
         "knowledge_enabled": agent_has_knowledge(agent.id, db),
     }
+    if agent.translation:
+        # Agent + translator (TR-040); absent for ordinary agents.
+        request_payload["translation"] = agent.translation
+    if creator_entry is not None:
+        request_payload["participants"] = {creator_identity: creator_entry}
     if providers:
         request_payload["providers"] = providers
     if provider_settings:
         request_payload["provider_settings"] = provider_settings
+    transfer_to = (deployment.configuration or {}).get("transfer_to") if deployment else None
+    if isinstance(transfer_to, str) and transfer_to:
+        request_payload["transfer_to"] = transfer_to
     session.runtime_contract = request_payload
     db.add(session)
     db.commit()
@@ -560,6 +714,77 @@ async def get_voice_session(
         "transport": session.transport,
         "started_at": session.started_at,
         "ended_at": session.ended_at,
+    }
+
+
+@app.post("/voice/sessions/{session_id}/participants")
+async def add_voice_session_participant(
+    session_id: UUID, payload: ParticipantIn, db: Session = Depends(get_db)
+) -> dict[str, Any]:
+    """Add the second person to a two-participant interpreter call (TR-020).
+
+    Returns the guest's LiveKit connection for the session's room. The participant is
+    stored in the session's runtime contract (so an ensure-running restart carries it)
+    and the live Runtime session is told, so the next utterance is already translated
+    for them. Everyone in the room hears the translated audio; routing a translation
+    only to the other person is future work.
+    """
+
+    session = (
+        db.query(VoiceSession)
+        .filter(VoiceSession.id == str(session_id))
+        .with_for_update()
+        .one_or_none()
+    )
+    if session is None:
+        raise HTTPException(status_code=404, detail="voice_session_not_found")
+    if session.status not in {"created", "running"}:
+        raise HTTPException(status_code=409, detail="session_not_active")
+    contract = dict(session.runtime_contract or {})
+    participants = dict(contract.get("participants") or {})
+    if not participants:
+        raise HTTPException(status_code=409, detail="participants_not_enabled")
+    if len(participants) >= MAX_SESSION_PARTICIPANTS:
+        raise HTTPException(status_code=409, detail="session_full")
+    entry = participant_entry(
+        contract.get("mode"), contract.get("interpreter"), payload, db
+    )
+    if any(existing["language"] == entry["language"] for existing in participants.values()):
+        # Two people speaking the same language have nothing to interpret.
+        raise HTTPException(status_code=422, detail="participant_languages_must_differ")
+    identity = f"guest-{uuid4().hex[:8]}"
+    configured = all(
+        os.getenv(name)
+        for name in ("LIVEKIT_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET")
+    )
+    token = create_participant_token(session.room_name, identity) if configured else ""
+
+    runtime_url = os.getenv("RUNTIME_API_URL")
+    runtime_token = os.getenv("PLATFORM_RUNTIME_TOKEN", "")
+    if runtime_url:
+        if not runtime_token:
+            raise HTTPException(status_code=503, detail="runtime_auth_not_configured")
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.post(
+                    f"{runtime_url.rstrip('/')}/sessions/{session.id}/participants",
+                    headers={"X-Runtime-Token": runtime_token},
+                    json={"identity": identity, **entry},
+                )
+                # 404: the Runtime does not hold the session (not started yet or
+                # restarted); the stored contract starts it with this participant.
+                if response.status_code != 404:
+                    response.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=503, detail="runtime_unavailable") from exc
+
+    participants[identity] = entry
+    contract["participants"] = participants
+    session.runtime_contract = contract
+    db.commit()
+    return {
+        "participant_identity": identity,
+        "connection": {"url": os.getenv("LIVEKIT_URL", ""), "token": token},
     }
 
 

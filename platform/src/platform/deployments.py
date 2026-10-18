@@ -1,5 +1,6 @@
 """Deployment API: where an agent is reachable (web, SIP phone number, or API)."""
 
+import asyncio
 from typing import Any, Literal
 from uuid import UUID
 
@@ -7,10 +8,11 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy.orm import Session
 
+from . import sip
 from .db import get_db
 from .models import Agent as AgentRecord
 from .models import Deployment as DeploymentRecord
-from .validation import reject_secret_configuration, validate_e164
+from .validation import validate_deployment_configuration, validate_e164
 
 router = APIRouter(tags=["deployments"])
 
@@ -33,7 +35,7 @@ class DeploymentIn(BaseModel):
     @field_validator("configuration")
     @classmethod
     def reject_secret_values(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return reject_secret_configuration(value)
+        return validate_deployment_configuration(value)
 
 
 class Deployment(BaseModel):
@@ -70,7 +72,7 @@ class DeploymentPatch(BaseModel):
     @field_validator("configuration")
     @classmethod
     def reject_secret_values(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return reject_secret_configuration(value)
+        return validate_deployment_configuration(value)
 
 
 def check_phone_invariant(channel: str, phone_number: str | None) -> None:
@@ -161,3 +163,102 @@ async def archive_deployment(
     record = get_deployment_or_404(deployment_id, db)
     record.status = "archived"
     db.commit()
+
+
+class BridgeCallIn(BaseModel):
+    from_number: str
+    to_number: str
+
+    @field_validator("from_number", "to_number")
+    @classmethod
+    def check_number(cls, value: str) -> str:
+        return validate_e164(value)
+
+
+class BridgeParticipant(BaseModel):
+    role: Literal["from", "to"]
+    phone_number: str
+    identity: str
+    participant_id: str
+
+
+class BridgeCall(BaseModel):
+    session_id: str
+    conversation_id: str
+    room_name: str
+    participants: list[BridgeParticipant]
+
+
+@router.post(
+    "/deployments/{deployment_id}/bridge-call",
+    response_model=BridgeCall,
+    status_code=status.HTTP_201_CREATED,
+)
+async def bridge_call(
+    deployment_id: UUID, payload: BridgeCallIn, db: Session = Depends(get_db)
+) -> BridgeCall:
+    """Phone interpreter: dial both parties into one room with the interpreter agent.
+
+    Both legs join the same LiveKit room as the interpreter runtime, which hears them
+    and speaks translations into the room. The session is created without TR-020
+    participants (each leg's SIP identity is only known once the session exists), so
+    nobody is mapped to a language; the interpreter's own detection of the spoken
+    language must pick the direction. That needs the cascaded engine with ``auto``
+    direction: ``one_way`` or the one-direction ``realtime`` engine would translate
+    only one party, so they are rejected with ``bridge_requires_two_way_interpreter``.
+    The ``from`` party is dialed first, then ``to``; if ``to`` does not connect, the
+    session is ended and ``from`` is hung up.
+    """
+
+    record = get_deployment_or_404(deployment_id, db)
+    agent = db.get(AgentRecord, record.agent_id)
+    if record.channel != "sip":
+        raise HTTPException(status_code=422, detail="deployment_not_sip")
+    if agent is None or agent.mode != "interpreter":
+        raise HTTPException(status_code=422, detail="agent_not_interpreter")
+    interpreter = agent.interpreter or {}
+    if (
+        interpreter.get("engine", "cascaded") != "cascaded"
+        or interpreter.get("direction", "auto") != "auto"
+    ):
+        raise HTTPException(status_code=422, detail="bridge_requires_two_way_interpreter")
+    if record.status != "active":
+        raise HTTPException(status_code=409, detail="deployment_not_active")
+    if payload.from_number == payload.to_number:
+        raise HTTPException(status_code=422, detail="bridge_numbers_must_differ")
+    if not sip.sip_configured():
+        raise HTTPException(status_code=409, detail="sip_not_configured")
+    try:
+        session = await sip.create_voice_session(record.agent_id, record.id)
+    except sip.SessionCreateError as exc:
+        raise HTTPException(status_code=502, detail="session_create_failed") from exc
+    session_id = str(session["session_id"])
+    room_name = str(session["room_name"])
+    participants: list[BridgeParticipant] = []
+    for role, number in (("from", payload.from_number), ("to", payload.to_number)):
+        identity = f"{sip.SIP_IDENTITY_PREFIX}{role}-{session_id}"
+        try:
+            participant_id = await sip.dial(number, room_name, identity)
+        except sip.SipError as exc:
+            await asyncio.gather(
+                sip.end_voice_session(session_id),
+                *(sip.hangup(room_name, item.identity) for item in participants),
+            )
+            raise HTTPException(
+                status_code=502,
+                detail="sip_dial_failed",
+            ) from exc
+        participants.append(
+            BridgeParticipant(
+                role=role,
+                phone_number=number,
+                identity=identity,
+                participant_id=participant_id,
+            )
+        )
+    return BridgeCall(
+        session_id=session_id,
+        conversation_id=str(session["conversation_id"]),
+        room_name=room_name,
+        participants=participants,
+    )

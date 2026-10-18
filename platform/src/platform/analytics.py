@@ -45,6 +45,9 @@ def latency_sample(payload: Any) -> tuple[str, float] | None:
     )
     if not metric or value is None:
         return None
+    # Pipecat reports a zero TTFB when each STT/TTS service connects, before any speech.
+    if metric.endswith("_ttfb") and value <= 0:
+        return None
     return metric, float(value)
 
 
