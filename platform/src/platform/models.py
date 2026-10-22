@@ -146,6 +146,9 @@ class VoiceSession(Base):
     transport: Mapped[str] = mapped_column(String(50), default="livekit")
     room_name: Mapped[str] = mapped_column(String(255), unique=True)
     runtime_contract: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # SHA-256 hex digests of session tokens (RM-004); the tokens themselves are never stored.
+    session_token_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    guest_token_hashes: Mapped[list | None] = mapped_column(JSON, nullable=True)
 
 
 class RuntimeEvent(Base):

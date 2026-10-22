@@ -14,7 +14,7 @@ from .participants import ParticipantDirectory, ParticipantError
 from .pipeline import PipelineConfig
 from . import sip_transfer
 from .session import RuntimeSession, SessionState
-from .tts_preview import TTSPreviewError, synthesize_preview
+from .tts_preview import PREVIEW_PROVIDERS, TTSPreviewError, get_preview_provider
 from .voice_cloning import (
     CloneProviderError,
     SampleUnavailable,
@@ -235,14 +235,23 @@ async def start_session(
     return {"status": "accepted"}
 
 
+def _engine_supports_two_way(interpreter: dict[str, Any]) -> bool:
+    """Whether the engine this interpreter config resolves to serves several speakers."""
+
+    from .interpreter import InterpreterSettings
+    from .translation_engine import get_engine
+
+    try:
+        return get_engine(InterpreterSettings.from_mapping(interpreter).engine).supports_two_way
+    except RuntimeError:
+        return False
+
+
 def _build_participant_directory(payload: SessionStart) -> ParticipantDirectory:
     """Validate and index ``participants`` (422 when they do not fit the session)."""
 
     interpreter = payload.interpreter or {}
-    if (
-        payload.mode != "interpreter"
-        or (interpreter.get("engine") or "cascaded") != "cascaded"
-    ):
+    if payload.mode != "interpreter" or not _engine_supports_two_way(interpreter):
         raise HTTPException(
             status_code=422, detail="participants_require_cascaded_interpreter"
         )
@@ -370,13 +379,14 @@ async def tts_preview(
         or not hmac.compare_digest(x_runtime_token, expected)
     ):
         raise HTTPException(status_code=401, detail="invalid_runtime_token")
-    if payload.provider != "cartesia":
+    if payload.provider not in PREVIEW_PROVIDERS:
         raise HTTPException(status_code=422, detail="unsupported_tts_provider")
-    api_key = os.getenv("CARTESIA_API_KEY")
+    preview = get_preview_provider(payload.provider)
+    api_key = os.getenv(preview.api_key_env)
     if not api_key:
         raise HTTPException(status_code=503, detail="tts_not_configured")
     try:
-        audio = await synthesize_preview(
+        audio = await preview.synthesize(
             api_key=api_key,
             provider_voice_id=payload.provider_voice_id,
             text=payload.text,

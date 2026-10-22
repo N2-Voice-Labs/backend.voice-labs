@@ -28,7 +28,7 @@ def test_create_interpreter_agent_auto_en_ru() -> None:
         assert response.status_code == 201
         agent = response.json()
         assert agent["mode"] == "interpreter"
-        assert agent["interpreter"] == {"languages": ["en", "ru"], "direction": "auto", "engine": "cascaded"}
+        assert agent["interpreter"] == {"languages": ["en", "ru"], "direction": "auto", "engine": "cascaded", "latency_mode": "balanced", "hear_original": False}
 
 
 def test_create_interpreter_agent_one_way_ko_en() -> None:
@@ -44,7 +44,7 @@ def test_create_interpreter_agent_one_way_ko_en() -> None:
         assert response.status_code == 201
         agent = response.json()
         assert agent["mode"] == "interpreter"
-        assert agent["interpreter"] == {"languages": ["ko", "en"], "direction": "one_way", "engine": "cascaded"}
+        assert agent["interpreter"] == {"languages": ["ko", "en"], "direction": "one_way", "engine": "cascaded", "latency_mode": "balanced", "hear_original": False}
 
 
 def test_create_interpreter_agent_auto_with_unsupported_language_ko() -> None:
@@ -178,7 +178,7 @@ def test_patch_agent_to_interpreter_mode() -> None:
         assert response.status_code == 200
         updated = response.json()
         assert updated["mode"] == "interpreter"
-        assert updated["interpreter"] == {"languages": ["en", "ru"], "direction": "auto", "engine": "cascaded"}
+        assert updated["interpreter"] == {"languages": ["en", "ru"], "direction": "auto", "engine": "cascaded", "latency_mode": "balanced", "hear_original": False}
 
 
 def test_patch_interpreter_to_agent_mode() -> None:
@@ -267,7 +267,7 @@ def test_session_contract_includes_mode_and_interpreter_interpreter() -> None:
         assert "mode" in contract
         assert contract["mode"] == "interpreter"
         assert "interpreter" in contract
-        assert contract["interpreter"] == {"languages": ["en", "ru"], "direction": "auto", "engine": "cascaded"}
+        assert contract["interpreter"] == {"languages": ["en", "ru"], "direction": "auto", "engine": "cascaded", "latency_mode": "balanced", "hear_original": False}
 
 
 def test_get_agent_includes_mode_and_interpreter() -> None:
@@ -283,7 +283,7 @@ def test_get_agent_includes_mode_and_interpreter() -> None:
 
         retrieved = client.get(f"/agents/{created['id']}").json()
         assert retrieved["mode"] == "interpreter"
-        assert retrieved["interpreter"] == {"languages": ["en", "ru"], "direction": "auto", "engine": "cascaded"}
+        assert retrieved["interpreter"] == {"languages": ["en", "ru"], "direction": "auto", "engine": "cascaded", "latency_mode": "balanced", "hear_original": False}
 
 
 def test_list_agents_includes_mode_and_interpreter() -> None:
@@ -373,6 +373,8 @@ def test_create_realtime_agent_one_way_reaches_runtime_contract() -> None:
             "languages": ["ru", "en"],
             "direction": "one_way",
             "engine": "realtime",
+            "latency_mode": "balanced",
+            "hear_original": False,
         }
         session = client.post("/voice/sessions", json={"agent_id": agent["id"]}).json()
         assert contract_for(session["session_id"])["interpreter"]["engine"] == "realtime"
@@ -422,3 +424,142 @@ def test_unknown_engine_is_rejected() -> None:
     with TestClient(app) as client:
         response = client.post("/agents", json=_realtime_agent(["en", "ru"], engine="whisper"))
         assert response.status_code == 422
+
+
+# -- latency modes (RM-011) -------------------------------------------------------------
+
+
+def _mode_agent(languages, direction, mode=None, **interpreter):
+    config = {"languages": languages, "direction": direction, **interpreter}
+    if mode is not None:
+        config["latency_mode"] = mode
+    return {"name": "Modes", "mode": "interpreter", "interpreter": config}
+
+
+def test_latency_mode_defaults_to_balanced_and_old_rows_read_back_balanced() -> None:
+    from src.platform.models import Agent as AgentRecord
+
+    with TestClient(app) as client:
+        agent = client.post("/agents", json=_mode_agent(["en", "ru"], "auto")).json()
+        assert agent["interpreter"]["latency_mode"] == "balanced"
+        with SessionLocal() as db:
+            record = db.get(AgentRecord, agent["id"])
+            record.interpreter = {"languages": ["en", "ru"], "direction": "auto"}
+            db.commit()
+        assert client.get(f"/agents/{agent['id']}").json()["interpreter"]["latency_mode"] == "balanced"
+
+
+def test_each_latency_mode_is_stored_and_reaches_the_runtime_contract() -> None:
+    with TestClient(app) as client:
+        for mode in ("balanced", "accurate"):
+            agent = client.post("/agents", json=_mode_agent(["en", "ru"], "auto", mode)).json()
+            assert agent["interpreter"]["latency_mode"] == mode
+            assert agent["interpreter"]["engine"] == "cascaded"
+            session = client.post("/voice/sessions", json={"agent_id": agent["id"]}).json()
+            assert contract_for(session["session_id"])["interpreter"]["latency_mode"] == mode
+
+
+def test_unknown_latency_mode_is_rejected_on_create_and_patch() -> None:
+    with TestClient(app) as client:
+        for bad in ("fast", "INSTANT", ""):
+            response = client.post("/agents", json=_mode_agent(["en", "ru"], "auto", bad))
+            assert response.status_code == 422, bad
+            assert response.json()["detail"] == "invalid_interpreter_config"
+        agent = client.post("/agents", json=_mode_agent(["en", "ru"], "auto")).json()
+        patched = client.patch(
+            f"/agents/{agent['id']}",
+            json={"interpreter": {"languages": ["en", "ru"], "direction": "auto", "latency_mode": "warp"}},
+        )
+        assert patched.status_code == 422
+        assert patched.json()["detail"] == "invalid_interpreter_config"
+        assert client.post(
+            "/agents",
+            json={**_mode_agent(["en", "ru"], "auto"), "interpreter": {
+                "languages": ["en", "ru"], "direction": "auto", "latency_mode": 5}},
+        ).status_code == 422  # not a string at all
+
+
+def test_instant_picks_realtime_when_the_config_allows_it() -> None:
+    with TestClient(app) as client:
+        agent = client.post("/agents", json=_mode_agent(["ko", "en"], "one_way", "instant")).json()
+        assert agent["interpreter"]["engine"] == "realtime"
+        assert agent["interpreter"]["latency_mode"] == "instant"
+        session = client.post("/voice/sessions", json={"agent_id": agent["id"]}).json()
+        contract = contract_for(session["session_id"])["interpreter"]
+        assert (contract["engine"], contract["latency_mode"]) == ("realtime", "instant")
+
+
+def test_instant_stays_cascaded_when_realtime_cannot_serve_the_config() -> None:
+    with TestClient(app) as client:
+        two_way = client.post("/agents", json=_mode_agent(["en", "ru"], "auto", "instant")).json()
+        assert two_way["interpreter"]["engine"] == "cascaded"
+        # nl is a valid cascaded language but not a realtime output language.
+        nl = client.post("/agents", json=_mode_agent(["en", "nl"], "one_way", "instant")).json()
+        assert nl["interpreter"]["engine"] == "cascaded"
+        # balanced / accurate never pick realtime on their own.
+        for mode in ("balanced", "accurate"):
+            agent = client.post("/agents", json=_mode_agent(["ko", "en"], "one_way", mode)).json()
+            assert agent["interpreter"]["engine"] == "cascaded"
+
+
+def test_an_explicit_engine_wins_over_the_mode() -> None:
+    with TestClient(app) as client:
+        forced = client.post(
+            "/agents", json=_mode_agent(["ko", "en"], "one_way", "instant", engine="cascaded")
+        ).json()
+        assert (forced["interpreter"]["engine"], forced["interpreter"]["latency_mode"]) == (
+            "cascaded", "instant",
+        )  # fmt: skip
+        realtime = client.post(
+            "/agents", json=_mode_agent(["ko", "en"], "one_way", "accurate", engine="realtime")
+        ).json()
+        assert realtime["interpreter"]["engine"] == "realtime"
+        # Engine rules still apply to an explicit choice: realtime is one way only.
+        bad = client.post(
+            "/agents", json=_mode_agent(["en", "ru"], "auto", "instant", engine="realtime")
+        )
+        assert bad.status_code == 422 and bad.json()["detail"] == "invalid_interpreter_config"
+
+
+def test_patch_applies_the_mode_engine_rule() -> None:
+    with TestClient(app) as client:
+        agent = client.post("/agents", json=_mode_agent(["ko", "en"], "one_way")).json()
+        assert agent["interpreter"]["engine"] == "cascaded"
+        instant = client.patch(
+            f"/agents/{agent['id']}",
+            json={"interpreter": {"languages": ["ko", "en"], "direction": "one_way", "latency_mode": "instant"}},
+        ).json()
+        assert instant["interpreter"]["engine"] == "realtime"
+        back = client.patch(
+            f"/agents/{agent['id']}",
+            json={"interpreter": {"languages": ["ko", "en"], "direction": "one_way", "latency_mode": "accurate"}},
+        ).json()
+        assert (back["interpreter"]["engine"], back["interpreter"]["latency_mode"]) == (
+            "cascaded", "accurate",
+        )  # fmt: skip
+        pinned = client.patch(
+            f"/agents/{agent['id']}",
+            json={"interpreter": {
+                "languages": ["ko", "en"], "direction": "one_way",
+                "latency_mode": "instant", "engine": "cascaded"}},
+        ).json()
+        assert pinned["interpreter"]["engine"] == "cascaded"
+
+
+def test_two_person_sessions_need_the_cascaded_engine_even_in_instant_mode() -> None:
+    with TestClient(app) as client:
+        auto = client.post("/agents", json=_mode_agent(["ko", "en"], "one_way", "instant")).json()
+        refused = client.post(
+            "/voice/sessions",
+            json={"agent_id": auto["id"], "participant": {"language": "ko"}},
+        )
+        assert refused.status_code == 422
+        assert refused.json()["detail"] == "participants_require_cascaded_interpreter"
+        pinned = client.post(
+            "/agents", json=_mode_agent(["ko", "en"], "one_way", "instant", engine="cascaded")
+        ).json()
+        accepted = client.post(
+            "/voice/sessions",
+            json={"agent_id": pinned["id"], "participant": {"language": "ko"}},
+        )
+        assert accepted.status_code == 201, accepted.text

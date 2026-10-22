@@ -9,7 +9,14 @@ from uuid import UUID, uuid4
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -29,25 +36,36 @@ from .models import (
     VoiceSession,
     utcnow,
 )
-from . import analytics, campaigns, deployments, knowledge, templates, tools, voices
+from . import analytics, auth, campaigns, deployments, knowledge, templates, tools, voices
 from .livekit import create_participant_token
 from .validation import (
     OUTCOMES,
     AUTO_DIRECTION_LANGUAGES,
+    DEFAULT_LATENCY_MODE,
     INTERPRETER_LANGUAGES,
+    LATENCY_MODES,
     REALTIME_TRANSLATE_OUTPUT_LANGUAGES,
     reject_secret_configuration,
+    validate_glossary,
 )
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    auth.log_auth_status()
     if os.getenv("PLATFORM_AUTO_CREATE_SCHEMA") == "1":
         Base.metadata.create_all(bind=engine)
     yield
 
 
-app = FastAPI(title="Voice Labs Platform", version="0.1.0", lifespan=lifespan)
+app = FastAPI(
+    title="Voice Labs Platform",
+    version="0.1.0",
+    lifespan=lifespan,
+    # Secure by default: every route requires the admin key (when PLATFORM_API_KEYS is
+    # set) unless auth.py explicitly allowlists it.
+    dependencies=[Depends(auth.authenticate)],
+)
 RUNTIME_PROVIDER_SETTINGS = {
     "stt": {"model", "language", "interim_results", "smart_format"},
     "llm": {"model", "temperature", "max_tokens", "top_p", "translation_model"},
@@ -61,7 +79,7 @@ app.add_middleware(
         if origin.strip()
     ],
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
-    allow_headers=["content-type", "x-runtime-token"],
+    allow_headers=["content-type", "x-runtime-token", "authorization"],
     # Opt-in for a hosted web origin calling a Platform on the viewer's localhost.
     **(
         {"allow_private_network": True}
@@ -85,6 +103,27 @@ class InterpreterConfig(BaseModel):
     languages: list[str]
     direction: str = "auto"
     engine: Literal["cascaded", "realtime"] = "cascaded"
+    # RM-011: "instant" | "balanced" | "accurate". Checked in ``validate_interpreter_engine``
+    # (422 invalid_interpreter_config). ``instant`` picks the realtime engine when the
+    # config allows it and ``engine`` is not given; see ``resolve_interpreter_engine``.
+    latency_mode: str = DEFAULT_LATENCY_MODE
+    # RM-002: two-person calls also hear each other's original microphone (off by default).
+    hear_original: bool = False
+    # NS-08: terms the translation must respect; validated and normalized by
+    # ``validate_glossary``. Absent from the stored config when not given.
+    glossary: list[dict[str, Any]] | None = None
+
+    @field_validator("glossary", mode="before")
+    @classmethod
+    def validate_glossary_field(cls, value: Any) -> list[dict[str, Any]] | None:
+        return None if value is None else validate_glossary(value)
+
+    @model_serializer(mode="wrap")
+    def omit_empty_glossary(self, handler: Any) -> dict[str, Any]:
+        data = handler(self)
+        if not data.get("glossary"):
+            data.pop("glossary", None)
+        return data
 
     @field_validator("languages", mode="before")
     @classmethod
@@ -130,6 +169,8 @@ def validate_interpreter_engine(interpreter: Any) -> None:
         return
     if isinstance(interpreter, InterpreterConfig):
         interpreter = interpreter.model_dump()
+    if interpreter.get("latency_mode", DEFAULT_LATENCY_MODE) not in LATENCY_MODES:
+        raise HTTPException(status_code=422, detail="invalid_interpreter_config")
     if interpreter.get("engine", "cascaded") != "realtime":
         return
     languages = interpreter.get("languages") or []
@@ -139,6 +180,31 @@ def validate_interpreter_engine(interpreter: Any) -> None:
         or languages[1] not in REALTIME_TRANSLATE_OUTPUT_LANGUAGES
     ):
         raise HTTPException(status_code=422, detail="invalid_interpreter_config")
+
+
+def resolve_interpreter_engine(
+    interpreter: dict[str, Any], engine_explicit: bool
+) -> dict[str, Any]:
+    """Apply the latency mode's engine choice (RM-011) to a validated interpreter dict.
+
+    ``instant`` selects the ``realtime`` engine when none was given explicitly and the
+    config allows it (``one_way`` and a target language the realtime model can speak);
+    otherwise the engine stays as stored (``cascaded``, tuned by the mode in Runtime). An
+    explicit ``engine`` always wins. The stored engine is therefore what Runtime runs.
+    Note: realtime serves one speaker, so a two-person session on an ``instant`` agent
+    needs ``engine: "cascaded"`` set explicitly.
+    """
+
+    languages = interpreter.get("languages") or []
+    if (
+        not engine_explicit
+        and interpreter.get("latency_mode") == "instant"
+        and interpreter.get("direction", "auto") == "one_way"
+        and len(languages) == 2
+        and languages[1] in REALTIME_TRANSLATE_OUTPUT_LANGUAGES
+    ):
+        return {**interpreter, "engine": "realtime"}
+    return interpreter
 
 
 MAX_CALLER_LANGUAGES = 4
@@ -153,9 +219,11 @@ def validate_agent_translation(
     the working language while callers speak 1-4 other languages. Caller languages are
     detected per utterance only when every caller language and the working language are
     in Deepgram's code-switching set (``AUTO_DIRECTION_LANGUAGES``); otherwise exactly
-    one (fixed) caller language is allowed.
+    one (fixed) caller language is allowed. An optional ``glossary`` (NS-08, see
+    ``validate_glossary``) is normalized and kept.
 
-    Raises 422 ``translation_not_allowed_for_interpreter`` or ``invalid_translation_config``.
+    Raises 422 ``translation_not_allowed_for_interpreter``, ``invalid_translation_config``
+    or ``invalid_glossary: <reason>``.
     """
 
     if translation is None:
@@ -165,10 +233,11 @@ def validate_agent_translation(
             status_code=422, detail="translation_not_allowed_for_interpreter"
         )
     invalid = HTTPException(status_code=422, detail="invalid_translation_config")
-    if not isinstance(translation, dict) or set(translation) != {
-        "working_language",
-        "caller_languages",
-    }:
+    if (
+        not isinstance(translation, dict)
+        or not {"working_language", "caller_languages"} <= set(translation)
+        or set(translation) - {"working_language", "caller_languages", "glossary"}
+    ):
         raise invalid
     working = translation["working_language"]
     callers = translation["caller_languages"]
@@ -193,7 +262,13 @@ def validate_agent_translation(
     )
     if not automatic and len(callers) != 1:
         raise invalid
-    return {"working_language": working, "caller_languages": callers}
+    result: dict[str, Any] = {"working_language": working, "caller_languages": callers}
+    if translation.get("glossary"):
+        try:
+            result["glossary"] = validate_glossary(translation["glossary"])
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=f"invalid_glossary: {exc}") from exc
+    return result
 
 
 class AgentIn(BaseModel):
@@ -318,7 +393,9 @@ def agent_response(agent: AgentRecord) -> Agent:
     return Agent.model_validate(agent)
 
 
-def provider_ids_for_agent(values: dict[str, Any], db: Session) -> dict[str, Any]:
+def provider_ids_for_agent(
+    values: dict[str, Any], db: Session, engine_explicit: bool | None = None
+) -> dict[str, Any]:
     for field, kind in (
         ("stt_provider_id", "stt"),
         ("llm_provider_id", "llm"),
@@ -344,7 +421,14 @@ def provider_ids_for_agent(values: dict[str, Any], db: Session) -> dict[str, Any
     interpreter = values.get("interpreter")
     validate_interpreter_engine(interpreter)
     if interpreter is not None and isinstance(interpreter, InterpreterConfig):
-        values["interpreter"] = interpreter.model_dump()
+        values["interpreter"] = interpreter = interpreter.model_dump()
+    if isinstance(interpreter, dict):
+        if not interpreter.get("glossary"):
+            interpreter.pop("glossary", None)
+        if engine_explicit is None:
+            # PATCH bodies are dumped with exclude_unset, so a default engine is absent.
+            engine_explicit = "engine" in interpreter
+        values["interpreter"] = resolve_interpreter_engine(interpreter, engine_explicit)
 
     return values
 
@@ -356,7 +440,12 @@ async def health() -> dict[str, str]:
 
 @app.post("/agents", response_model=Agent, status_code=status.HTTP_201_CREATED)
 async def create_agent(payload: AgentIn, db: Session = Depends(get_db)) -> Agent:
-    data = provider_ids_for_agent(payload.model_dump(), db)
+    data = provider_ids_for_agent(
+        payload.model_dump(),
+        db,
+        engine_explicit=payload.interpreter is not None
+        and "engine" in payload.interpreter.model_fields_set,
+    )
     data["translation"] = validate_agent_translation(
         data["mode"], data.get("translation")
     )
@@ -570,6 +659,7 @@ async def create_session(
         conversation_id=conversation.id,
         room_name=f"voice-labs-{session_id}",
     )
+    session_token, session.session_token_hash = auth.new_session_token()
     configured = all(
         os.getenv(name)
         for name in ("LIVEKIT_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET")
@@ -673,6 +763,7 @@ async def create_session(
         "session_status": session.status,
         "connection_status": "configured" if configured else "not_configured",
         "runtime_status": runtime_status,
+        "session_token": session_token,
     }
 
 
@@ -726,8 +817,8 @@ async def add_voice_session_participant(
     Returns the guest's LiveKit connection for the session's room. The participant is
     stored in the session's runtime contract (so an ensure-running restart carries it)
     and the live Runtime session is told, so the next utterance is already translated
-    for them. Everyone in the room hears the translated audio; routing a translation
-    only to the other person is future work.
+    for them. Runtime routes each translation only to the other person and keeps the
+    original microphones private unless the interpreter sets ``hear_original``.
     """
 
     session = (
@@ -781,10 +872,13 @@ async def add_voice_session_participant(
     participants[identity] = entry
     contract["participants"] = participants
     session.runtime_contract = contract
+    guest_token, guest_hash = auth.new_session_token()
+    session.guest_token_hashes = [*(session.guest_token_hashes or []), guest_hash]
     db.commit()
     return {
         "participant_identity": identity,
         "connection": {"url": os.getenv("LIVEKIT_URL", ""), "token": token},
+        "session_token": guest_token,
     }
 
 

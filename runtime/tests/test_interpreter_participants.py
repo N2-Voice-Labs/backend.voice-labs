@@ -446,7 +446,9 @@ def top_level(worker):
     return [p for p in pipeline._processors if type(p).__name__ not in {"PipelineSource", "PipelineSink"}]
 
 
-def test_builder_creates_one_stt_lane_per_participant(light_models) -> None:
+def test_builder_creates_one_stt_lane_per_participant(light_models, monkeypatch) -> None:
+    monkeypatch.setenv("LIVEKIT_API_KEY", "key")
+    monkeypatch.setenv("LIVEKIT_API_SECRET", "secret")
     config = pipeline_config(
         mode="interpreter",
         interpreter={"languages": ["en", "ko"], "direction": "one_way"},
@@ -460,9 +462,9 @@ def test_builder_creates_one_stt_lane_per_participant(light_models) -> None:
         "PerParticipantLiveKitInput",
         "ParallelPipeline",
         "TranslationProcessor",
-        "CartesiaTTSService",
+        "ParallelPipeline",  # one TTS per listener (RM-001)
         "RuntimeEventProcessor",
-        "LiveKitOutputTransport",
+        "ListenerRoutedLiveKitOutput",
     ]
     lanes = processors[1].processors
     assert len(lanes) == 2

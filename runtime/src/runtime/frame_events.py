@@ -11,6 +11,8 @@ from pipecat.frames.frames import (
     MetricsFrame,
     TextFrame,
     TranscriptionFrame,
+    TTSAudioRawFrame,
+    TTSStoppedFrame,
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
 )
@@ -19,6 +21,7 @@ from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
 from .events import RuntimeEventType
 from .session import RuntimeSession, SessionState
+from .timeline import TimelineTracker
 
 
 def latency_stage(processor_name: str) -> str:
@@ -46,9 +49,12 @@ class RuntimeEventProcessor(FrameProcessor):
         assistant_output: bool = False,
         control_events: bool = True,
         transcript_events: bool = True,
+        timeline: TimelineTracker | None = None,
     ) -> None:
         super().__init__()
         self._session = session
+        # RM-003: translated audio leaving the pipeline (only the latency instance feeds it).
+        self._timeline = timeline
         # Off when another processor owns the transcripts (agent + translator).
         self._transcript_events = transcript_events
         self._assistant_output = assistant_output
@@ -60,6 +66,8 @@ class RuntimeEventProcessor(FrameProcessor):
 
     async def process_frame(self, frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
+        if self._timeline is not None and self._latency_events:
+            self._feed_timeline(frame, direction)
         if self._transcript_events and isinstance(frame, TranscriptionFrame) and frame.finalized:
             language = frame.language.value if frame.language is not None else None
             await self._emit(
@@ -112,6 +120,18 @@ class RuntimeEventProcessor(FrameProcessor):
                 await self._emit("AgentSpeechCancelled")
 
         await self.push_frame(frame, direction)
+
+    def _feed_timeline(self, frame, direction: FrameDirection) -> None:
+        timeline = self._timeline
+        assert timeline is not None
+        if isinstance(frame, BotStoppedSpeakingFrame):
+            timeline.on_idle()
+        elif direction != FrameDirection.DOWNSTREAM:
+            return
+        elif isinstance(frame, TTSAudioRawFrame):
+            timeline.on_audio(frame.audio, frame.sample_rate, frame.num_channels)
+        elif isinstance(frame, TTSStoppedFrame):
+            timeline.on_tts_stopped()
 
     async def _emit_ttfb_latency(self, frame: MetricsFrame) -> None:
         for data in frame.data:

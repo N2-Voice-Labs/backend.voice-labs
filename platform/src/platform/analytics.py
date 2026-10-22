@@ -19,6 +19,9 @@ router = APIRouter(tags=["analytics"])
 # the alternative keys below are tolerated for other emitters.
 METRIC_KEYS = ("metric", "stage", "name")
 VALUE_KEYS = ("value_ms", "latency_ms", "duration_ms", "value")
+# RM-003: one event per translated utterance with the whole timeline; aggregated by engine
+# in the response's ``timeline`` section.
+TIMELINE_METRIC = "utterance_timeline"
 
 
 def percentile(sorted_values: list[float], fraction: float) -> float:
@@ -51,6 +54,39 @@ def latency_sample(payload: Any) -> tuple[str, float] | None:
     return metric, float(value)
 
 
+def _number(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value) if math.isfinite(value) and value >= 0 else None
+
+
+def timeline_sample(payload: Any) -> tuple[str, float, dict[str, float]] | None:
+    """``(engine, value_ms, marks_ms)`` of an ``utterance_timeline`` event, else None."""
+
+    if not isinstance(payload, dict) or payload.get("metric") != TIMELINE_METRIC:
+        return None
+    value = _number(payload.get("value_ms"))
+    if value is None:
+        return None
+    engine = payload.get("engine")
+    marks = payload.get("marks_ms")
+    clean = {
+        name: number
+        for name, raw in (marks.items() if isinstance(marks, dict) else ())
+        if isinstance(name, str) and (number := _number(raw)) is not None
+    }
+    return (engine if isinstance(engine, str) and engine else "unknown", value, clean)
+
+
+def distribution(values: list[float]) -> dict[str, Any]:
+    values = sorted(values)
+    return {
+        "count": len(values),
+        "p50": percentile(values, 0.5),
+        "p95": percentile(values, 0.95),
+    }
+
+
 @router.get("/analytics/summary")
 async def analytics_summary(
     agent_id: UUID | None = None,
@@ -78,6 +114,8 @@ async def analytics_summary(
         )
     )
     samples: dict[str, list[float]] = {}
+    timeline_values: dict[str, list[float]] = {}
+    timeline_marks: dict[str, dict[str, list[float]]] = {}
     for (payload,) in db.query(RuntimeEvent.payload).filter(
         RuntimeEvent.event_type == "LatencyMeasured",
         RuntimeEvent.conversation_id.in_(conversations),
@@ -85,6 +123,12 @@ async def analytics_summary(
         sample = latency_sample(payload)
         if sample:
             samples.setdefault(sample[0], []).append(sample[1])
+        timeline = timeline_sample(payload)
+        if timeline:
+            engine, value, marks = timeline
+            timeline_values.setdefault(engine, []).append(value)
+            for name, mark in marks.items():
+                timeline_marks.setdefault(engine, {}).setdefault(name, []).append(mark)
     latency = {}
     for metric, values in sorted(samples.items()):
         values.sort()
@@ -102,4 +146,16 @@ async def analytics_summary(
         },
         "languages": dict(languages),
         "latency": latency,
+        # Per engine: p50/p95 of time to first audio (T4 - T0, "value_ms") and of every
+        # mark of the utterance timeline (ms after the speaker started).
+        "timeline": {
+            engine: {
+                **distribution(values),
+                "marks": {
+                    name: distribution(marks)
+                    for name, marks in sorted(timeline_marks.get(engine, {}).items())
+                },
+            }
+            for engine, values in sorted(timeline_values.items())
+        },
     }

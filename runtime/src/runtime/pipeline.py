@@ -6,6 +6,14 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any
 
+from .speech_providers import (
+    build_llm,
+    build_stt,
+    build_tts,
+    provider_names,
+    provider_setting_types,
+)
+
 
 @dataclass(frozen=True)
 class PipelineConfig:
@@ -63,39 +71,19 @@ class PipelineConfig:
             "tts": "cartesia",
         }
         providers.update(session.get("providers", {}))
-        supported = {
-            "stt": {"deepgram"},
-            "llm": {"openai", "openai-compatible"},
-            "tts": {"cartesia"},
-        }
+        # Fail at session start, not mid-call: every provider must be registered.
         for kind, provider in providers.items():
-            if provider not in supported.get(kind, set()):
+            if provider not in provider_names(kind):
                 raise RuntimeError(f"unsupported {kind} provider: {provider}")
-        provider_setting_types: dict[str, dict[str, type | tuple[type, ...]]] = {
-            "stt": {
-                "model": str,
-                "language": str,
-                "interim_results": bool,
-                "smart_format": bool,
-            },
-            "llm": {
-                "model": str,
-                "temperature": (int, float),
-                "max_tokens": int,
-                "top_p": (int, float),
-                # Agent + translator: model of the two translation legs (not the LLM's).
-                "translation_model": str,
-            },
-            "tts": {"model": str, "language": str},
-        }
         provider_settings = session.get("provider_settings") or {}
         if not isinstance(provider_settings, dict):
             raise RuntimeError("provider settings must be an object")
         for kind, settings in provider_settings.items():
-            if kind not in provider_setting_types or not isinstance(settings, dict):
+            if kind not in providers or not isinstance(settings, dict):
                 raise RuntimeError(f"unsupported provider settings section: {kind}")
+            allowed = provider_setting_types(kind, providers[kind])
             for name, value in settings.items():
-                expected_type = provider_setting_types[kind].get(name)
+                expected_type = allowed.get(name)
                 if expected_type is None:
                     raise RuntimeError(f"unsupported {kind} provider setting: {name}")
                 if isinstance(value, bool) and expected_type is not bool:
@@ -111,11 +99,12 @@ class PipelineConfig:
         if mode not in {"agent", "interpreter"}:
             raise RuntimeError(f"unsupported session mode: {mode}")
         interpreter = session.get("interpreter") if mode == "interpreter" else None
-        engine = "cascaded"
+        engine = None
         if mode == "interpreter":
             from .interpreter import InterpreterSettings
+            from .translation_engine import get_engine
 
-            engine = InterpreterSettings.from_mapping(interpreter).engine
+            engine = get_engine(InterpreterSettings.from_mapping(interpreter).engine)
         participants = session.get("participants") or None
         if participants is not None:
             if not isinstance(participants, dict) or not all(
@@ -123,7 +112,7 @@ class PipelineConfig:
                 for identity, spec in participants.items()
             ):
                 raise RuntimeError("participants must map identities to {language, ...}")
-            if mode != "interpreter" or engine != "cascaded":
+            if engine is None or not engine.supports_two_way:
                 raise RuntimeError("participants require a cascaded interpreter")
             participants = {identity: dict(spec) for identity, spec in participants.items()}
         translation = session.get("translation") or None
@@ -136,12 +125,13 @@ class PipelineConfig:
             translation = dict(translation)
         if not values["livekit_token"]:
             values["livekit_token"] = create_runtime_token(values["room_name"])
-        # The realtime interpreter engine needs only LiveKit and OpenAI (no STT/TTS).
+        # An engine that speaks with the provider's voice (realtime) needs only LiveKit
+        # and OpenAI: no STT/TTS credentials.
         unused = {"deepgram_api_key", "cartesia_api_key", "cartesia_voice_id"}
         required = {
             field: name
             for field, name in names.items()
-            if not (engine == "realtime" and field in unused)
+            if not (engine is not None and not engine.uses_own_voice and field in unused)
         }
         missing = [name for field, name in required.items() if not values[field]]
         if missing:
@@ -214,8 +204,6 @@ def build_livekit_pipeline(config: PipelineConfig, session=None):
 
     require_pipecat()
     if config.mode == "interpreter":
-        if (config.interpreter or {}).get("engine") == "realtime":
-            return build_realtime_interpreter_pipeline(config, session)
         return build_interpreter_pipeline(config, session)
     from .frame_events import RuntimeEventProcessor
 
@@ -231,9 +219,6 @@ def build_livekit_pipeline(config: PipelineConfig, session=None):
         LLMContextAggregatorPair,
         LLMUserAggregatorParams,
     )
-    from pipecat.services.cartesia.tts import CartesiaTTSService
-    from pipecat.services.deepgram.stt import DeepgramSTTService
-    from pipecat.services.openai.llm import OpenAILLMService
     from pipecat.transports.livekit.transport import LiveKitParams, LiveKitTransport
     from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
     from pipecat.turns.user_turn_strategies import UserTurnStrategies
@@ -247,26 +232,20 @@ def build_livekit_pipeline(config: PipelineConfig, session=None):
             audio_out_enabled=True,
         ),
     )
-    stt_services = {"deepgram": DeepgramSTTService}
-    llm_services = {"openai": OpenAILLMService, "openai-compatible": OpenAILLMService}
-    tts_services = {"cartesia": CartesiaTTSService}
     translation = None
     if config.translation:
         from .agent_translation import AgentTranslationSettings
 
         translation = AgentTranslationSettings.from_mapping(config.translation)
-    stt_settings = config.provider_settings.get("stt", {}).copy()
+    # "multi" detects the caller's language per utterance; otherwise it is fixed.
+    stt_language = translation.stt_language if translation is not None else None
+    keyterms = ()
     if translation is not None:
-        # "multi" detects the caller's language per utterance; otherwise it is fixed.
-        stt_settings["language"] = translation.stt_language
-    stt = stt_services[config.providers["stt"]](
-        api_key=config.deepgram_api_key,
-        settings=DeepgramSTTService.Settings(**stt_settings),
-    )
-    llm_service = llm_services[config.providers["llm"]]
-    tts_service = tts_services[config.providers["tts"]]
-    llm_settings = config.provider_settings.get("llm", {}).copy()
-    llm_settings.pop("translation_model", None)  # consumed by the translators only
+        from .glossary import glossary_keyterms
+
+        language = None if stt_language == "multi" else stt_language
+        keyterms = glossary_keyterms(translation, language)
+    stt = build_stt(config, stt_language, keyterms)
     tool_runtime = None
     system_instruction = config.system_instruction
     if translation is not None:
@@ -279,19 +258,9 @@ def build_livekit_pipeline(config: PipelineConfig, session=None):
         )
         if tool_runtime:
             system_instruction = f"{system_instruction}\n\n{INSTRUCTION_SUFFIX}"
-    llm_settings["system_instruction"] = system_instruction
-    llm = llm_service(
-        api_key=config.openai_api_key,
-        base_url=os.getenv("OPENAI_BASE_URL") or None,
-        settings=llm_service.Settings(**llm_settings),
-    )
-    tts_settings = config.provider_settings.get("tts", {}).copy()
-    tts_settings["voice"] = config.cartesia_voice_id
-    if translation is not None:
-        tts_settings["language"] = translation.initial_tts_language
-    tts = tts_service(
-        api_key=config.cartesia_api_key,
-        settings=tts_service.Settings(**tts_settings),
+    llm = build_llm(config, system_instruction)
+    tts = build_tts(
+        config, translation.initial_tts_language if translation is not None else None
     )
     if tool_runtime:
         tool_runtime.register(llm)
@@ -385,7 +354,11 @@ def agent_translation_processors(
         model=model,
         base_url=os.getenv("OPENAI_BASE_URL") or None,
     )
-    state = CallerLanguageState(translation)
+    from .timeline import TimelineTracker
+
+    # RM-003: caller speech start -> first audible translated reply.
+    timeline = TimelineTracker(session, "agent_translation") if session is not None else None
+    state = CallerLanguageState(translation, timeline=timeline)
     processors = [
         transport.input(),
         stt,
@@ -403,12 +376,11 @@ def agent_translation_processors(
         tts,
     ]
     if session is not None:
-        processors.append(RuntimeEventProcessor(session, transcript_events=False))
+        processors.append(
+            RuntimeEventProcessor(session, transcript_events=False, timeline=timeline)
+        )
     processors.extend([transport.output(), assistant_aggregator])
     return processors
-
-
-INTERPRETER_TURN_PAUSE_SECS = 0.3
 
 
 def participant_directory(config: PipelineConfig, session, languages):
@@ -430,191 +402,69 @@ def participant_directory(config: PipelineConfig, session, languages):
 
 
 def build_interpreter_pipeline(config: PipelineConfig, session=None):
-    """Build the cascaded interpreter pipeline (no LLM context, tools or barge-in).
+    """Build the interpreter pipeline of ``interpreter.engine`` (see ``translation_engine``).
 
-    ``transport.input -> VAD -> Deepgram STT -> user turn processor -> translation ->
-    Cartesia TTS -> events -> transport.output``. Interruptions are disabled by
-    constructing the turn start strategies with ``enable_interruptions=False``, so no
-    ``InterruptionFrame`` is ever broadcast and a translation is never cut off.
-    ``TranslationProcessor`` consumes the transcripts and emits the user and
-    assistant ``TranscriptFinal`` events itself, so the single
-    ``RuntimeEventProcessor`` (after TTS) only contributes lifecycle and latency events.
+    ``transport.input -> engine processors -> transport.output``. The engine is looked up
+    in the registry; it builds everything between the transport's input and output (the
+    cascaded engine: VAD, STT, turns, translation, TTS and the event observer; the
+    realtime engine: VAD, streaming translation and the event observer). Interruptions
+    are never enabled, so a translation is never cut off.
 
-    Two-person sessions (``config.participants``, TR-020) replace the single
-    ``VAD -> STT -> user turn`` stage with a native ``ParallelPipeline`` of one lane per
-    participant (see ``participant_lanes``): LiveKit delivers each participant's audio
-    separately (``UserAudioRawFrame.user_id``), so every lane gets its own VAD, Deepgram
-    connection in that person's declared language, and turn detection. The translator
-    then speaks each translation in the speaker's own voice.
+    Two-person sessions (``config.participants``, TR-020) need an engine with
+    ``supports_two_way``; the transport then resamples each participant separately and
+    publishes one output track per listener (RM-001/RM-002, see ``participant_lanes`` and
+    ``audio_routing``). Every pipeline records the utterance timeline (RM-003) when there
+    is a session to report to.
     """
 
     require_pipecat()
-    from .participants import MAX_PARTICIPANTS
-    from .interpreter import (
-        DEFAULT_TRANSLATION_MODEL,
-        InterpreterSettings,
-        OpenAITranslator,
-        TranslationProcessor,
-    )
-
-    from pipecat.audio.vad.silero import SileroVADAnalyzer
-    from pipecat.audio.vad.vad_analyzer import VADParams
-    from pipecat.pipeline.pipeline import Pipeline
-    from pipecat.pipeline.worker import PipelineParams, PipelineWorker
-    from pipecat.processors.audio.vad_processor import VADProcessor
-    from pipecat.services.cartesia.tts import CartesiaTTSService
-    from pipecat.services.deepgram.stt import DeepgramSTTService
-    from pipecat.transports.livekit.transport import LiveKitParams, LiveKitTransport
-    from pipecat.turns.user_start import (
-        TranscriptionUserTurnStartStrategy,
-        VADUserTurnStartStrategy,
-    )
-    from pipecat.turns.user_stop import SpeechTimeoutUserTurnStopStrategy
-    from pipecat.turns.user_turn_processor import UserTurnProcessor
-    from pipecat.turns.user_turn_strategies import UserTurnStrategies
-
-    settings = InterpreterSettings.from_mapping(config.interpreter)
-    source, target = settings.languages
-    directory = participant_directory(config, session, settings.languages)
-    if directory is not None:
-        # Per-participant resampling: the stock input mixes interleaved speakers.
-        from .participant_lanes import PerParticipantLiveKitTransport as LiveKitTransport
-    transport = LiveKitTransport(
-        url=config.livekit_url,
-        token=config.livekit_token,
-        room_name=config.room_name,
-        params=LiveKitParams(audio_in_enabled=True, audio_out_enabled=True),
-    )
-
-    def make_stt(language: str):
-        stt_settings = config.provider_settings.get("stt", {}).copy()
-        stt_settings["language"] = language
-        return DeepgramSTTService(
-            api_key=config.deepgram_api_key,
-            settings=DeepgramSTTService.Settings(**stt_settings),
-        )
-
-    tts_settings = config.provider_settings.get("tts", {}).copy()
-    tts_settings["voice"] = config.cartesia_voice_id
-    tts_settings["language"] = target
-    tts = CartesiaTTSService(
-        api_key=config.cartesia_api_key,
-        settings=CartesiaTTSService.Settings(**tts_settings),
-    )
-    model = config.provider_settings.get("llm", {}).get("model") or DEFAULT_TRANSLATION_MODEL
-    translation = TranslationProcessor(
-        settings=settings,
-        translate=OpenAITranslator(
-            api_key=config.openai_api_key,
-            model=model,
-            base_url=os.getenv("OPENAI_BASE_URL") or None,
-        ),
-        model=model,
-        session=session,
-        initial_tts_language=target,
-        participants=directory,
-        default_voice_id=config.cartesia_voice_id,
-    )
-
-    def make_vad():
-        return VADProcessor(
-            vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.2))
-        )
-
-    def make_user_turns():
-        return UserTurnProcessor(
-            user_turn_strategies=UserTurnStrategies(
-                start=[
-                    VADUserTurnStartStrategy(enable_interruptions=False),
-                    TranscriptionUserTurnStartStrategy(enable_interruptions=False),
-                ],
-                stop=[
-                    SpeechTimeoutUserTurnStopStrategy(
-                        user_speech_timeout=INTERPRETER_TURN_PAUSE_SECS
-                    )
-                ],
-            )
-        )
-
-    if directory is None:
-        # Deepgram "multi" detects the language per utterance; one_way fixes the source.
-        stt = make_stt("multi" if settings.direction == "auto" else source)
-        listening = [make_vad(), stt, make_user_turns()]
-    else:
-        # One lane per participant: its own VAD, Deepgram connection (in that person's
-        # language) and turn detection, fed only that participant's audio.
-        from pipecat.pipeline.parallel_pipeline import ParallelPipeline
-
-        from .participant_lanes import LaneTurnTagger, ParticipantLaneGate
-
-        lanes = []
-        for lane in range(MAX_PARTICIPANTS):
-            language = directory.language_for_lane(lane)
-            stt = make_stt(language)
-            lanes.append(
-                [
-                    ParticipantLaneGate(directory, lane, stt=stt, language=language),
-                    make_vad(),
-                    stt,
-                    make_user_turns(),
-                    LaneTurnTagger(directory, lane),
-                ]
-            )
-        listening = [ParallelPipeline(*lanes)]
-    processors = [transport.input(), *listening, translation, tts]
-    if session is not None:
-        from .frame_events import RuntimeEventProcessor
-
-        processors.append(RuntimeEventProcessor(session))
-    processors.append(transport.output())
-    worker = PipelineWorker(
-        Pipeline(processors),
-        params=PipelineParams(enable_metrics=True, enable_usage_metrics=True),
-    )
-    return transport, worker
-
-
-def build_realtime_interpreter_pipeline(config: PipelineConfig, session=None):
-    """Build the streaming interpreter pipeline (OpenAI ``gpt-realtime-translate``).
-
-    ``transport.input -> VAD -> RealtimeTranslateProcessor -> events -> transport.output``.
-    No STT, LLM or TTS service is involved: the processor streams the (resampled) input
-    audio to the translation socket and emits the translated audio itself, plus the
-    user/assistant ``TranscriptFinal`` and ``realtime_first_audio_ms`` latency events. The
-    VAD only marks speech boundaries (it does not gate the audio, which is streamed
-    continuously); ``RuntimeEventProcessor`` adds lifecycle events and
-    ``turn_to_first_audio``. Interruptions never occur. Provider voices only: the agent's
-    voice profile is not used.
-    """
-
-    require_pipecat()
-    from .realtime_translate import RealtimeTranslateProcessor
-
-    from pipecat.audio.vad.silero import SileroVADAnalyzer
-    from pipecat.audio.vad.vad_analyzer import VADParams
-    from pipecat.pipeline.pipeline import Pipeline
-    from pipecat.pipeline.worker import PipelineParams, PipelineWorker
-    from pipecat.processors.audio.vad_processor import VADProcessor
-    from pipecat.transports.livekit.transport import LiveKitParams, LiveKitTransport
-
     from .interpreter import InterpreterSettings
+    from .timeline import TimelineTracker
+    from .translation_engine import EngineContext, get_engine
+
+    from pipecat.pipeline.pipeline import Pipeline
+    from pipecat.pipeline.worker import PipelineParams, PipelineWorker
+    from pipecat.transports.livekit.transport import LiveKitParams, LiveKitTransport
 
     settings = InterpreterSettings.from_mapping(config.interpreter)
-    transport = LiveKitTransport(
-        url=config.livekit_url,
-        token=config.livekit_token,
-        room_name=config.room_name,
-        params=LiveKitParams(audio_in_enabled=True, audio_out_enabled=True),
-    )
-    translate = RealtimeTranslateProcessor(
-        settings=settings, api_key=config.openai_api_key, session=session
-    )
-    vad = VADProcessor(vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.2)))
-    processors = [transport.input(), vad, translate]
-    if session is not None:
-        from .frame_events import RuntimeEventProcessor
+    engine = get_engine(settings.engine)
+    directory = participant_directory(config, session, settings.languages)
+    if directory is None:
+        transport = LiveKitTransport(
+            url=config.livekit_url,
+            token=config.livekit_token,
+            room_name=config.room_name,
+            params=LiveKitParams(audio_in_enabled=True, audio_out_enabled=True),
+        )
+    else:
+        # Per-participant resampling (the stock input mixes interleaved speakers) and one
+        # output track per listener (RM-001/RM-002): each destination is a lane whose TTS
+        # audio is published only to that listener.
+        from .audio_routing import ListenerAudioRouter, LiveKitApiSettings
+        from .participant_lanes import PerParticipantLiveKitTransport
+        from .participants import MAX_PARTICIPANTS, translation_destination
 
-        processors.append(RuntimeEventProcessor(session))
+        router = ListenerAudioRouter(
+            directory,
+            hear_original=settings.hear_original,
+            api_settings=LiveKitApiSettings.from_environment(config.livekit_url),
+        )
+        transport = PerParticipantLiveKitTransport(
+            url=config.livekit_url,
+            token=config.livekit_token,
+            room_name=config.room_name,
+            params=LiveKitParams(
+                audio_in_enabled=True,
+                audio_out_enabled=True,
+                audio_out_destinations=[
+                    translation_destination(lane) for lane in range(MAX_PARTICIPANTS)
+                ],
+            ),
+            router=router,
+        )
+    timeline = TimelineTracker(session, engine.name) if session is not None else None
+    context = EngineContext(config=config, session=session, directory=directory, timeline=timeline)
+    processors = [transport.input(), *engine.build_processors(settings, context)]
     processors.append(transport.output())
     worker = PipelineWorker(
         Pipeline(processors),

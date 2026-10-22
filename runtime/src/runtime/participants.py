@@ -17,8 +17,14 @@ its own VAD, Deepgram connection (in the participant's declared language) and tu
 detection. A participant's lane is its position in the mapping (insertion order); at
 most :data:`MAX_PARTICIPANTS` are admitted.
 
-All room participants hear the translated audio (it is published to the LiveKit room).
-Routing each translation only to the other person is future work.
+Audio ownership (RM-001 / RM-002)
+---------------------------------
+Each participant also has a :class:`ParticipantContext`: who they are, what they speak,
+which language their words are translated into, their voice, their lane, and the
+Runtime-published track *they* hear (``translation-for-<identity>``). The translation of
+A's speech is synthesised in B's language and A's voice and goes only to B's track;
+see :mod:`runtime.audio_routing` for how that and "nobody hears the other's original
+microphone" are enforced server-side.
 """
 
 from __future__ import annotations
@@ -30,6 +36,19 @@ from typing import Any
 
 MAX_PARTICIPANTS = 2
 _LANGUAGE = re.compile(r"^[a-z]{2,3}$")
+TRANSLATION_TRACK_PREFIX = "translation-for-"
+
+
+def translation_track_name(identity: str) -> str:
+    """LiveKit track name of the translation a listener hears."""
+
+    return f"{TRANSLATION_TRACK_PREFIX}{identity}"
+
+
+def translation_destination(lane: int) -> str:
+    """Pipecat output destination feeding the track of the listener in ``lane``."""
+
+    return f"translation-lane-{lane}"
 
 
 class ParticipantError(ValueError):
@@ -58,6 +77,29 @@ class Participant:
     display_name: str | None = None
 
 
+@dataclass(frozen=True)
+class ParticipantContext:
+    """Everything the pipeline and the audio router need to know about one participant.
+
+    ``source_language`` is what the participant speaks, ``target_language`` the language
+    their words are translated into (the other participant's). ``voice_id`` is the voice
+    their translated words are spoken in. ``output_track`` / ``output_destination`` are
+    the track and Pipecat destination carrying what this participant *hears* (the other
+    person's translated speech); ``listener`` is who hears *this* participant's
+    translation, or None while the other person is not in the room.
+    """
+
+    identity: str
+    lane: int
+    display_name: str | None
+    source_language: str
+    target_language: str
+    voice_id: str | None
+    output_track: str
+    output_destination: str
+    listener: str | None
+
+
 Listener = Callable[[Participant], Awaitable[None]]
 
 
@@ -71,6 +113,9 @@ class ParticipantDirectory:
         self.languages: tuple[str, str] = (pair[0], pair[1])
         self._participants: dict[str, Participant] = {}
         self._listeners: list[Listener] = []
+        # Who is in the LiveKit room right now. None until a router reports it, in
+        # which case every directory entry counts as present.
+        self._present: set[str] | None = None
 
     @classmethod
     def from_mapping(
@@ -165,3 +210,42 @@ class ParticipantDirectory:
         return next(
             (code for code in self.languages if code != speaker.language), self.languages[1]
         )
+
+    # -- per-participant context and presence (RM-001) --------------------------
+
+    def set_present(self, identities: Sequence[str] | set[str]) -> None:
+        """Record who is in the LiveKit room (reported by the audio router)."""
+
+        self._present = set(identities)
+
+    def is_present(self, identity: str | None) -> bool:
+        if not identity or identity not in self._participants:
+            return False
+        return self._present is None or identity in self._present
+
+    def listener_for(self, speaker: str) -> str | None:
+        """Identity that hears ``speaker``'s translation: the other participant, if present."""
+
+        for other in self._participants:
+            if other != speaker and self.is_present(other):
+                return other
+        return None
+
+    def context(self, identity: str) -> ParticipantContext:
+        participant = self._participants[identity]
+        lane = self.lane_of(identity)
+        assert lane is not None
+        return ParticipantContext(
+            identity=identity,
+            lane=lane,
+            display_name=participant.display_name,
+            source_language=participant.language,
+            target_language=self.target_for(identity),
+            voice_id=participant.voice_id,
+            output_track=translation_track_name(identity),
+            output_destination=translation_destination(lane),
+            listener=self.listener_for(identity),
+        )
+
+    def contexts(self) -> list[ParticipantContext]:
+        return [self.context(identity) for identity in self._participants]

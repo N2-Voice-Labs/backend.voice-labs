@@ -765,3 +765,67 @@ def test_silent_translated_audio_plays_without_counting_as_speech():
     assert not is_voiced(b"\x00\x00" * 100)
     assert not is_voiced(b"\x10\x00" * 100)  # amplitude 16, below the threshold
     assert is_voiced(b"\x00\x00" * 99 + b"\x00\x10")  # one loud sample is enough
+
+
+# -- RM-003: utterance timeline ---------------------------------------------------
+
+
+def _voiced(ms: int, rate: int = 24000) -> bytes:
+    return b"\x01\x10" * (rate * ms // 1000)
+
+
+def test_utterance_timeline_has_one_event_per_speech_with_realtime_marks() -> None:
+    from src.runtime.timeline import TimelineTracker
+
+    session = FakeSession()
+    tracker = TimelineTracker(session, "realtime")
+    ws = FakeWS(
+        [
+            0.15,
+            {"type": "session.input_transcript.delta", "delta": "Привет"},
+            0.1,
+            audio_delta(b"\x00\x00" * 4800),  # silence is not first audio
+            audio_delta(_voiced(600)),  # 600 ms of audible translation: stable at once
+            audio_delta(_voiced(100)),  # same utterance: no second event
+        ]
+    )
+    frames = [
+        VADUserStartedSpeakingFrame(start_secs=0.1),
+        mic(9600),  # the first chunk of the utterance reaches the model
+        SleepFrame(sleep=0.6),
+        VADUserStoppedSpeakingFrame(stop_secs=0.2),
+        SleepFrame(sleep=0.2),
+    ]
+    run(make_processor(Connector(ws), session=session, timeline=tracker), frames)
+
+    [event] = [p for p in session.of("LatencyMeasured") if p["metric"] == "utterance_timeline"]
+    assert event["engine"] == "realtime" and "speaker" not in event
+    marks = event["marks_ms"]
+    assert list(marks) == ["vad", "first_transcript", "translation_start", "first_audio", "stable"]
+    assert marks["vad"] == pytest.approx(100, abs=1)
+    assert marks["vad"] <= marks["translation_start"] <= marks["first_transcript"] <= marks["first_audio"]
+    assert marks["first_audio"] >= 250  # the 0.15 + 0.1 s of model lag plus the VAD window
+    assert marks["stable"] == pytest.approx(marks["first_audio"] + 500, abs=1)
+    assert event["value_ms"] == marks["first_audio"]
+    # The existing realtime metric is kept.
+    assert any(p["metric"] == "realtime_first_audio_ms" for p in session.of("LatencyMeasured"))
+
+
+def test_a_new_speech_start_ends_the_previous_utterance_timeline() -> None:
+    from src.runtime.timeline import TimelineTracker
+
+    session = FakeSession()
+    tracker = TimelineTracker(session, "realtime")
+    ws = FakeWS([0.1, audio_delta(_voiced(200)), 0.5, audio_delta(_voiced(200))])
+    frames = [
+        VADUserStartedSpeakingFrame(start_secs=0.0),
+        SleepFrame(sleep=0.3),
+        VADUserStoppedSpeakingFrame(stop_secs=0.2),
+        VADUserStartedSpeakingFrame(start_secs=0.0),
+        SleepFrame(sleep=0.5),
+    ]
+    run(make_processor(Connector(ws), session=session, timeline=tracker), frames)
+    events = [p for p in session.of("LatencyMeasured") if p["metric"] == "utterance_timeline"]
+    assert len(events) == 2
+    # 200 ms of audio never reaches 500 ms: stable is the end of the utterance's audio.
+    assert events[0]["marks_ms"]["stable"] == pytest.approx(events[0]["marks_ms"]["first_audio"] + 200, abs=1)

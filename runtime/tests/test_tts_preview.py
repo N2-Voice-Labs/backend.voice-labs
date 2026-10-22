@@ -108,6 +108,29 @@ def test_preview_rejects_unsupported_provider(monkeypatch) -> None:
     assert calls == []
 
 
+def test_preview_dispatches_to_a_registered_provider(monkeypatch) -> None:
+    seen: list[dict] = []
+
+    async def fake_synth(**kwargs) -> bytes:
+        seen.append(kwargs)
+        return b"RIFFfake"
+
+    monkeypatch.setitem(
+        tts_preview.PREVIEW_PROVIDERS, "fake", tts_preview.PreviewProvider("FAKE_KEY", fake_synth)
+    )
+    monkeypatch.setenv("FAKE_KEY", "fake-secret")
+    with TestClient(api.app) as client:
+        response = client.post("/tts/preview", json={**BODY, "provider": "fake"}, headers=TOKEN)
+    assert response.status_code == 200 and response.content == b"RIFFfake"
+    assert seen[0]["api_key"] == "fake-secret" and seen[0]["provider_voice_id"] == "voice-1"
+    monkeypatch.delenv("FAKE_KEY")
+    with TestClient(api.app) as client:
+        response = client.post("/tts/preview", json={**BODY, "provider": "fake"}, headers=TOKEN)
+    assert response.status_code == 503
+    with pytest.raises(tts_preview.TTSPreviewError, match="unsupported tts provider: nope"):
+        tts_preview.get_preview_provider("nope")
+
+
 def test_preview_requires_cartesia_key(monkeypatch) -> None:
     monkeypatch.delenv("CARTESIA_API_KEY")
     calls = install_client(monkeypatch)

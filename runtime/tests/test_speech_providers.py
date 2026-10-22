@@ -1,0 +1,427 @@
+"""NS-06: the STT, LLM and TTS provider registries."""
+
+import pytest
+
+pytest.importorskip("pipecat")
+
+from src.runtime import speech_providers
+from src.runtime.pipeline import PipelineConfig
+from src.runtime.speech_providers import (
+    build_llm,
+    build_stt,
+    build_tts,
+    llm_names,
+    provider_capabilities,
+    register_llm,
+    register_stt,
+    register_tts,
+    stt_names,
+    tts_names,
+)
+
+
+def _config(**overrides) -> PipelineConfig:
+    values = dict(
+        livekit_url="ws://localhost:7880",
+        livekit_token="token",
+        room_name="room",
+        deepgram_api_key="dg-key",
+        openai_api_key="oa-key",
+        cartesia_api_key="ct-key",
+        cartesia_voice_id="voice-1",
+        system_instruction="prompt",
+    )
+    values.update(overrides)
+    return PipelineConfig(**values)
+
+
+class Recorder:
+    """Stands in for a Pipecat service class: records constructor arguments."""
+
+    class Settings(dict):
+        def __init__(self, **kwargs):
+            super().__init__(kwargs)
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+
+@pytest.fixture
+def restore_registries():
+    """Undo any ``register_*`` made by a test (factories, settings and capabilities)."""
+
+    tables = [*speech_providers._REGISTRIES.values(), speech_providers._SETTING_TYPES,
+              speech_providers._CAPABILITIES]
+    saved = [dict(table) for table in tables]
+    yield
+    for table, snapshot in zip(tables, saved):
+        table.clear()
+        table.update(snapshot)
+
+
+def test_builtin_providers_are_registered() -> None:
+    assert stt_names()[:1] == ("deepgram",)
+    assert tts_names()[:1] == ("cartesia",)
+
+
+def test_unknown_providers_fail_with_a_clear_error() -> None:
+    with pytest.raises(RuntimeError, match="unsupported stt provider: whisper"):
+        build_stt(_config(providers={"stt": "whisper", "llm": "openai", "tts": "cartesia"}))
+    with pytest.raises(RuntimeError, match="unsupported tts provider: espeak"):
+        build_tts(_config(providers={"stt": "deepgram", "llm": "openai", "tts": "espeak"}))
+
+
+def test_session_start_rejects_unknown_providers_and_follows_the_registry(
+    monkeypatch, restore_registries
+) -> None:
+    for key, value in {
+        "LIVEKIT_URL": "ws://localhost:7880",
+        "RUNTIME_LIVEKIT_TOKEN": "token",
+        "LIVEKIT_ROOM_NAME": "room",
+        "DEEPGRAM_API_KEY": "dg",
+        "OPENAI_API_KEY": "oa",
+        "CARTESIA_API_KEY": "ct",
+        "CARTESIA_VOICE_ID": "voice",
+    }.items():
+        monkeypatch.setenv(key, value)
+    with pytest.raises(RuntimeError, match="unsupported tts provider: elevenlabs"):
+        PipelineConfig.from_environment({"providers": {"tts": "elevenlabs"}})
+    register_tts("elevenlabs", lambda config, settings, **extra: None)
+    config = PipelineConfig.from_environment({"providers": {"tts": "elevenlabs"}})
+    assert config.providers["tts"] == "elevenlabs"
+
+
+def test_deepgram_factory_builds_the_service_with_the_session_settings(monkeypatch) -> None:
+    from pipecat.services.deepgram import stt
+
+    monkeypatch.setattr(stt, "DeepgramSTTService", Recorder)
+    config = _config(provider_settings={"stt": {"model": "nova-3", "interim_results": True}})
+
+    service = build_stt(config, "ko")
+
+    assert service.kwargs["api_key"] == "dg-key"
+    assert service.kwargs["settings"] == {
+        "model": "nova-3",
+        "interim_results": True,
+        "language": "ko",
+    }
+    # No language given: the settings' own (here none) are left alone, and the session's
+    # provider_settings dict is never mutated.
+    assert "language" not in build_stt(config).kwargs["settings"]
+    assert "language" not in config.provider_settings["stt"]
+
+
+def test_cartesia_factory_builds_the_service_with_voice_language_and_extras(
+    monkeypatch,
+) -> None:
+    from pipecat.services.cartesia import tts
+
+    monkeypatch.setattr(tts, "CartesiaTTSService", Recorder)
+    config = _config(provider_settings={"tts": {"model": "sonic-2", "language": "en"}})
+
+    service = build_tts(config, "ko", transport_destination="lane-1")
+
+    assert service.kwargs["api_key"] == "ct-key"
+    assert service.kwargs["transport_destination"] == "lane-1"
+    assert service.kwargs["settings"] == {"model": "sonic-2", "language": "ko", "voice": "voice-1"}
+    plain = build_tts(config).kwargs
+    assert plain["settings"] == {"model": "sonic-2", "language": "en", "voice": "voice-1"}
+    assert "transport_destination" not in plain
+    assert config.provider_settings["tts"] == {"model": "sonic-2", "language": "en"}
+
+
+def test_real_services_accept_the_factory_settings() -> None:
+    stt_service = build_stt(_config(), "en")
+    tts_service = build_tts(_config(), "en")
+    assert type(stt_service).__name__ == "DeepgramSTTService"
+    assert type(tts_service).__name__ == "CartesiaTTSService"
+
+
+def test_registered_provider_is_used_by_name(restore_registries) -> None:
+    seen = []
+
+    def fake_tts(config, settings, **extra):
+        seen.append((config.cartesia_voice_id, settings, extra))
+        return "fake-tts"
+
+    register_tts("fake", fake_tts)
+    config = _config(
+        providers={"stt": "deepgram", "llm": "openai", "tts": "fake"},
+        provider_settings={"tts": {"model": "m"}},
+    )
+    assert build_tts(config, "ru", transport_destination="d") == "fake-tts"
+    assert seen == [("voice-1", {"model": "m", "language": "ru"}, {"transport_destination": "d"})]
+
+
+def test_register_stt_replaces_the_same_name(restore_registries) -> None:
+    register_stt("deepgram", lambda config, settings: "replaced")
+    assert build_stt(_config()) == "replaced"
+
+
+def test_glossary_keyterms_reach_deepgram_only_when_present(monkeypatch) -> None:
+    import pipecat.services.deepgram.stt as deepgram
+
+    monkeypatch.setattr(deepgram, "DeepgramSTTService", Recorder)
+    boosted = build_stt(_config(), "ru", ["вид на жительство"])
+    assert boosted.kwargs["settings"]["keyterm"] == ["вид на жительство"]
+    assert "keyterm" not in build_stt(_config(), "ru").kwargs["settings"]
+
+
+def test_keyterms_are_not_passed_to_factories_without_them(restore_registries) -> None:
+    register_stt("plain", lambda config, settings: settings)
+    config = _config(providers={"stt": "plain", "llm": "openai", "tts": "cartesia"})
+    assert build_stt(config, "en") == {"language": "en"}
+
+
+def test_llm_registry_has_openai_and_openai_compatible() -> None:
+    assert set(llm_names()) >= {"openai", "openai-compatible"}
+    assert provider_capabilities("llm", "openai").supports("tools")
+    assert provider_capabilities("stt", "deepgram").supports("keyterms")
+    assert provider_capabilities("tts", "cartesia").kind == "tts"
+    with pytest.raises(KeyError):
+        provider_capabilities("tts", "nobody")
+
+
+def test_unknown_llm_provider_fails_with_a_clear_error() -> None:
+    config = _config(providers={"stt": "deepgram", "llm": "gemini", "tts": "cartesia"})
+    with pytest.raises(RuntimeError, match="unsupported llm provider: gemini"):
+        build_llm(config)
+
+
+def test_openai_factory_builds_the_service_like_the_pipeline_used_to(monkeypatch) -> None:
+    from pipecat.services.openai import llm
+
+    monkeypatch.setattr(llm, "OpenAILLMService", Recorder)
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://qwen.test/v1")
+    config = _config(
+        provider_settings={"llm": {"model": "gpt-x", "translation_model": "gpt-t"}},
+    )
+
+    service = build_llm(config, "be brief")
+
+    assert service.kwargs["api_key"] == "oa-key"
+    assert service.kwargs["base_url"] == "http://qwen.test/v1"
+    # translation_model is for the translators only; the session dict is not mutated.
+    assert service.kwargs["settings"] == {"model": "gpt-x", "system_instruction": "be brief"}
+    assert config.provider_settings["llm"] == {"model": "gpt-x", "translation_model": "gpt-t"}
+    monkeypatch.delenv("OPENAI_BASE_URL")
+    assert build_llm(config).kwargs["base_url"] is None
+    assert "system_instruction" not in build_llm(config).kwargs["settings"]
+
+
+def _session_env(monkeypatch) -> None:
+    for key, value in {
+        "LIVEKIT_URL": "ws://localhost:7880",
+        "RUNTIME_LIVEKIT_TOKEN": "token",
+        "LIVEKIT_ROOM_NAME": "room",
+        "DEEPGRAM_API_KEY": "dg",
+        "OPENAI_API_KEY": "oa",
+        "CARTESIA_API_KEY": "ct",
+        "CARTESIA_VOICE_ID": "voice",
+    }.items():
+        monkeypatch.setenv(key, value)
+
+
+def test_session_start_rejects_unknown_llm_provider(monkeypatch) -> None:
+    _session_env(monkeypatch)
+    with pytest.raises(RuntimeError, match="unsupported llm provider: gemini"):
+        PipelineConfig.from_environment({"providers": {"llm": "gemini"}})
+    with pytest.raises(RuntimeError, match="unsupported voice provider: x"):
+        PipelineConfig.from_environment({"providers": {"voice": "x"}})
+
+
+def test_provider_settings_keys_follow_the_registered_provider(
+    monkeypatch, restore_registries
+) -> None:
+    _session_env(monkeypatch)
+    # Today's keys and types are unchanged.
+    config = PipelineConfig.from_environment(
+        {
+            "provider_settings": {
+                "stt": {"model": "nova-3", "language": "multi", "interim_results": True},
+                "llm": {"model": "m", "temperature": 0.2, "translation_model": "t"},
+                "tts": {"model": "sonic-2", "language": "en"},
+            }
+        }
+    )
+    assert config.provider_settings["llm"]["temperature"] == 0.2
+    with pytest.raises(RuntimeError, match="unsupported tts provider setting: stability"):
+        PipelineConfig.from_environment({"provider_settings": {"tts": {"stability": 0.5}}})
+    with pytest.raises(RuntimeError, match="invalid llm provider setting type: temperature"):
+        PipelineConfig.from_environment({"provider_settings": {"llm": {"temperature": "hot"}}})
+    # A provider declares its own keys when it registers; nothing else changes.
+    register_tts(
+        "fake",
+        lambda config, settings, **extra: None,
+        settings={"model": str, "stability": (int, float)},
+    )
+    config = PipelineConfig.from_environment(
+        {
+            "providers": {"tts": "fake"},
+            "provider_settings": {"tts": {"stability": 0.5}},
+        }
+    )
+    assert config.provider_settings["tts"] == {"stability": 0.5}
+    with pytest.raises(RuntimeError, match="unsupported tts provider setting: language"):
+        PipelineConfig.from_environment(
+            {"providers": {"tts": "fake"}, "provider_settings": {"tts": {"language": "en"}}}
+        )
+
+
+# -- every pipeline path asks the registry ---------------------------------------
+
+
+@pytest.fixture
+def light_models(monkeypatch):
+    from pipecat.audio.turn.smart_turn import local_smart_turn_v3
+    from pipecat.audio.vad import silero
+
+    class LightweightAnalyzer:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+    monkeypatch.setattr(local_smart_turn_v3, "LocalSmartTurnAnalyzerV3", LightweightAnalyzer)
+    monkeypatch.setattr(silero, "SileroVADAnalyzer", LightweightAnalyzer)
+    monkeypatch.setenv("LIVEKIT_API_KEY", "key")
+    monkeypatch.setenv("LIVEKIT_API_SECRET", "secret")
+
+
+@pytest.fixture
+def fake_providers(restore_registries):
+    """Register ``fake`` as stt, llm and tts; every service built is recorded in ``calls``."""
+
+    from pipecat.processors.frame_processor import FrameProcessor
+
+    calls: list[tuple] = []
+
+    class FakeSTT(FrameProcessor):
+        pass
+
+    class FakeLLM(FrameProcessor):
+        def register_function(self, name, handler, **options) -> None:
+            calls.append(("tool", name))
+
+    class FakeTTS(FrameProcessor):
+        pass
+
+    def stt(config, settings, **extra):
+        calls.append(("stt", dict(settings), extra))
+        service = FakeSTT()
+        service._settings = type("S", (), {"language": settings.get("language")})()
+        return service
+
+    def llm(config, settings):
+        calls.append(("llm", dict(settings)))
+        service = FakeLLM()
+        service._settings = type("S", (), {"system_instruction": settings["system_instruction"]})()
+        return service
+
+    def tts(config, settings, **extra):
+        calls.append(("tts", dict(settings), extra))
+        return FakeTTS()
+
+    register_stt("fake", stt, settings={"model": str, "language": str}, features=("keyterms",))
+    register_llm("fake", llm, settings={"model": str})
+    register_tts("fake", tts, settings={"language": str})
+    return calls
+
+
+def _fake_config(**kwargs) -> PipelineConfig:
+    return _config(
+        providers={"stt": "fake", "llm": "fake", "tts": "fake"},
+        provider_settings={"stt": {"model": "m"}},
+        **kwargs,
+    )
+
+
+def _inner(worker):
+    from pipecat.pipeline.pipeline import Pipeline
+
+    pipeline = next(p for p in worker._pipeline._processors if isinstance(p, Pipeline))
+    return [
+        p for p in pipeline._processors if type(p).__name__ not in {"PipelineSource", "PipelineSink"}
+    ]
+
+
+def test_agent_pipeline_asks_the_registry_for_stt_llm_and_tts(light_models, fake_providers) -> None:
+    from src.runtime.pipeline import build_livekit_pipeline
+
+    _, worker = build_livekit_pipeline(_fake_config())
+
+    names = [type(p).__name__ for p in _inner(worker)]
+    assert names.count("FakeSTT") == names.count("FakeLLM") == names.count("FakeTTS") == 1
+    assert "DeepgramSTTService" not in names and "CartesiaTTSService" not in names
+    assert [call[0] for call in fake_providers] == ["stt", "llm", "tts"]
+    assert fake_providers[1][1]["system_instruction"] == "prompt"
+
+
+def test_agent_translator_pipeline_asks_the_registry(light_models, fake_providers) -> None:
+    from uuid import uuid4
+
+    from src.runtime.pipeline import build_livekit_pipeline
+    from src.runtime.session import RuntimeSession
+
+    config = _fake_config(translation={"working_language": "en", "caller_languages": ["ru", "es"]})
+    _, worker = build_livekit_pipeline(config, RuntimeSession(uuid4(), uuid4(), uuid4()))
+
+    names = [type(p).__name__ for p in _inner(worker)]
+    assert {"FakeSTT", "FakeLLM", "FakeTTS"} <= set(names)
+    kinds = {call[0]: call for call in fake_providers}
+    assert kinds["stt"][1]["language"] == "multi"  # per-utterance detection, unchanged
+    assert kinds["tts"][1]["language"] == "ru"
+    assert "InboundTranslator" in names and "OutboundTranslator" in names
+
+
+def test_cascaded_interpreter_asks_the_registry(light_models, fake_providers) -> None:
+    from src.runtime.pipeline import build_livekit_pipeline
+
+    config = _fake_config(
+        mode="interpreter", interpreter={"languages": ["en", "ru"], "direction": "auto"}
+    )
+    _, worker = build_livekit_pipeline(config)
+
+    names = [type(p).__name__ for p in _inner(worker)]
+    assert "FakeSTT" in names and "FakeTTS" in names
+    assert "DeepgramSTTService" not in names and "CartesiaTTSService" not in names
+    assert [(c[0], c[1]["language"]) for c in fake_providers] == [("stt", "multi"), ("tts", "ru")]
+
+
+def test_two_way_interpreter_lanes_and_listener_tts_ask_the_registry(
+    light_models, fake_providers
+) -> None:
+    from uuid import uuid4
+
+    from src.runtime.participants import ParticipantDirectory
+    from src.runtime.pipeline import build_livekit_pipeline
+    from src.runtime.session import RuntimeSession
+
+    participants = {
+        "alice": {"language": "en", "voice_id": "v-a"},
+        "bob": {"language": "ko", "voice_id": "v-b"},
+    }
+    config = _fake_config(
+        mode="interpreter",
+        interpreter={"languages": ["en", "ko"], "direction": "one_way"},
+        participants=participants,
+    )
+    session = RuntimeSession(uuid4(), uuid4(), uuid4())
+    session.participants = ParticipantDirectory.from_mapping(("en", "ko"), participants)
+    _, worker = build_livekit_pipeline(config, session)
+
+    stt_calls = [c for c in fake_providers if c[0] == "stt"]
+    tts_calls = [c for c in fake_providers if c[0] == "tts"]
+    assert [c[1]["language"] for c in stt_calls] == ["en", "ko"]  # one STT lane each
+    assert [c[1]["language"] for c in tts_calls] == ["en", "ko"]  # one TTS per listener
+    assert [c[2] for c in tts_calls] == [
+        {"transport_destination": "translation-lane-0"},
+        {"transport_destination": "translation-lane-1"},
+    ]
+    assert "DeepgramSTTService" not in repr(worker._pipeline)
+
+
+def test_pipelines_fail_for_unregistered_provider_before_building(light_models) -> None:
+    from src.runtime.pipeline import build_livekit_pipeline
+
+    config = _config(providers={"stt": "whisper", "llm": "openai", "tts": "cartesia"})
+    with pytest.raises(RuntimeError, match="unsupported stt provider: whisper"):
+        build_livekit_pipeline(config)

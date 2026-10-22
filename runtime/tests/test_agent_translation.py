@@ -757,3 +757,164 @@ def test_builder_leaves_the_normal_agent_pipeline_untouched(light_models) -> Non
     ]
     assert all(p._transcript_events for p in processors if type(p).__name__ == "RuntimeEventProcessor")
     assert "translated into" not in processors[4]._settings.system_instruction
+
+
+# -- RM-003: utterance timeline ---------------------------------------------------------
+
+
+def _timeline_pipeline(session, *, language="ru"):
+    from src.runtime.timeline import TimelineTracker
+
+    tracker = TimelineTracker(session, "agent_translation")
+    state = CallerLanguageState(SETTINGS, timeline=tracker)
+    state.language = language
+    tap = CallerLanguageTap(state)
+    inbound_t = InboundTranslator(state=state, translate=echo_translate, model="m", session=session)
+    outbound_t = OutboundTranslator(state=state, translate=echo_translate, model="m", session=session)
+    return Pipeline([tap, inbound_t, outbound_t]), tracker
+
+
+def _voiced(ms: int, rate: int = 16000) -> bytes:
+    return b"\x01\x10" * (rate * ms // 1000)
+
+
+def test_agent_translation_timeline_runs_from_caller_speech_to_first_translated_reply() -> None:
+    from pipecat.frames.frames import VADUserStartedSpeakingFrame
+
+    session = FakeSession()
+    pipeline, tracker = _timeline_pipeline(session)
+    context = context_with_user("Здравствуйте")
+    run(
+        pipeline,
+        [
+            VADUserStartedSpeakingFrame(start_secs=0.2),
+            SleepFrame(sleep=0.03),
+            InterimTranscriptionFrame("Здрав", "caller", "t", Language.RU),
+            SleepFrame(sleep=0.03),
+            segment("Здравствуйте", Language.RU),
+            SleepFrame(sleep=0.03),
+            LLMContextFrame(context=context),
+            SleepFrame(sleep=0.05),
+            *response("Hello there. ", "How can I help?"),
+            SleepFrame(sleep=0.1),
+        ],
+    )
+    [queued] = list(tracker._queue)
+    assert list(queued.marks) == ["vad", "first_transcript", "translation_start"]
+    assert queued.chunks_pushed == 2 and queued.speech_complete  # one TTS context per sentence
+
+    tracker.on_audio(_voiced(300), 16000)
+    tracker.on_tts_stopped()
+    assert session.of("LatencyMeasured")[-1]["metric"] != "utterance_timeline"  # still playing
+    tracker.on_audio(_voiced(300), 16000)
+    tracker.on_tts_stopped()
+    [event] = [p for p in session.of("LatencyMeasured") if p["metric"] == "utterance_timeline"]
+    assert event["engine"] == "agent_translation"
+    marks = event["marks_ms"]
+    assert 200 <= marks["vad"] <= 200.5
+    assert marks["vad"] <= marks["first_transcript"] <= marks["translation_start"] <= marks["first_audio"]
+    assert event["value_ms"] == marks["first_audio"]
+
+
+def test_agent_timeline_when_the_caller_speaks_the_working_language_has_no_translation_mark() -> None:
+    from pipecat.frames.frames import VADUserStartedSpeakingFrame
+
+    session = FakeSession()
+    pipeline, tracker = _timeline_pipeline(session, language="en")
+    run(
+        pipeline,
+        [
+            VADUserStartedSpeakingFrame(start_secs=0.1),
+            SleepFrame(sleep=0.03),
+            segment("Hello", Language.EN),
+            SleepFrame(sleep=0.03),
+            LLMContextFrame(context=context_with_user("Hello")),
+            SleepFrame(sleep=0.05),
+            *response("Hi there."),
+            SleepFrame(sleep=0.1),
+        ],
+    )
+    [queued] = list(tracker._queue)
+    assert list(queued.marks) == ["vad", "first_transcript"]
+    assert queued.chunks_pushed is None  # TTS speaks the LLM text: the count is unknown
+    tracker.on_audio(_voiced(200), 16000)
+    tracker.on_idle()
+    [event] = [p for p in session.of("LatencyMeasured") if p["metric"] == "utterance_timeline"]
+    assert "translation_start" not in event["marks_ms"] and event["engine"] == "agent_translation"
+
+
+def test_only_the_first_response_of_a_turn_is_timed() -> None:
+    from pipecat.frames.frames import VADUserStartedSpeakingFrame
+
+    session = FakeSession()
+    pipeline, tracker = _timeline_pipeline(session)
+    run(
+        pipeline,
+        [
+            VADUserStartedSpeakingFrame(start_secs=0.1),
+            SleepFrame(sleep=0.03),
+            segment("Здравствуйте", Language.RU),
+            SleepFrame(sleep=0.03),
+            LLMContextFrame(context=context_with_user("Здравствуйте")),
+            SleepFrame(sleep=0.05),
+            *response("One."),
+            SleepFrame(sleep=0.05),
+            *response("Two."),  # e.g. the reply after a tool call
+            SleepFrame(sleep=0.1),
+        ],
+    )
+    assert len(tracker._queue) == 1
+
+
+def test_a_turn_continued_after_a_pause_keeps_the_original_speech_start() -> None:
+    from pipecat.frames.frames import VADUserStartedSpeakingFrame
+
+    session = FakeSession()
+    pipeline, tracker = _timeline_pipeline(session)
+    context = context_with_user("Здравствуйте")
+    run(
+        pipeline,
+        [
+            VADUserStartedSpeakingFrame(start_secs=0.2),
+            SleepFrame(sleep=0.03),
+            segment("Здравствуйте", Language.RU),
+            SleepFrame(sleep=0.03),
+            LLMContextFrame(context=context),  # first part of the turn reaches the LLM
+            SleepFrame(sleep=0.03),
+            segment("мне нужна помощь", Language.RU),  # the caller goes on, no new VAD start
+            SleepFrame(sleep=0.03),
+            LLMContextFrame(context=context_with_user("мне нужна помощь")),
+            SleepFrame(sleep=0.05),
+            *response("Sure."),
+            SleepFrame(sleep=0.1),
+        ],
+    )
+    [queued] = list(tracker._queue)
+    assert "vad" in queued.marks and queued.chunks_pushed == 1
+
+
+def test_a_reply_cut_off_before_any_audio_hands_its_timing_to_the_next_reply() -> None:
+    from pipecat.frames.frames import VADUserStartedSpeakingFrame
+
+    session = FakeSession()
+    pipeline, tracker = _timeline_pipeline(session)
+    run(
+        pipeline,
+        [
+            VADUserStartedSpeakingFrame(start_secs=0.2),
+            SleepFrame(sleep=0.03),
+            segment("Здравствуйте", Language.RU),
+            SleepFrame(sleep=0.03),
+            LLMContextFrame(context=context_with_user("Здравствуйте")),
+            SleepFrame(sleep=0.05),
+            LLMFullResponseStartFrame(),
+            LLMTextFrame("Hel"),
+            SleepFrame(sleep=0.05),
+            InterruptionFrame(),  # the caller talks over the reply before it is heard
+            SleepFrame(sleep=0.05),
+            *response("Hello there."),
+            SleepFrame(sleep=0.1),
+        ],
+    )
+    [queued] = list(tracker._queue)
+    assert "vad" in queued.marks and queued.chunks_pushed == 1 and queued.speech_complete

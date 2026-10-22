@@ -28,6 +28,9 @@ https://developers.openai.com/api/docs/models/gpt-realtime-translate
   transcripts are continuous append-only deltas. The API does not report the detected
   source language and has no voice parameter (the voice adapts to the speaker), so the
   user's own cloned voice and the agent's voice profile are not used by this engine.
+* ``session.update`` accepts no instructions, prompt or glossary field, so the NS-08
+  glossary (``interpreter.glossary``) does not apply to this engine: it is honoured by the
+  cascaded engine only. Use the cascaded engine when terminology must be enforced.
 * Output languages (13): es pt fr ja ru zh de ko hi id vi it en. Input: 70+ languages,
   detected by the model. Pricing: $0.034 per minute of audio.
 
@@ -79,7 +82,7 @@ import hashlib
 import json
 import logging
 import time
-from array import array
+from collections import deque
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
 
@@ -100,6 +103,7 @@ from pipecat.frames.frames import (
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
 from .interpreter import InterpreterSettings
+from .timeline import VOICED_PEAK_THRESHOLD, TimelineTracker, UtteranceTimeline, is_voiced  # noqa: F401
 
 _logger = logging.getLogger(__name__)
 
@@ -120,18 +124,13 @@ RECONNECT_DELAY_SECONDS = 0.5
 STABLE_CONNECTION_SECONDS = 30.0
 CLOSE_TIMEOUT_SECONDS = 5.0
 WS_CLOSE_TIMEOUT_SECONDS = 0.5
-# The API streams audio continuously, silence included. Chunks whose peak stays below this
-# PCM16 amplitude are played as plain audio, so they neither count as the agent speaking nor
-# stop the first-audio latency clock.
-VOICED_PEAK_THRESHOLD = 500
+# The API streams audio continuously, silence included. Chunks whose peak stays below the
+# voiced threshold (``timeline.VOICED_PEAK_THRESHOLD``, shared with the TTS audio check)
+# are played as plain audio, so they neither count as the agent speaking nor stop the
+# first-audio latency clock.
 FAILURE_REASON = "realtime_translate_failed"
-
-def is_voiced(audio: bytes) -> bool:
-    """Return whether a PCM16 chunk contains sound above the silence threshold."""
-
-    samples = array("h")
-    samples.frombytes(audio[: len(audio) - len(audio) % 2])
-    return any(abs(sample) >= VOICED_PEAK_THRESHOLD for sample in samples)
+# Input chunks whose queue time is remembered to date "translation started" (T3).
+RECENT_CHUNK_TIMES = 16
 
 
 _SENTENCE_END = (".", "!", "?", "…", "。", "！", "？")
@@ -209,9 +208,13 @@ class RealtimeTranslateProcessor(FrameProcessor):
         reconnect_delay: float = RECONNECT_DELAY_SECONDS,
         stable_connection_seconds: float = STABLE_CONNECTION_SECONDS,
         close_timeout: float = CLOSE_TIMEOUT_SECONDS,
+        timeline: TimelineTracker | None = None,
     ) -> None:
         super().__init__()
         validate_realtime_settings(settings)
+        self._timeline = timeline
+        self._utterance: UtteranceTimeline | None = None
+        self._chunk_times: deque[float] = deque(maxlen=RECENT_CHUNK_TIMES)
         self._source, self._target = settings.languages
         self._api_key = api_key
         self._session = session
@@ -261,6 +264,8 @@ class RealtimeTranslateProcessor(FrameProcessor):
             await self.push_frame(UserStartedSpeakingFrame(), direction)
         elif isinstance(frame, VADUserStoppedSpeakingFrame):
             self._user_speaking = False
+            if self._timeline is not None:
+                self._timeline.turn_stopped("")
             self._arm_flush()
             await self.push_frame(frame, direction)
             await self.push_frame(UserStoppedSpeakingFrame(), direction)
@@ -271,6 +276,23 @@ class RealtimeTranslateProcessor(FrameProcessor):
         self._user_speaking = True
         self._cancel_flush()
         self._speech_started_at = time.monotonic() - max(0.0, frame.start_secs or 0.0)
+        self._start_timeline(frame)
+
+    def _start_timeline(self, frame: VADUserStartedSpeakingFrame) -> None:
+        """T0/T1 of a new utterance (RM-003); the previous one ends here."""
+
+        tracker = self._timeline
+        if tracker is None:
+            return
+        previous = self._utterance
+        utterance = tracker.speech_started("", frame.start_secs)
+        if utterance is not None and utterance is not previous:
+            # The audio is streamed to the model continuously; translation of this
+            # utterance starts with the first chunk queued at or after its T0.
+            at = next((t for t in self._chunk_times if t >= utterance.t0), None)
+            if at is not None:
+                utterance.marks["translation_start"] = at
+        self._utterance = utterance
 
     # -- input audio -----------------------------------------------------------
 
@@ -289,6 +311,13 @@ class RealtimeTranslateProcessor(FrameProcessor):
             self._queue_chunk(chunk)
 
     def _queue_chunk(self, chunk: bytes | None) -> None:
+        if self._timeline is not None and chunk is not None:
+            now = self._timeline.now()
+            self._chunk_times.append(now)
+            utterance = self._utterance
+            if utterance is not None and "translation_start" not in utterance.marks:
+                # Speech already running: this chunk is the first sent for it.
+                self._timeline.mark(utterance, "translation_start")
         if self._chunks.qsize() >= MAX_PENDING_CHUNKS:
             try:
                 self._chunks.get_nowait()
@@ -450,7 +479,13 @@ class RealtimeTranslateProcessor(FrameProcessor):
             return
         sample_rate = int(event.get("sample_rate") or DEFAULT_OUTPUT_SAMPLE_RATE)
         num_channels = int(event.get("channels") or 1)
-        if not is_voiced(audio):
+        voiced = is_voiced(audio)
+        tracker = self._timeline
+        if tracker is not None:
+            if voiced:
+                tracker.enqueue_audio(self._utterance)
+            tracker.on_audio(audio, sample_rate, num_channels)
+        if not voiced:
             await self.push_frame(OutputAudioRawFrame(audio, sample_rate, num_channels))
             return
         if self._speech_started_at is not None:
@@ -462,6 +497,8 @@ class RealtimeTranslateProcessor(FrameProcessor):
         delta = event.get("delta")
         if not isinstance(delta, str) or not delta:
             return
+        if self._timeline is not None and buffer is self._source_text:
+            self._timeline.mark(self._utterance, "first_transcript")
         buffer.append(delta)
         text = "".join(self._target_text)
         if len(text) >= TRANSCRIPT_SOFT_LIMIT_CHARS and text.rstrip().endswith(_SENTENCE_END):
@@ -488,6 +525,9 @@ class RealtimeTranslateProcessor(FrameProcessor):
         """Emit the accumulated source/translated text as one user + assistant pair."""
 
         self._cancel_flush()
+        if self._timeline is not None and self._utterance is not None:
+            self._timeline.finish(self._utterance)
+            self._utterance = None
         source = "".join(self._source_text).strip()
         translated = "".join(self._target_text).strip()
         self._source_text.clear()

@@ -60,10 +60,13 @@ from pipecat.frames.frames import (
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
     LLMTextFrame,
+    InterimTranscriptionFrame,
     StartFrame,
     TranscriptionFrame,
     TTSSpeakFrame,
     TTSUpdateSettingsFrame,
+    UserStoppedSpeakingFrame,
+    VADUserStartedSpeakingFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.services.settings import TTSSettings
@@ -79,7 +82,9 @@ from .interpreter import (
     _script_votes,
     language_label,
 )
+from .glossary import Glossary, parse_glossary
 from .participants import normalize_language
+from .timeline import TimelineTracker, UtteranceTimeline
 
 _logger = logging.getLogger(__name__)
 
@@ -106,6 +111,8 @@ class AgentTranslationSettings:
 
     working_language: str
     caller_languages: tuple[str, ...]
+    # NS-08: required renderings and never-translate terms; see ``glossary``.
+    glossary: Glossary = ()
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any] | None) -> "AgentTranslationSettings":
@@ -130,7 +137,11 @@ class AgentTranslationSettings:
                 "translation caller_languages must be distinct supported languages "
                 "other than the working language"
             )
-        settings = cls(working_language=working, caller_languages=callers)  # type: ignore[arg-type]
+        settings = cls(  # type: ignore[arg-type]
+            working_language=working,
+            caller_languages=callers,
+            glossary=parse_glossary(raw.get("glossary")),
+        )
         if len(callers) > 1 and not settings.auto:
             raise RuntimeError(
                 "several caller languages require automatic language detection"
@@ -157,10 +168,16 @@ class AgentTranslationSettings:
     @property
     def instruction(self) -> str:
         language = language_label(self.working_language)
-        return (
+        text = (
             "Callers speak other languages; their words reach you translated into "
             f"{language}. Always answer in {language}; your reply is translated for them."
         )
+        # Names and terms that must survive translation: the agent should say them
+        # exactly as the glossary writes them.
+        terms = [entry.source for entry in self.glossary if entry.keep]
+        if terms:
+            text += " Never alter these names or terms: " + ", ".join(terms) + "."
+        return text
 
 
 @dataclass
@@ -174,8 +191,15 @@ class _Segment:
 class CallerLanguageState:
     """Shared by the pipeline's translation processors."""
 
-    def __init__(self, settings: AgentTranslationSettings) -> None:
+    def __init__(
+        self,
+        settings: AgentTranslationSettings,
+        timeline: TimelineTracker | None = None,
+    ) -> None:
         self.settings = settings
+        # RM-003: the caller's turn that the next LLM response answers.
+        self.timeline = timeline
+        self.utterance: UtteranceTimeline | None = None
         self.language: str = settings.caller_languages[0]
         self.history: deque[tuple[str, str, str, str]] = deque(maxlen=OUTBOUND_HISTORY_PAIRS)
         self.segments: list[_Segment] = []
@@ -271,6 +295,17 @@ class CallerLanguageTap(FrameProcessor):
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
+        tracker = self._state.timeline
+        if tracker is not None:
+            # The aggregator (downstream) owns the VAD; its frames reach this tap
+            # upstream. Either direction is the one copy this processor sees.
+            if isinstance(frame, VADUserStartedSpeakingFrame):
+                tracker.speech_started("", frame.start_secs)
+            elif isinstance(frame, UserStoppedSpeakingFrame):
+                tracker.turn_stopped("")
+            elif isinstance(frame, (InterimTranscriptionFrame, TranscriptionFrame)):
+                if frame.text.strip():
+                    tracker.transcript("")
         if isinstance(frame, TranscriptionFrame) and frame.text.strip():
             self._state.segments.append(
                 _Segment(
@@ -340,6 +375,11 @@ class InboundTranslator(FrameProcessor):
         if not pending:
             return
         segments, self._state.segments = self._state.segments, []
+        tracker = self._state.timeline
+        if tracker is not None:
+            # A turn continued after a pause arrives as another context frame without a
+            # new speech start: it keeps timing from the speech that is still unanswered.
+            self._state.utterance = tracker.take("") or self._state.utterance
         settings = self._state.settings
         messages = frame.context.messages
         # A turn can reach the context as several user messages (the aggregator ends it
@@ -354,6 +394,8 @@ class InboundTranslator(FrameProcessor):
         self._state.language = language
         translated = original
         if language != settings.working_language and original:
+            if tracker is not None:
+                tracker.mark(self._state.utterance, "translation_start")
             translated = await self._translate_message(original, language)
         self._done.append(message)
         message["content"] = translated
@@ -377,7 +419,9 @@ class InboundTranslator(FrameProcessor):
         """
 
         working = self._state.settings.working_language
-        messages = build_translation_messages(text, source, working)
+        messages = build_translation_messages(
+            text, source, working, glossary=self._state.settings.glossary
+        )
         started = time.monotonic()
         try:
             translated = await collect_translation(self._translate, messages)
@@ -407,6 +451,7 @@ class _Response:
     originals: list[str] = field(default_factory=list)
     spoken: list[str] = field(default_factory=list)
     first_chunk_measured: bool = False
+    utterance: UtteranceTimeline | None = None
 
 
 class OutboundTranslator(FrameProcessor):
@@ -438,6 +483,8 @@ class OutboundTranslator(FrameProcessor):
             # super() already cancelled the in-flight translation and dropped the
             # queued text frames; report what was handed to TTS and forget the rest.
             self._emit_assistant_transcript()
+            if self._response is not None:
+                self._interrupted(self._response)
             self._response = None
             await self.push_frame(frame, direction)
         elif isinstance(frame, LLMFullResponseStartFrame):
@@ -455,6 +502,15 @@ class OutboundTranslator(FrameProcessor):
         language = self._state.language
         passthrough = language == settings.working_language
         self._response = _Response(language=language, passthrough=passthrough)
+        tracker = self._state.timeline
+        if tracker is not None:
+            # The first response after a caller turn is the one timed (a later response of
+            # the same turn, e.g. after a tool call, is not).
+            self._response.utterance, self._state.utterance = self._state.utterance, None
+            if passthrough:
+                # No translation: the LLM text goes straight to TTS, in as many pieces as
+                # the TTS service chooses, so the output going idle ends the utterance.
+                tracker.enqueue_audio(self._response.utterance)
         await self._ensure_tts_language(language)
         if not passthrough:
             frame.skip_tts = True  # opens the assistant turn; never reaches TTS
@@ -484,7 +540,22 @@ class OutboundTranslator(FrameProcessor):
     async def _finish_response(self) -> None:
         if self._response is not None:
             self._emit_assistant_transcript()
+            self._speech_done(self._response)
             self._response = None
+
+    def _interrupted(self, response: _Response) -> None:
+        """A barge-in cut the reply off: unheard speech keeps its timing for the next reply."""
+
+        tracker = self._state.timeline
+        if tracker is not None and tracker.abandon(response.utterance):
+            self._state.utterance = response.utterance
+        else:
+            self._speech_done(response)
+
+    def _speech_done(self, response: _Response) -> None:
+        tracker = self._state.timeline
+        if tracker is not None:
+            tracker.speech_done(response.utterance, count_known=not response.passthrough)
 
     # -- translation -------------------------------------------------------------
 
@@ -500,11 +571,13 @@ class OutboundTranslator(FrameProcessor):
             settings.working_language,
             response.language,
             tuple(self._state.history),
+            glossary=settings.glossary,
         )
         started = time.monotonic()
         released = False
         chunker = SentenceChunker()
         deltas: list[str] = []
+        tracker = self._state.timeline
 
         async def say(chunk: str) -> None:
             nonlocal released
@@ -525,8 +598,13 @@ class OutboundTranslator(FrameProcessor):
                         self._model,
                     )
             response.spoken.append(chunk)
+            if tracker is not None:
+                tracker.enqueue_audio(response.utterance)
+                tracker.chunk_pushed(response.utterance)
             await self.push_frame(TTSSpeakFrame(chunk, append_to_context=False))
 
+        if tracker is not None:
+            tracker.mark(response.utterance, "translation_start")
         stream = self._translate(messages)
         try:
             async for delta in stream:

@@ -1,4 +1,12 @@
-"""One-shot TTS preview synthesis through the Cartesia REST bytes endpoint."""
+"""One-shot TTS preview synthesis (REST), selected by provider name (NS-06).
+
+``PREVIEW_PROVIDERS`` is the preview counterpart of the TTS registry in
+``speech_providers``: ``/tts/preview`` looks the provider up here instead of naming Cartesia.
+A new provider is one ``register_preview(name, api_key_env, synthesize)`` call.
+"""
+
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 
 import httpx
 
@@ -56,3 +64,31 @@ async def synthesize_preview(
     if not audio:
         raise TTSPreviewError("cartesia returned empty audio")
     return audio
+
+
+@dataclass(frozen=True)
+class PreviewProvider:
+    api_key_env: str
+    # async (*, api_key, provider_voice_id, text, language, model) -> WAV bytes
+    synthesize: Callable[..., Awaitable[bytes]]
+
+
+PREVIEW_PROVIDERS: dict[str, PreviewProvider] = {}
+
+
+def register_preview(
+    name: str, api_key_env: str, synthesize: Callable[..., Awaitable[bytes]]
+) -> None:
+    """Make ``name`` previewable (replaces the same name)."""
+
+    PREVIEW_PROVIDERS[name] = PreviewProvider(api_key_env, synthesize)
+
+
+def get_preview_provider(name: str) -> PreviewProvider:
+    try:
+        return PREVIEW_PROVIDERS[name]
+    except KeyError:
+        raise TTSPreviewError(f"unsupported tts provider: {name}") from None
+
+
+register_preview("cartesia", "CARTESIA_API_KEY", synthesize_preview)
