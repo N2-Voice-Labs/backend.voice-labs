@@ -244,7 +244,13 @@ class ListenerRoutedLiveKitOutput(LiveKitOutputTransport):
             sample_rate=client._out_sample_rate,
             num_channels=self._params.audio_out_channels,
             queue_size_ms=self._params.audio_out_queue_size_ms,
+            audio_sink=self._push_phone_audio,
         )
+
+    async def _push_phone_audio(self, identity: str, event) -> None:
+        """Feed a phone-room participant's microphone to the input like any other's."""
+
+        await self._client._audio_queue.put((event, identity))
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)

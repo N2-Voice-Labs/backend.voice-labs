@@ -14,8 +14,10 @@ Streaming
 The translator is an async iterator of text deltas (OpenAI ``stream=True``). A
 :class:`SentenceChunker` cuts the growing text at sentence boundaries (or at a clause
 boundary once ~40 characters are pending) and each chunk is pushed to TTS as soon as it
-is complete, so audio starts before the whole translation exists. The complete text is
-still emitted once as the assistant ``TranscriptFinal``.
+is complete, so audio starts before the whole translation exists. The first chunk of an
+utterance may end at a clause boundary from 20 characters on (later chunks 40; none in
+accurate mode, which cuts at sentences only). The complete text is still emitted once as
+the assistant ``TranscriptFinal``.
 
 Turn end
 --------
@@ -95,6 +97,9 @@ from .latency_modes import (
     profile_for,
 )
 from .participants import MAX_PARTICIPANTS, ParticipantDirectory, normalize_language
+from .provider_failures import report_provider_exception
+from .stall_watchdog import guard_first_token
+from .guard_events import current_turn_id
 from .timeline import TimelineTracker, UtteranceTimeline
 
 _logger = logging.getLogger(__name__)
@@ -106,6 +111,9 @@ DRAIN_TIMEOUT_SECONDS = 20.0
 # finalized continuation before being translated on its own.
 LATE_SEGMENT_GRACE_SECONDS = 0.3
 CLAUSE_MIN_CHARS = 40
+# PR-21: the first chunk of an utterance is what the listener waits for, so it may end at
+# a clause boundary earlier than later chunks (never later than ``clause_min_chars``).
+FIRST_CLAUSE_MIN_CHARS = 20
 MIN_COMPLETION_TOKENS = 64
 MAX_COMPLETION_TOKENS = 512
 
@@ -183,14 +191,14 @@ class InterpreterSettings:
         latency_mode = raw.get("latency_mode") or DEFAULT_LATENCY_MODE
         if latency_mode not in LATENCY_MODES:
             raise RuntimeError(f"unsupported interpreter latency_mode: {latency_mode}")
+        glossary = parse_glossary(raw.get("glossary"))
         # An explicit engine always wins over the engine the mode would choose.
         engine = raw.get("engine") or default_engine_for(
-            latency_mode, direction, pair[1]
+            latency_mode, direction, pair[1], has_glossary=bool(glossary)
         )
         hear_original = raw.get("hear_original", False)
         if not isinstance(hear_original, bool):
             raise RuntimeError("interpreter hear_original must be a boolean")
-        glossary = parse_glossary(raw.get("glossary"))
         settings = cls(
             languages=(pair[0], pair[1]),
             direction=direction,
@@ -405,13 +413,26 @@ class SentenceChunker:
     A chunk ends at a sentence boundary (``. ! ? …`` followed by whitespace, or the CJK
     ``。？！`` followed by anything) or, once at least ``clause_min_chars`` (default
     :data:`CLAUSE_MIN_CHARS`; None disables clause cuts) characters are pending, at a clause boundary (``, ; :`` followed by whitespace; fullwidth
-    ``，；：、`` followed by anything). A terminator at the very end of the buffer waits
-    for the next delta (it may be ``3.5`` or ``...``); :meth:`flush` returns the rest.
+    ``，；：、`` followed by anything). When ``first_clause_min_chars`` is given, the first
+    chunk of the stream needs only ``min(clause_min_chars, first_clause_min_chars)``
+    characters (PR-21: the listener waits for it). A terminator at the very end of the buffer waits for the next delta (it may be
+    ``3.5`` or ``...``); :meth:`flush` returns the rest.
     """
 
-    def __init__(self, clause_min_chars: int | None = CLAUSE_MIN_CHARS) -> None:
-        # None: cut at sentence boundaries only (the "accurate" latency mode).
+    def __init__(
+        self,
+        clause_min_chars: int | None = CLAUSE_MIN_CHARS,
+        first_clause_min_chars: int | None = None,
+    ) -> None:
+        # None: cut at sentence boundaries only (the "accurate" latency mode); then the
+        # first chunk is not special either.
         self._clause_min_chars = clause_min_chars
+        self._first_clause_min_chars = (
+            clause_min_chars
+            if clause_min_chars is None or first_clause_min_chars is None
+            else min(clause_min_chars, first_clause_min_chars)
+        )
+        self._cut = False
         self._buffer = ""
 
     def feed(self, delta: str) -> list[str]:
@@ -422,6 +443,7 @@ class SentenceChunker:
             self._buffer = self._buffer[end:].lstrip()
             if chunk:
                 chunks.append(chunk)
+                self._cut = True
         return chunks
 
     def flush(self) -> list[str]:
@@ -432,6 +454,7 @@ class SentenceChunker:
         text = self._buffer
         size = len(text)
         index = 0
+        clause_min = self._clause_min_chars if self._cut else self._first_clause_min_chars
         while index < size:
             char = text[index]
             if char in _SENTENCE_END:
@@ -445,9 +468,9 @@ class SentenceChunker:
                 index = end
                 continue
             if (
-                self._clause_min_chars is not None
+                clause_min is not None
                 and (char in _CLAUSE_END or char in _FULLWIDTH_CLAUSE_END)
-                and len(text[: index + 1].strip()) >= self._clause_min_chars
+                and len(text[: index + 1].strip()) >= clause_min
             ):
                 if index + 1 == size:
                     return None
@@ -475,6 +498,10 @@ class _TurnState:
     late_flush: asyncio.TimerHandle | None = None
 
 
+# Called with the utterance info when a translation comes back empty (ST-12).
+EmptyTranslationHook = Callable[[dict[str, object]], None]
+
+
 class TranslationProcessor(FrameProcessor):
     """Translate each finished user utterance and speak it in the other language."""
 
@@ -492,9 +519,11 @@ class TranslationProcessor(FrameProcessor):
         timeline: TimelineTracker | None = None,
         context_pairs: int = MAX_CONTEXT_PAIRS,
         clause_min_chars: int | None = CLAUSE_MIN_CHARS,
+        on_empty_translation: EmptyTranslationHook | None = None,
     ) -> None:
         super().__init__()
         self._settings = settings
+        self._on_empty_translation = on_empty_translation
         self._timeline = timeline
         self._context_pairs = context_pairs
         self._clause_min_chars = clause_min_chars
@@ -683,8 +712,13 @@ class TranslationProcessor(FrameProcessor):
                 await self.process_utterance(utterance)
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
                 _logger.exception("Interpreter dropped an utterance after an error")
+                # ST-10a: a dropped utterance is never silent. ``other`` is emitted and the
+                # call goes on; repeated ones end it (see provider_failures).
+                report_provider_exception(
+                    self._session, "translation", "openai", exc, stage="process_utterance"
+                )
             finally:
                 self._queue.task_done()
 
@@ -727,6 +761,7 @@ class TranslationProcessor(FrameProcessor):
             source, target = self.resolve_languages(utterance.language, utterance.text)
             voice = self._default_voice_id
         self._last_source = source
+        turn_id = current_turn_id(self._session, utterance.timeline)  # ST-02a
         user_event: dict[str, object] = {
             "content": utterance.text,
             "role": "user",
@@ -737,6 +772,8 @@ class TranslationProcessor(FrameProcessor):
         }
         if participant is not None:
             user_event.update(speaker, target_language=target)
+        if turn_id is not None:
+            user_event["turn_id"] = turn_id
         self._emit("TranscriptFinal", user_event)
         translated_for = (
             {
@@ -757,7 +794,7 @@ class TranslationProcessor(FrameProcessor):
             self._settings.glossary,
         )
         started = time.monotonic()
-        chunker = SentenceChunker(self._clause_min_chars)
+        chunker = SentenceChunker(self._clause_min_chars, FIRST_CLAUSE_MIN_CHARS)
         deltas: list[str] = []
         spoken: list[str] = []
 
@@ -783,6 +820,7 @@ class TranslationProcessor(FrameProcessor):
                     "translation_first_chunk_ms", time.monotonic() - started
                 )
                 if timeline is not None:
+                    timeline.mark(utterance_timeline, "translation_first_chunk")
                     timeline.enqueue_audio(utterance_timeline, listener_identity)
                 changes: dict[str, str] = {}
                 if lane is not None:
@@ -813,13 +851,17 @@ class TranslationProcessor(FrameProcessor):
             speak_frame = TTSSpeakFrame(chunk, append_to_context=False)
             if lane is not None:
                 speak_frame.metadata["listener_lane"] = lane
+            if timeline is not None:
+                timeline.mark(utterance_timeline, "tts_request")
             await self.push_frame(speak_frame)
 
         if timeline is not None:
             timeline.mark(utterance_timeline, "translation_start")
-        stream = self._translate(messages)
+        stream = guard_first_token(self._translate(messages))
         try:
             async for delta in stream:
+                if timeline is not None and delta:
+                    timeline.mark(utterance_timeline, "translation_first_token")
                 deltas.append(delta)
                 for chunk in chunker.feed(delta):
                     await speak(chunk)
@@ -834,9 +876,13 @@ class TranslationProcessor(FrameProcessor):
                 type(exc).__name__,
                 "stopped after %d spoken chunk(s)" % len(spoken) if spoken else "skipping utterance",
             )
+            # PR-30: rejected key or no credit must end the call, not silently skip every turn.
+            report_provider_exception(self._session, "translation", "openai", exc)
             if spoken:
                 # Report what the listener actually heard; keep it out of the context.
-                self._emit_assistant_transcript(" ".join(spoken), target, translated_for)
+                self._emit_assistant_transcript(
+                    " ".join(spoken), target, translated_for, turn_id
+                )
             return
         finally:
             await _close_stream(stream)
@@ -844,9 +890,19 @@ class TranslationProcessor(FrameProcessor):
                 timeline.speech_done(utterance_timeline)
         translation = "".join(deltas).strip()
         if not translation:
+            if self._on_empty_translation is not None:
+                self._on_empty_translation(
+                    {
+                        "text": utterance.text,
+                        "source_language": source,
+                        "target_language": target,
+                        "user_id": utterance.user_id,
+                        "turn_id": turn_id,
+                    }
+                )
             return
         self._history.append((source, utterance.text, target, translation))
-        self._emit_assistant_transcript(translation, target, translated_for)
+        self._emit_assistant_transcript(translation, target, translated_for, turn_id)
 
     def _emit_latency(self, metric: str, seconds: float) -> None:
         self._emit(
@@ -860,19 +916,23 @@ class TranslationProcessor(FrameProcessor):
         )
 
     def _emit_assistant_transcript(
-        self, content: str, target: str, translated_for: dict[str, object] | None = None
+        self,
+        content: str,
+        target: str,
+        translated_for: dict[str, object] | None = None,
+        turn_id: int | None = None,
     ) -> None:
-        self._emit(
-            "TranscriptFinal",
-            {
-                "content": content,
-                "role": "assistant",
-                "primary_language": target,
-                "detected_languages": [target],
-                # Two-participant sessions: who was translated, from which language.
-                **(translated_for or {}),
-            },
-        )
+        payload: dict[str, object] = {
+            "content": content,
+            "role": "assistant",
+            "primary_language": target,
+            "detected_languages": [target],
+            # Two-participant sessions: who was translated, from which language.
+            **(translated_for or {}),
+        }
+        if turn_id is not None:
+            payload["turn_id"] = turn_id
+        self._emit("TranscriptFinal", payload)
 
     # -- events ----------------------------------------------------------------
 

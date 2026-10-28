@@ -137,6 +137,38 @@ def test_one_event_with_every_mark_when_playback_becomes_stable() -> None:
     assert len(session.timelines()) == 1
 
 
+def test_pr20_marks_split_translation_start_to_first_audio() -> None:
+    tracker, clock, session = make()
+    timeline = tracker.speech_started("", 0.2)
+    clock.advance(0.1)
+    tracker.transcript("")
+    clock.advance(0.05)
+    tracker.take("")
+    tracker.mark(timeline, "translation_start")  # 100.15
+    clock.advance(0.4)
+    tracker.mark(timeline, "translation_first_token")  # LLM time to first token 0.4
+    clock.advance(0.1)
+    tracker.mark(timeline, "translation_first_chunk")  # chunking wait 0.1
+    tracker.enqueue_audio(timeline)
+    tracker.chunk_pushed(timeline)
+    tracker.mark(timeline, "tts_request")
+    tracker.mark(timeline, "translation_first_token")  # first occurrence wins
+    clock.advance(0.3)  # TTS time to first byte 0.3
+    tracker.speech_done(timeline)
+    tracker.on_audio(pcm(600), RATE)
+
+    [event] = session.timelines()
+    marks = event["marks_ms"]
+    assert list(marks) == [
+        "vad", "first_transcript", "translation_start", "translation_first_token",
+        "translation_first_chunk", "tts_request", "first_audio", "stable",
+    ]  # fmt: skip
+    assert marks["translation_first_token"] - marks["translation_start"] == pytest.approx(400, abs=0.2)
+    assert marks["translation_first_chunk"] - marks["translation_first_token"] == pytest.approx(100, abs=0.2)
+    assert marks["first_audio"] - marks["tts_request"] == pytest.approx(300, abs=0.2)
+    assert event["value_ms"] == marks["first_audio"]
+
+
 def test_missing_marks_are_omitted() -> None:
     tracker, clock, session = make()
     timeline = tracker.speech_started("", 0.0)

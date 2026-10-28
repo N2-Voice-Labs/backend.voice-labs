@@ -907,3 +907,90 @@ def test_session_start_accepts_old_and_new_contracts() -> None:
     )
     assert new.mode == "interpreter"
     assert new.interpreter == {"languages": ["en", "ru"], "direction": "auto"}
+
+
+# -- PR-21: first chunk of an utterance -----------------------------------------------
+
+
+def test_first_chunk_may_end_at_an_earlier_clause_than_later_chunks() -> None:
+    chunker = SentenceChunker(40, first_clause_min_chars=20)
+    # 25 characters pending at the first comma: enough for the first chunk ...
+    assert chunker.feed("Thank you for calling us, how can we help") == ["Thank you for calling us,"]
+    # ... but later chunks keep the 40-character clause threshold.
+    assert chunker.feed(" you today, sir, as we are here") == []
+    assert chunker.feed(" to serve. Next") == ["how can we help you today, sir, as we are here to serve."]
+    assert chunker.flush() == ["Next"]
+
+
+def test_first_chunk_threshold_never_exceeds_the_clause_threshold_and_is_off_by_default() -> None:
+    # instant already cuts at 20: unchanged; a smaller clause threshold wins over the first one.
+    assert SentenceChunker(20, first_clause_min_chars=20).feed("A clause of twenty chars, rest") == [
+        "A clause of twenty chars,"
+    ]
+    assert SentenceChunker(10, first_clause_min_chars=20).feed("Ten chars, rest of it") == ["Ten chars,"]
+    # Not asked for: balanced keeps 40 for the first chunk too.
+    assert SentenceChunker(40).feed("Thank you for calling us, how can we help") == []
+    # Accurate (no clause cuts) ignores it: sentences only.
+    accurate = SentenceChunker(None, first_clause_min_chars=20)
+    assert accurate.feed("Thank you for calling us, how can we help. Next") == [
+        "Thank you for calling us, how can we help."
+    ]
+
+
+def test_first_chunk_clause_cut_works_for_streamed_tokens_and_fullwidth_commas() -> None:
+    chunker = SentenceChunker(40, first_clause_min_chars=20)
+    tokens = ["Thank", " you", " for", " calling", " us", ",", " how", " can", " we"]
+    out = [c for t in tokens for c in chunker.feed(t)]
+    assert out == ["Thank you for calling us,"]
+    assert chunker.flush() == ["how can we"]
+    cjk = SentenceChunker(40, first_clause_min_chars=5)
+    assert cjk.feed("\u611f\u8c22\u60a8\u7684\u6765\u7535\uff0c\u8bf7\u95ee") == ["\u611f\u8c22\u60a8\u7684\u6765\u7535\uff0c"]
+
+
+def test_balanced_processor_speaks_the_first_clause_early_and_marks_the_timeline() -> None:
+    from pipecat.frames.frames import VADUserStartedSpeakingFrame
+    from src.runtime.timeline import TimelineTracker
+
+    session = FakeSession()
+    tracker = TimelineTracker(session, "cascaded")
+
+    async def streaming(messages):
+        await asyncio.sleep(0.05)  # LLM time to first token
+        yield "Спасибо за ваш звонок, "
+        await asyncio.sleep(0.05)
+        yield "чем мы можем вам помочь "
+        yield "сегодня, сэр, мы всегда рады. "
+        yield "Конец"
+
+    processor = TranslationProcessor(
+        settings=InterpreterSettings(languages=("en", "ru"), direction="one_way"),
+        translate=streaming,
+        model="m",
+        session=session,
+        clause_min_chars=40,
+        timeline=tracker,
+    )
+    down, _ = run(
+        processor,
+        [VADUserStartedSpeakingFrame(start_secs=0.1), *utterance("Thank you for calling", "en")],
+    )
+    assert spoken(down) == [
+        "Спасибо за ваш звонок,",
+        "чем мы можем вам помочь сегодня, сэр, мы всегда рады.",
+        "Конец",
+    ]
+    [queued] = list(tracker._queue)
+    marks = queued.marks
+    order = ["translation_start", "translation_first_token", "translation_first_chunk", "tts_request"]
+    assert all(name in marks for name in order)
+    assert [marks[name] for name in order] == sorted(marks[name] for name in order)
+    assert marks["translation_first_token"] - marks["translation_start"] >= 0.04  # LLM wait
+    assert marks["tts_request"] >= marks["translation_first_chunk"]
+    assert queued.chunks_pushed == 3
+
+
+def test_translation_works_without_a_timeline_tracker() -> None:
+    # No tracker: translation still works (no AttributeError on the new marks).
+    processor = make_processor()
+    down, _ = run(processor, utterance("Hello", "en"))
+    assert spoken(down) == ["T:Hello"]

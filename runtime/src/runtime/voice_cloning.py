@@ -216,3 +216,64 @@ async def clone_voice(
     if not isinstance(voice_id, str) or not voice_id:
         raise CloneProviderError("cartesia response missing voice id")
     return voice_id
+
+
+DELETE_TIMEOUT_SECONDS = 15.0
+# Provider voice ids are opaque; accept UUID-like / slug ids only so the id can never alter
+# the upstream path (no slashes, dots, query or whitespace).
+PROVIDER_VOICE_ID_PATTERN = r"^[A-Za-z0-9_-]{1,128}$"
+_RETRYABLE_STATUSES = {408, 425, 429}
+
+
+class UnknownVoiceProvider(Exception):
+    """No voice management support for this provider."""
+
+
+class VoiceDeleteError(Exception):
+    """Provider delete failed. The message is safe to log (no key, no upstream body)."""
+
+    def __init__(self, message: str, *, retryable: bool) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+
+
+async def _delete_cartesia_voice(api_key: str, provider_voice_id: str) -> None:
+    headers = {
+        "X-API-Key": api_key,
+        "Authorization": f"Bearer {api_key}",
+        "Cartesia-Version": CLONE_CARTESIA_VERSION,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=DELETE_TIMEOUT_SECONDS) as client:
+            response = await client.delete(
+                f"{CARTESIA_BASE_URL}/voices/{provider_voice_id}", headers=headers
+            )
+    except httpx.HTTPError as exc:
+        raise VoiceDeleteError(
+            f"cartesia request failed: {type(exc).__name__}", retryable=True
+        ) from None
+    status = response.status_code
+    if status == 404 or 200 <= status < 300:
+        return  # 404: already gone, which is the state the caller wants.
+    raise VoiceDeleteError(
+        f"cartesia returned status {status}",
+        retryable=status >= 500 or status in _RETRYABLE_STATUSES,
+    )
+
+
+_VOICE_DELETERS = {"cartesia": _delete_cartesia_voice}
+
+
+def supports_voice_delete(provider: str) -> bool:
+    return provider in _VOICE_DELETERS
+
+
+async def delete_voice(
+    provider: str, provider_voice_id: str, *, api_key: str
+) -> None:
+    """Delete a cloned voice at the provider; an already-missing voice counts as success."""
+
+    deleter = _VOICE_DELETERS.get(provider)
+    if deleter is None:
+        raise UnknownVoiceProvider(provider)
+    await deleter(api_key, provider_voice_id)

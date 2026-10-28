@@ -698,12 +698,13 @@ def test_builder_selects_the_translator_pipeline_only_when_translation_is_set(li
         "InboundTranslator",
         "OpenAILLMService",
         "OutboundTranslator",
+        "AnswerGuard",
         "CartesiaTTSService",
         "RuntimeEventProcessor",
         "LiveKitOutputTransport",
         "LLMAssistantAggregator",
     ]
-    stt, llm, tts = processors[1], processors[5], processors[7]
+    stt, llm, tts = processors[1], processors[5], processors[8]
     assert stt._settings.language == "multi" and stt._settings.model == "nova-3"
     assert tts._settings.language == "ru"
     instruction = llm._settings.system_instruction
@@ -712,7 +713,7 @@ def test_builder_selects_the_translator_pipeline_only_when_translation_is_set(li
     # The translators own the transcripts: the remaining event processor mutes them,
     # so no transcript event can be emitted twice.
     assert names.count("RuntimeEventProcessor") == 1
-    assert processors[8]._transcript_events is False
+    assert processors[9]._transcript_events is False
     assert processors[4]._session is session and processors[6]._session is session
     # The translation legs use a small fast model, not the LLM's; warm-up is wired.
     assert processors[4]._model == processors[6]._model == "gpt-4.1-nano"
@@ -735,7 +736,7 @@ def test_builder_fixes_the_stt_language_for_a_single_non_detectable_caller(light
     _, worker = build_livekit_pipeline(config)
     processors = _processors(worker)
     assert processors[1]._settings.language == "ko"
-    assert processors[7]._settings.language == "ko"
+    assert processors[8]._settings.language == "ko"
     assert "RuntimeEventProcessor" not in [type(p).__name__ for p in processors]
 
 
@@ -750,6 +751,7 @@ def test_builder_leaves_the_normal_agent_pipeline_untouched(light_models) -> Non
         "LLMUserAggregator",
         "OpenAILLMService",
         "RuntimeEventProcessor",
+        "AnswerGuard",
         "CartesiaTTSService",
         "RuntimeEventProcessor",
         "LiveKitOutputTransport",
@@ -800,7 +802,10 @@ def test_agent_translation_timeline_runs_from_caller_speech_to_first_translated_
         ],
     )
     [queued] = list(tracker._queue)
-    assert list(queued.marks) == ["vad", "first_transcript", "translation_start"]
+    assert list(queued.marks) == [
+        "vad", "first_transcript", "translation_start", "translation_first_token",
+        "translation_first_chunk", "tts_request",
+    ]  # fmt: skip
     assert queued.chunks_pushed == 2 and queued.speech_complete  # one TTS context per sentence
 
     tracker.on_audio(_voiced(300), 16000)
@@ -813,6 +818,13 @@ def test_agent_translation_timeline_runs_from_caller_speech_to_first_translated_
     marks = event["marks_ms"]
     assert 200 <= marks["vad"] <= 200.5
     assert marks["vad"] <= marks["first_transcript"] <= marks["translation_start"] <= marks["first_audio"]
+    assert (
+        marks["translation_start"]
+        <= marks["translation_first_token"]
+        <= marks["translation_first_chunk"]
+        <= marks["tts_request"]
+        <= marks["first_audio"]
+    )
     assert event["value_ms"] == marks["first_audio"]
 
 

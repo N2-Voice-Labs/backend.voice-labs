@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any
 
+from .provider_failures import watch_provider_failures
+from .turn_debug import watch_turn_debug
 from .speech_providers import (
     build_llm,
     build_stt,
@@ -40,6 +42,9 @@ class PipelineConfig:
     # Two-person interpreter sessions: LiveKit identity -> {language, voice_id,
     # display_name}. None (or empty) keeps the single-participant pipeline.
     participants: dict[str, dict[str, Any]] | None = None
+    # Two-person sessions whose humans cannot subscribe in the session room: each hears its
+    # translation in a private listen room (``participants.listen_room_name``).
+    private_listening: bool = False
     # Agent + translator (TR-040): {working_language, caller_languages}. None keeps the
     # ordinary agent pipeline.
     translation: dict[str, Any] | None = None
@@ -115,6 +120,13 @@ class PipelineConfig:
             if engine is None or not engine.supports_two_way:
                 raise RuntimeError("participants require a cascaded interpreter")
             participants = {identity: dict(spec) for identity, spec in participants.items()}
+        private_listening = bool(session.get("private_listening", False))
+        if private_listening and participants is None:
+            raise RuntimeError("private_listening requires participants")
+        if not private_listening and any(
+            spec.get("phone_room") for spec in (participants or {}).values()
+        ):
+            raise RuntimeError("phone_room participants require private_listening")
         translation = session.get("translation") or None
         if translation is not None:
             from .agent_translation import AgentTranslationSettings
@@ -151,6 +163,7 @@ class PipelineConfig:
             mode=mode,
             interpreter=dict(interpreter) if interpreter else None,
             participants=participants,
+            private_listening=private_listening,
             translation=translation,
         )
 
@@ -184,6 +197,23 @@ def create_runtime_token(room_name: str) -> str:
         .with_ttl(timedelta(minutes=10))
         .to_jwt()
     )
+
+
+def listen_room_connector(config: PipelineConfig, room_name_for=None):
+    """Connect the Runtime to one participant's private room (their listen room, or with
+    ``room_name_for=phone_room_name`` the room a phone is dialled into)."""
+
+    from livekit import rtc
+
+    from .participants import listen_room_name
+
+    async def connect(identity: str):
+        name = (room_name_for or listen_room_name)(config.room_name, identity)
+        room = rtc.Room()
+        await room.connect(config.livekit_url, create_runtime_token(name))
+        return room
+
+    return connect
 
 
 def require_pipecat() -> None:
@@ -302,6 +332,7 @@ def build_livekit_pipeline(config: PipelineConfig, session=None):
             processors.append(
                 RuntimeEventProcessor(session, assistant_output=True, control_events=False)
             )
+        processors.append(answer_guard(session, _agent_language(config, session)))
         processors.append(tts)
         if session is not None:
             processors.append(RuntimeEventProcessor(session))
@@ -311,7 +342,41 @@ def build_livekit_pipeline(config: PipelineConfig, session=None):
         pipeline,
         params=PipelineParams(enable_metrics=True, enable_usage_metrics=True),
     )
+    # PR-30: a dead or out-of-credit provider ends the call cleanly instead of going silent.
+    # ST-10a: also attaches the stall watchdog (STT/LLM/TTS hangs raise no error).
+    watch_provider_failures(worker, session, config.providers)
+    # ST-02a: one TurnDebug event per turn (agent mode only; not the interpreter pipelines).
+    watch_turn_debug(worker, session, config.providers)
     return transport, worker
+
+
+def _agent_language(config: PipelineConfig, session):
+    """The language the answer guard's REPEAT line is spoken in (non-translation agent).
+
+    The agent has no declared caller language; use what is configured for speech: the TTS
+    language setting, else the STT one (``multi`` means undetermined). Unknown: English.
+    """
+
+    settings = config.provider_settings
+    for kind in ("tts", "stt"):
+        language = (settings.get(kind) or {}).get("language")
+        if isinstance(language, str) and language and language != "multi":
+            return language
+    return getattr(session, "caller_language", None)
+
+
+def answer_guard(session, language):
+    """ST-12: the answer guard before TTS; reports ``AnswerEmpty``/``AnswerTruncated``."""
+
+    from .answer_guard import MAX_SPOKEN_CHARS, AnswerGuard
+    from .guard_events import answer_empty_hook, answer_truncated_hook
+
+    return AnswerGuard(
+        language=language,
+        max_spoken_chars=MAX_SPOKEN_CHARS,
+        on_empty=answer_empty_hook(session),
+        on_truncated=answer_truncated_hook(session, MAX_SPOKEN_CHARS),
+    )
 
 
 def agent_translation_processors(
@@ -344,6 +409,7 @@ def agent_translation_processors(
     )
     from .frame_events import RuntimeEventProcessor
     from .agent_translation import AGENT_TRANSLATION_MODEL
+    from .guard_events import translation_empty_hook
     from .interpreter import OpenAITranslator
 
     # A small fast model keeps the two extra round trips short; the LLM's own model is
@@ -359,6 +425,9 @@ def agent_translation_processors(
     # RM-003: caller speech start -> first audible translated reply.
     timeline = TimelineTracker(session, "agent_translation") if session is not None else None
     state = CallerLanguageState(translation, timeline=timeline)
+    if session is not None:
+        # ST-10b: the failure apology is spoken in the caller's current language.
+        session.caller_language = lambda: state.language
     processors = [
         transport.input(),
         stt,
@@ -370,9 +439,18 @@ def agent_translation_processors(
             model=model,
             session=session,
             warm_up=translator.warm_up,
+            on_empty_translation=translation_empty_hook(session, "inbound"),
         ),
         llm,
-        OutboundTranslator(state=state, translate=translator, model=model, session=session),
+        OutboundTranslator(
+            state=state,
+            translate=translator,
+            model=model,
+            session=session,
+            on_empty_translation=translation_empty_hook(session, "outbound"),
+        ),
+        # The outbound translator's spoken output is in the caller's current language.
+        answer_guard(session, lambda: state.language),
         tts,
     ]
     if session is not None:
@@ -442,12 +520,22 @@ def build_interpreter_pipeline(config: PipelineConfig, session=None):
         # audio is published only to that listener.
         from .audio_routing import ListenerAudioRouter, LiveKitApiSettings
         from .participant_lanes import PerParticipantLiveKitTransport
-        from .participants import MAX_PARTICIPANTS, translation_destination
+        from .participants import MAX_PARTICIPANTS, phone_room_name, translation_destination
 
         router = ListenerAudioRouter(
             directory,
             hear_original=settings.hear_original,
             api_settings=LiveKitApiSettings.from_environment(config.livekit_url),
+            listen_room_factory=(
+                listen_room_connector(config)
+                if config.private_listening and not settings.hear_original
+                else None
+            ),
+            phone_room_factory=(
+                listen_room_connector(config, phone_room_name)
+                if config.private_listening and not settings.hear_original
+                else None
+            ),
         )
         transport = PerParticipantLiveKitTransport(
             url=config.livekit_url,
@@ -469,6 +557,11 @@ def build_interpreter_pipeline(config: PipelineConfig, session=None):
     worker = PipelineWorker(
         Pipeline(processors),
         params=PipelineParams(enable_metrics=True, enable_usage_metrics=True),
+    )
+    # PR-30: a dead or out-of-credit provider ends the call cleanly instead of going silent.
+    # ST-10a: plus the stall watchdog; the realtime engine has no STT/LLM/TTS to watch.
+    watch_provider_failures(
+        worker, session, config.providers, stall_watchdog=settings.engine != "realtime"
     )
     return transport, worker
 

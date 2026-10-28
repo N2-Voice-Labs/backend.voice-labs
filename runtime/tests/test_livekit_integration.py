@@ -478,10 +478,7 @@ async def _verify_livekit_session(
                 if event.event_type == "SessionEnded"
             )
             assert terminal_event.payload["outcome"] == "ended"
-            assert terminal_event.payload["reason"] in {
-                "Browser participant disconnected",
-                "LiveKit disconnected",
-            }
+            assert terminal_event.payload["reason"] == "participant_disconnected"
         elif not disconnect_remotely:
             terminal_event = next(
                 event
@@ -490,7 +487,7 @@ async def _verify_livekit_session(
             )
             assert terminal_event.payload == {
                 "outcome": "ended",
-                "reason": "Session ended by request",
+                "reason": "platform_end",
             }
         remaining = await livekit.room.list_participants(
             livekit_api.ListParticipantsRequest(room=room_name)

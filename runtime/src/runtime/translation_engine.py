@@ -25,11 +25,14 @@ contract is the registry key.
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from .speech_providers import build_stt, build_tts
+
+_logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from pipecat.processors.frame_processor import FrameProcessor
@@ -121,7 +124,9 @@ class CascadedEngine:
         from pipecat.turns.user_turn_strategies import UserTurnStrategies
 
         from .glossary import glossary_keyterms
+        from .guard_events import translation_empty_hook
         from .interpreter import OpenAITranslator, TranslationProcessor
+        from .language_capabilities import stt_language_for
         from .participants import MAX_PARTICIPANTS, translation_destination
 
         config, directory = context.config, context.directory
@@ -153,6 +158,7 @@ class CascadedEngine:
             timeline=context.timeline,
             context_pairs=profile.context_pairs,
             clause_min_chars=profile.clause_min_chars,
+            on_empty_translation=translation_empty_hook(context.session, "interpreter"),
         )
 
         def make_vad():
@@ -177,7 +183,15 @@ class CascadedEngine:
 
         if directory is None:
             # Deepgram "multi" detects the language per utterance; one_way fixes the source.
-            stt = make_stt("multi" if settings.direction == "auto" else source)
+            stt_language = stt_language_for(settings.languages, settings.direction)
+            if settings.direction == "auto" and stt_language != "multi":
+                _logger.warning(
+                    "languages %s are not all in Deepgram's multi set; "
+                    "transcribing %s only",
+                    settings.languages,
+                    stt_language,
+                )
+            stt = make_stt(stt_language)
             listening = [make_vad(), stt, make_user_turns()]
             speaking = [make_tts(target)]
         else:

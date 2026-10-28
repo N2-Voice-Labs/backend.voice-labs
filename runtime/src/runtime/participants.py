@@ -45,6 +45,34 @@ def translation_track_name(identity: str) -> str:
     return f"{TRANSLATION_TRACK_PREFIX}{identity}"
 
 
+LISTEN_ROOM_SEPARATOR = "--listen--"
+
+
+def listen_room_name(room_name: str, identity: str) -> str:
+    """Private room a listener hears their translation in (``private_listening``).
+
+    Only that listener (subscribe-only) and the Runtime join it. The Platform derives the
+    same name (``platform.livekit.listen_room_name``); ``docs/contracts.md`` documents it.
+    """
+
+    return f"{room_name}{LISTEN_ROOM_SEPARATOR}{identity}"
+
+
+PHONE_ROOM_SEPARATOR = "--phone--"
+
+
+def phone_room_name(room_name: str, identity: str) -> str:
+    """Private room a phone (SIP) participant is dialled into (``private_listening``).
+
+    The phone and the Runtime are the only members: the phone's microphone is published
+    there and its translation (``translation-for-<identity>``) comes back on the same
+    connection, so it can never hear another person's original voice. The Platform
+    derives the same name (``platform.livekit.phone_room_name``).
+    """
+
+    return f"{room_name}{PHONE_ROOM_SEPARATOR}{identity}"
+
+
 def translation_destination(lane: int) -> str:
     """Pipecat output destination feeding the track of the listener in ``lane``."""
 
@@ -75,6 +103,9 @@ class Participant:
     language: str
     voice_id: str | None = None
     display_name: str | None = None
+    # A phone (SIP) participant dialled into its own :func:`phone_room_name` room instead
+    # of the session room. Only with ``private_listening``.
+    phone_room: bool = False
 
 
 @dataclass(frozen=True)
@@ -144,9 +175,29 @@ class ParticipantDirectory:
             raise ParticipantError("session_full")
         voice_id = spec.get("voice_id") or None
         display_name = spec.get("display_name") or None
-        participant = Participant(identity, language, voice_id, display_name)
+        participant = Participant(
+            identity, language, voice_id, display_name, bool(spec.get("phone_room"))
+        )
         self._participants[identity] = participant
         return participant
+
+    async def remove(self, identity: str) -> None:
+        """Forget a phone-room participant whose call never connected (and tell listeners).
+
+        Only the most recently added participant can leave, so the remaining lane
+        numbers (insertion order) stay stable.
+        """
+
+        participant = self._participants.get(identity)
+        if participant is None:
+            raise ParticipantError("participant_not_found")
+        if not participant.phone_room or identity != list(self._participants)[-1]:
+            raise ParticipantError("participant_not_removable")
+        del self._participants[identity]
+        if self._present is not None:
+            self._present.discard(identity)
+        for listener in list(self._listeners):
+            await listener(participant)
 
     async def update(self, identity: str, spec: Mapping[str, Any]) -> Participant:
         """Add or replace a participant and tell listeners (the pipeline lanes)."""
@@ -162,15 +213,21 @@ class ParticipantDirectory:
     def get(self, identity: str | None) -> Participant | None:
         return self._participants.get(identity) if identity else None
 
-    def as_contract(self) -> dict[str, dict[str, str | None]]:
+    def as_contract(self) -> dict[str, dict[str, Any]]:
         return {
             p.identity: {
                 "language": p.language,
                 "voice_id": p.voice_id,
                 "display_name": p.display_name,
+                **({"phone_room": True} if p.phone_room else {}),
             }
             for p in self._participants.values()
         }
+
+    def phone_room_identities(self) -> list[str]:
+        """Participants that live in their own phone room, not in the session room."""
+
+        return [p.identity for p in self._participants.values() if p.phone_room]
 
     # -- lanes -----------------------------------------------------------------
 

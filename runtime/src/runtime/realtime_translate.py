@@ -62,8 +62,14 @@ A socket error (connect failure, close, send/receive error, an ``error`` event b
 session is ready) triggers one reconnect attempt after :data:`RECONNECT_DELAY_SECONDS`;
 audio captured meanwhile is queued (bounded, oldest dropped). The retry allowance is
 restored after a connection stayed up for :data:`STABLE_CONNECTION_SECONDS`. When the
-retry fails too, the session is marked failed (``SessionFailed`` with reason
-``realtime_translate_failed``) and the pipeline is ended.
+retry fails too, ``ProviderError`` (kind ``realtime``) is emitted (the first attempt emits a
+retryable ``ProviderError`` of its own, ``attempt`` 1) and the session either
+falls back to the cascaded engine (``EngineFallback``, one-way sessions with cascaded
+providers configured) or is marked failed (``SessionFailed`` with reason
+``provider_failed``) and the pipeline is ended. Rejected credentials (a 401/403 on connect,
+close code 3000 ``invalid_api_key``, an ``error`` event naming a bad key) and exhausted
+quota (``insufficient_quota``, 402) are never retried and never fall back, because the
+cascaded translator uses the same OpenAI key. See :mod:`runtime.provider_failures`.
 
 Two-way
 -------
@@ -103,6 +109,14 @@ from pipecat.frames.frames import (
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
 from .interpreter import InterpreterSettings
+from .language_capabilities import realtime_output_languages
+from .provider_failures import (
+    FAILURE_REASON,  # noqa: F401 - re-exported
+    FATAL_REASONS,
+    classify_error,
+    report_provider_failure,
+    report_provider_retry,
+)
 from .timeline import VOICED_PEAK_THRESHOLD, TimelineTracker, UtteranceTimeline, is_voiced  # noqa: F401
 
 _logger = logging.getLogger(__name__)
@@ -110,9 +124,7 @@ _logger = logging.getLogger(__name__)
 REALTIME_TRANSLATE_MODEL = "gpt-realtime-translate"
 REALTIME_TRANSLATE_URL = "wss://api.openai.com/v1/realtime/translations"
 SOURCE_TRANSCRIPTION_MODEL = "gpt-realtime-whisper"
-REALTIME_TRANSLATE_OUTPUT_LANGUAGES = frozenset(
-    {"es", "pt", "fr", "ja", "ru", "zh", "de", "ko", "hi", "id", "vi", "it", "en"}
-)
+REALTIME_TRANSLATE_OUTPUT_LANGUAGES = realtime_output_languages()
 
 INPUT_SAMPLE_RATE = 24000
 DEFAULT_OUTPUT_SAMPLE_RATE = 24000
@@ -128,7 +140,6 @@ WS_CLOSE_TIMEOUT_SECONDS = 0.5
 # voiced threshold (``timeline.VOICED_PEAK_THRESHOLD``, shared with the TTS audio check)
 # are played as plain audio, so they neither count as the agent speaking nor stop the
 # first-audio latency clock.
-FAILURE_REASON = "realtime_translate_failed"
 # Input chunks whose queue time is remembered to date "translation started" (T3).
 RECENT_CHUNK_TIMES = 16
 
@@ -361,10 +372,20 @@ class RealtimeTranslateProcessor(FrameProcessor):
                     and time.monotonic() - connected_at >= self._stable_seconds
                 ):
                     retry_available = True
-                if not retry_available:
-                    await self._fail(exc)
+                # Rejected credentials or no credit fail the same way on a second attempt.
+                stage = "connect" if connected_at is None else "stream"
+                if not retry_available or classify_error(exception=exc) in FATAL_REASONS:
+                    await self._fail(exc, stage)
                     return
                 retry_available = False
+                # ST-10a: the reconnect is the retry; announce it (never a log-only path).
+                report_provider_retry(
+                    self._session,
+                    "realtime",
+                    "openai",
+                    classify_error(exception=exc),
+                    stage=stage,
+                )
                 _logger.warning(
                     "Realtime translate socket error (%s); reconnecting once",
                     type(exc).__name__,
@@ -447,6 +468,8 @@ class RealtimeTranslateProcessor(FrameProcessor):
                 error = event.get("error") if isinstance(event.get("error"), Mapping) else {}
                 detail = f"{error.get('type', 'error')}: {error.get('message', '')}"
                 if not ready:
+                    raise RealtimeTranslateError(f"session rejected ({detail})")
+                if classify_error(text=detail) in FATAL_REASONS:
                     raise RealtimeTranslateError(f"session rejected ({detail})")
                 _logger.warning("Realtime translate error event: %s", detail)
 
@@ -581,34 +604,37 @@ class RealtimeTranslateProcessor(FrameProcessor):
             await self.cancel_task(task)
         await self._close_ws()
 
-    async def _fail(self, exc: BaseException) -> None:
-        """Permanent failure: record it on the session and end the pipeline.
+    async def _fail(self, exc: BaseException, stage: str | None = None) -> None:
+        """Permanent failure: report it (fall back or end) and stop translating.
 
         Ending goes through a separate task because cancelling the pipeline cancels this
         processor's run task, which is the caller.
         """
 
         self._failed = True
-        _logger.error("Realtime translate failed permanently: %s", type(exc).__name__)
+        reason = classify_error(exception=exc)
+        _logger.error("Realtime translate failed permanently (%s): %s", reason, type(exc).__name__)
         self._flush_transcripts()
-        session = self._session
-        if session is not None and hasattr(session, "fail"):
-            session.fail(FAILURE_REASON)
-        self.create_task(self._end_session(exc), "realtime-translate-fail")
 
-    async def _end_session(self, exc: BaseException) -> None:
-        session = self._session
-        if session is not None and hasattr(session, "request_end"):
-            try:
-                if await session.request_end(FAILURE_REASON):
-                    return
-            except Exception:
-                _logger.exception("Could not end the session after a realtime translate failure")
-        await self.push_error(
-            f"realtime translate failed: {type(exc).__name__}",
-            exception=exc if isinstance(exc, Exception) else None,
-            force_treat_as_permanent=True,
+        async def push_error() -> None:
+            await self.push_error(
+                f"realtime translate failed: {reason}",
+                exception=exc if isinstance(exc, Exception) else None,
+                force_treat_as_permanent=True,
+            )
+
+        report_provider_failure(
+            self._session,
+            "realtime",
+            "openai",
+            reason,
+            stage=stage,
+            fatal=True,
+            allow_fallback=True,
+            if_not_ended=push_error,
         )
+        if self._session is None:
+            await push_error()
 
     # -- events ----------------------------------------------------------------
 

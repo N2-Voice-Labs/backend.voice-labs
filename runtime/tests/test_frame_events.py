@@ -77,6 +77,7 @@ def test_final_user_transcription_emits_persistable_transcript_event() -> None:
                 "timestamp": "now",
                 "primary_language": "en",
                 "detected_languages": ["en"],
+                "turn_id": 1,
             },
         )
     ]

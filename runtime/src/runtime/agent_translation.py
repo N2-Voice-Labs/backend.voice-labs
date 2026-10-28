@@ -74,6 +74,7 @@ from pipecat.services.settings import TTSSettings
 from .interpreter import (
     _SCRIPT_LANGUAGES,
     SUPPORTED_LANGUAGES,
+    EmptyTranslationHook,
     SentenceChunker,
     TranslateFn,
     _close_stream,
@@ -83,7 +84,16 @@ from .interpreter import (
     language_label,
 )
 from .glossary import Glossary, parse_glossary
+from .guard_events import current_turn_id
+from .language_capabilities import auto_detect_languages
 from .participants import normalize_language
+from .provider_failures import (
+    TRANSIENT_REASONS,
+    classify_error,
+    report_provider_exception,
+    report_provider_retry,
+)
+from .stall_watchdog import guard_first_token
 from .timeline import TimelineTracker, UtteranceTimeline
 
 _logger = logging.getLogger(__name__)
@@ -92,9 +102,7 @@ MAX_CALLER_LANGUAGES = 4
 # Mirrors the Platform's AUTO_DIRECTION_LANGUAGES: Deepgram "multi" (code-switching)
 # detects these. Every caller language and the working language must be in the set for
 # per-utterance detection; otherwise the single caller language is fixed.
-AUTO_DETECTION_LANGUAGES = frozenset(
-    {"en", "es", "fr", "de", "hi", "ru", "pt", "ja", "it", "nl"}
-)
+AUTO_DETECTION_LANGUAGES = auto_detect_languages()
 PROCESSOR_NAME = "agent_translation"
 # Small, fast, non-reasoning model for the two translation legs (each adds a round trip
 # to every turn). Override with ``provider_settings.llm.translation_model``.
@@ -286,6 +294,9 @@ async def collect_translation(translate: Any, messages: list[dict[str, str]]) ->
     return "".join(parts).strip()
 
 
+INBOUND_RETRY_DELAY_SECONDS = 0.2  # pause before the inbound translator's one retry
+
+
 class CallerLanguageTap(FrameProcessor):
     """Record the language of each finalized transcript segment; pass frames through."""
 
@@ -334,6 +345,7 @@ class InboundTranslator(FrameProcessor):
         model: str,
         session: Any | None = None,
         warm_up: Callable[[], Awaitable[None]] | None = None,
+        on_empty_translation: EmptyTranslationHook | None = None,
     ) -> None:
         super().__init__()
         self._state = state
@@ -341,6 +353,7 @@ class InboundTranslator(FrameProcessor):
         self._model = model
         self._session = session
         self._warm_up = warm_up
+        self._on_empty_translation = on_empty_translation
         self._done: deque[Any] = deque(maxlen=self._DONE_LIMIT)
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
@@ -409,6 +422,9 @@ class InboundTranslator(FrameProcessor):
         }
         if segments:
             event.update(user_id=segments[-1].user_id, timestamp=segments[-1].timestamp)
+        turn_id = current_turn_id(self._session, self._state.utterance)  # ST-02a
+        if turn_id is not None:
+            event["turn_id"] = turn_id
         emit_event(self._session, "TranscriptFinal", event)
 
     async def _translate_message(self, text: str, source: str) -> str:
@@ -424,7 +440,29 @@ class InboundTranslator(FrameProcessor):
         )
         started = time.monotonic()
         try:
-            translated = await collect_translation(self._translate, messages)
+            try:
+                translated = await collect_translation(
+                    lambda m: guard_first_token(self._translate(m)), messages
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as first:
+                # ST-10a: the one place this request can be re-issued as is (nothing has
+                # been spoken yet). A transient failure is retried once; anything else, or
+                # the retry failing too, takes the normal failure path below.
+                category = classify_error(exception=first)
+                if category not in TRANSIENT_REASONS:
+                    raise
+                report_provider_retry(
+                    self._session, "translation", "openai", category, stage="inbound_translation"
+                )
+                _logger.warning(
+                    "Inbound translation failed (%s); retrying once", type(first).__name__
+                )
+                await asyncio.sleep(INBOUND_RETRY_DELAY_SECONDS)
+                translated = await collect_translation(
+                    lambda m: guard_first_token(self._translate(m)), messages
+                )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -432,8 +470,20 @@ class InboundTranslator(FrameProcessor):
                 "Inbound translation failed (%s); passing the caller's words through",
                 type(exc).__name__,
             )
+            report_provider_exception(
+                self._session, "translation", "openai", exc, stage="inbound_translation"
+            )  # PR-30
             return text
         if not translated:
+            # ST-12: the caller's words go on unchanged; let the orchestrator know.
+            if self._on_empty_translation is not None:
+                self._on_empty_translation(
+                    {
+                        "text": text,
+                        "source_language": source,
+                        "target_language": working,
+                    }
+                )
             return text
         emit_latency(
             self._session, "inbound_translation_ms", time.monotonic() - started, self._model
@@ -464,12 +514,14 @@ class OutboundTranslator(FrameProcessor):
         translate: TranslateFn,
         model: str,
         session: Any | None = None,
+        on_empty_translation: EmptyTranslationHook | None = None,
     ) -> None:
         super().__init__()
         self._state = state
         self._translate = as_streaming_translator(translate)
         self._model = model
         self._session = session
+        self._on_empty_translation = on_empty_translation
         self._tts_language = state.settings.initial_tts_language
         self._response: _Response | None = None
 
@@ -599,15 +651,19 @@ class OutboundTranslator(FrameProcessor):
                     )
             response.spoken.append(chunk)
             if tracker is not None:
+                tracker.mark(response.utterance, "translation_first_chunk")
                 tracker.enqueue_audio(response.utterance)
                 tracker.chunk_pushed(response.utterance)
+                tracker.mark(response.utterance, "tts_request")
             await self.push_frame(TTSSpeakFrame(chunk, append_to_context=False))
 
         if tracker is not None:
             tracker.mark(response.utterance, "translation_start")
-        stream = self._translate(messages)
+        stream = guard_first_token(self._translate(messages))
         try:
             async for delta in stream:
+                if tracker is not None and delta:
+                    tracker.mark(response.utterance, "translation_first_token")
                 deltas.append(delta)
                 for chunk in chunker.feed(delta):
                     await say(chunk)
@@ -623,6 +679,7 @@ class OutboundTranslator(FrameProcessor):
                 if released
                 else "speaking the sentence untranslated",
             )
+            report_provider_exception(self._session, "translation", "openai", exc)  # PR-30
             if not released:
                 await say(sentence)
             return
@@ -632,6 +689,15 @@ class OutboundTranslator(FrameProcessor):
         if translation:
             self._state.history.append(
                 (settings.working_language, sentence, response.language, translation)
+            )
+        elif self._on_empty_translation is not None:
+            # ST-12: nothing was spoken for this sentence; let the orchestrator know.
+            self._on_empty_translation(
+                {
+                    "text": sentence,
+                    "source_language": settings.working_language,
+                    "target_language": response.language,
+                }
             )
 
     # -- events ------------------------------------------------------------------
@@ -647,17 +713,17 @@ class OutboundTranslator(FrameProcessor):
             original = " ".join(response.originals).strip()
         if not spoken:
             return
-        emit_event(
-            self._session,
-            "TranscriptFinal",
-            {
-                "content": spoken,
-                "role": "assistant",
-                "primary_language": response.language,
-                "detected_languages": [response.language],
-                "original_text": original,
-                "working_language": self._state.settings.working_language,
-            },
-        )
+        event: dict[str, object] = {
+            "content": spoken,
+            "role": "assistant",
+            "primary_language": response.language,
+            "detected_languages": [response.language],
+            "original_text": original,
+            "working_language": self._state.settings.working_language,
+        }
+        turn_id = current_turn_id(self._session, response.utterance)  # ST-02a
+        if turn_id is not None:
+            event["turn_id"] = turn_id
+        emit_event(self._session, "TranscriptFinal", event)
         response.originals = []
         response.spoken = []

@@ -581,7 +581,7 @@ def test_failed_retry_is_fatal() -> None:
     connector = Connector(FakeWS([ConnectionError("boom")]), ConnectionError("still down"))
     run(make_processor(connector, session=session), [mic(9600), SleepFrame(sleep=0.3)])
     assert len(connector.calls) == 2
-    assert session.failures == ["realtime_translate_failed"]
+    assert session.failures == ["provider_failed"]
 
 
 def test_fatal_error_marks_the_session_failed_and_ends_it() -> None:
@@ -590,8 +590,8 @@ def test_fatal_error_marks_the_session_failed_and_ends_it() -> None:
     run(make_processor(connector, session=session), [SleepFrame(sleep=0.2)])
 
     assert len(connector.calls) == 2  # first attempt + exactly one retry
-    assert session.failures == ["realtime_translate_failed"]
-    assert session.end_requests == ["realtime_translate_failed"]
+    assert session.failures == ["provider_failed"]
+    assert session.end_requests == ["provider_failed"]
 
 
 def test_session_rejected_by_the_api_is_a_failure() -> None:
@@ -601,7 +601,7 @@ def test_session_rejected_by_the_api_is_a_failure() -> None:
     run(make_processor(connector, session=session), [SleepFrame(sleep=0.2)])
 
     assert len(connector.calls) == 2
-    assert session.failures == ["realtime_translate_failed"]
+    assert session.failures == ["provider_failed"]
 
 
 def test_error_event_after_the_session_is_ready_is_not_fatal() -> None:
@@ -670,7 +670,7 @@ def test_runtime_session_fail_turns_the_terminal_event_into_session_failed(monke
             pass
 
         async def run(self) -> None:
-            session.fail("realtime_translate_failed")
+            session.fail("provider_failed")
 
     monkeypatch.setattr(pipecat.workers.runner, "WorkerRunner", Runner)
     config = PipelineConfig("ws://l", "t", "room", "d", "o", "c", "v", "prompt")
@@ -678,7 +678,7 @@ def test_runtime_session_fail_turns_the_terminal_event_into_session_failed(monke
 
     last = client.events[-1]
     assert last.event_type == "SessionFailed"
-    assert last.payload == {"outcome": "failed", "reason": "realtime_translate_failed"}
+    assert last.payload == {"outcome": "failed", "reason": "provider_failed"}
 
 
 # -- config and pipeline builder -----------------------------------------------

@@ -215,7 +215,7 @@ def test_pipeline_exception_emits_one_session_failure(monkeypatch) -> None:
         asyncio.run(session.run_pipeline(pipeline_config()))
 
     assert [event.event_type for event in client.events] == ["SessionFailed"]
-    assert client.events[0].payload == {"outcome": "failed", "reason": "RuntimeError"}
+    assert client.events[0].payload == {"outcome": "failed", "reason": "runtime_error", "detail": "RuntimeError"}
     assert session.state == SessionState.ENDED
 
 
@@ -311,6 +311,6 @@ def test_provider_configuration_failure_does_not_emit_runtime_started(monkeypatc
 
     emitted = client_instance[0].events
     assert [event.event_type for event in emitted] == ["SessionFailed"]
-    assert emitted[0].payload == {"outcome": "failed", "reason": "RuntimeError"}
+    assert emitted[0].payload == {"outcome": "failed", "reason": "runtime_error", "detail": "RuntimeError"}
     assert client_instance[0].closed is True
     assert api._session_states[str(request.session_id)] == "failed"

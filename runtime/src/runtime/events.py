@@ -1,7 +1,7 @@
 """Transport-independent versioned runtime events."""
 
 from datetime import datetime, timezone
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field
@@ -23,7 +23,14 @@ RuntimeEventType = Literal[
     "ToolCalled",
     "HandoffRequested",
     "OutcomeRecorded",
+    "ProviderError",
+    "EngineFallback",
+    "TurnDebug",
+    "AnswerEmpty",
+    "AnswerTruncated",
+    "TranslationEmpty",
 ]
+EVENT_TYPES: tuple[str, ...] = get_args(RuntimeEventType)
 
 
 class RuntimeEvent(BaseModel):

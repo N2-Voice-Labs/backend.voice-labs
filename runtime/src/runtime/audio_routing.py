@@ -13,7 +13,8 @@ holds for browsers, SIP phones and API clients alike. :class:`ListenerAudioRoute
 three things, all re-applied idempotently by :meth:`ListenerAudioRouter.sync`:
 
 1. **Publish one translation track per listener** (``translation-for-<identity>``) with
-   the Runtime's own LiveKit connection, for participants that are in the room. Pipecat's
+   the Runtime's own LiveKit connection, for participants that are in the room (into the
+   session room, or into the listener's private listen room, see below). Pipecat's
    LiveKit transport publishes a single track and ignores ``transport_destination``; the
    output subclass in ``participant_lanes`` hands every destination frame to
    :meth:`write` instead.
@@ -31,6 +32,34 @@ three things, all re-applied idempotently by :meth:`ListenerAudioRouter.sync`:
    microphone for roughly 0.1-0.2 s before the unsubscribe lands (it cannot be closed
    server-side: a token with ``can_subscribe=false`` also blocks the translation track,
    and the server refuses forced subscriptions for such participants).
+
+Private listening (``listen_room_factory``)
+-------------------------------------------
+The scheme above cannot be airtight inside one room: LiveKit auto-subscribes a joining
+participant to every microphone for a moment before the server API can undo it, and a
+client may subscribe itself again. LiveKit has no server-side way to deny one track to a
+participant that may subscribe at all (``can_subscribe`` is all or nothing, and a
+``can_subscribe=false`` participant cannot be force-subscribed either). So when the
+Platform marks the session ``private_listening`` the humans' session-room tokens cannot
+subscribe to anything, and each translation track is published in a second room that only
+its listener and the Runtime join (``participants.listen_room_name``). Nobody can then
+receive another person's microphone, from the first millisecond, whatever the client
+does. Steps 2 and 3 still run (step 3 covers other clients), and the Runtime's own
+session-room permissions stay "nobody".
+
+Phone participants (``phone_room_factory``)
+-------------------------------------------
+A SIP leg is created by LiveKit's ``CreateSIPParticipant``, whose request has no
+permission fields: the phone always gets the default grant (publish and subscribe), and a
+participant that may subscribe is auto-subscribed to every microphone in its room. It
+cannot be restricted to ``can_subscribe=false`` either, because it could then not hear its
+translation (a SIP leg joins exactly one room). So the phone is never put in the session
+room: the Platform dials it into ``participants.phone_room_name`` (``phone_room``
+participants), where only the Runtime joins it. The router connects to that room as soon
+as the participant is in the directory (before the call is answered), publishes the
+phone's translation there and forwards the phone's microphone into the pipeline as that
+participant's audio (``audio_sink``). The other person's voice is not in that room, and
+the phone's microphone is not in the session room: there is no join-time window at all.
 
 Everything here is duck-typed over ``livekit.rtc``/``livekit.api`` objects so it is
 unit-tested with fakes; only :func:`livekit_api_from_environment` touches the network.
@@ -109,6 +138,8 @@ class _ListenerTrack:
     track: Any
     sid: str
     name: str
+    # Private listen room carrying this track (None: the session room).
+    room: Any | None = None
 
 
 class ListenerAudioRouter:
@@ -122,6 +153,9 @@ class ListenerAudioRouter:
         api_settings: LiveKitApiSettings | None = None,
         api_factory: Callable[[LiveKitApiSettings], Any] = livekit_api_from_environment,
         burst: Sequence[float] = SYNC_BURST,
+        listen_room_factory: Callable[[str], Awaitable[Any]] | None = None,
+        phone_room_factory: Callable[[str], Awaitable[Any]] | None = None,
+        audio_stream_factory: Callable[[Any], Any] | None = None,
     ) -> None:
         self._directory = directory
         self.hear_original = hear_original
@@ -129,6 +163,13 @@ class ListenerAudioRouter:
         self._api_factory = api_factory
         self._api: Any | None = None
         self._burst = tuple(burst) or (0.0,)
+        self._listen_room_factory = listen_room_factory
+        self._phone_room_factory = phone_room_factory
+        self._audio_stream_factory = audio_stream_factory or rtc.AudioStream
+        # identity -> the phone's own room, and the task forwarding its microphone.
+        self._phone_rooms: dict[str, Any] = {}
+        self._phone_streams: dict[str, tuple[Any, asyncio.Task[None]]] = {}
+        self._audio_sink: Callable[[str, Any], Awaitable[None]] | None = None
         self._room: Any | None = None
         self._audio_format = (24000, 1, 1000)
         self._tracks: dict[str, _ListenerTrack] = {}
@@ -151,10 +192,16 @@ class ListenerAudioRouter:
         sample_rate: int,
         num_channels: int = 1,
         queue_size_ms: int = 1000,
+        audio_sink: Callable[[str, Any], Awaitable[None]] | None = None,
     ) -> None:
-        """Start enforcing on a connected room (the Runtime has joined it)."""
+        """Start enforcing on a connected room (the Runtime has joined it).
+
+        ``audio_sink(identity, audio_frame_event)`` receives the microphone of phone-room
+        participants, which the session room's transport never sees.
+        """
 
         self._room = room
+        self._audio_sink = audio_sink
         self._audio_format = (sample_rate, num_channels, queue_size_ms)
         for event in (
             "participant_connected",
@@ -255,15 +302,31 @@ class ListenerAudioRouter:
         room = self._room
         if room is None or self._closed:
             return None
-        present = set(getattr(room, "remote_participants", {}) or {})
+        present = set(getattr(room, "remote_participants", {}) or {}) | self._phone_present()
         self._directory.set_present(present & set(self._directory_identities()))
         return room, present
 
+    def _phone_present(self) -> set[str]:
+        """Phone participants that have joined their own room."""
+
+        return {
+            identity
+            for identity, phone_room in self._phone_rooms.items()
+            if identity in (getattr(phone_room, "remote_participants", {}) or {})
+        }
+
     async def _reconcile_tracks(self, room: Any, present: set[str]) -> None:
         async with self._tracks_lock:
+            if await self._connect_phone_rooms():
+                present = present | self._phone_present()
+                self._directory.set_present(present & set(self._directory_identities()))
             await self._sync_tracks(room, present)
             self._set_permissions(
-                {identity: (entry.sid,) for identity, entry in self._tracks.items()}
+                {
+                    identity: (entry.sid,)
+                    for identity, entry in self._tracks.items()
+                    if entry.room is None
+                }
             )
             await self._subscribe_listeners(room)
 
@@ -279,6 +342,70 @@ class ListenerAudioRouter:
             if identity not in self._tracks:
                 await self._publish(room, identity)
 
+    async def _connect_phone_rooms(self) -> bool:
+        """Join the room of every phone participant (before its call is answered)."""
+
+        wanted = self._directory.phone_room_identities()
+        for identity in [i for i in self._phone_rooms if i not in wanted]:
+            # The call never connected and the Platform withdrew the participant.
+            self._stop_phone_stream(identity)
+            await _disconnect_quietly(self._phone_rooms.pop(identity))
+        for identity in wanted:
+            if identity in self._phone_rooms:
+                continue
+            if self._phone_room_factory is None:
+                # Never fall back to the session room: that would hear the other person.
+                raise AudioRoutingError(f"no phone room available for {identity}")
+            phone_room = await self._phone_room_factory(identity)
+            self._phone_rooms[identity] = phone_room
+            self._watch_phone_room(identity, phone_room)
+        return bool(wanted)
+
+    def _watch_phone_room(self, identity: str, phone_room: Any) -> None:
+        """Forward the phone's microphone to the pipeline and re-sync on joins/leaves."""
+
+        def on_track(track: Any, _publication: Any, participant: Any) -> None:
+            if participant.identity == identity and track.kind == rtc.TrackKind.KIND_AUDIO:
+                self._start_phone_stream(identity, track)
+
+        for event in ("participant_connected", "participant_disconnected"):
+            phone_room.on(event, self._on_room_event)
+        phone_room.on("track_subscribed", on_track)
+        # Tracks subscribed while connecting raised no event for the handler above.
+        participant = (getattr(phone_room, "remote_participants", {}) or {}).get(identity)
+        for publication in getattr(participant, "track_publications", {}).values():
+            track = getattr(publication, "track", None)
+            if track is not None and publication.kind == rtc.TrackKind.KIND_AUDIO:
+                self._start_phone_stream(identity, track)
+
+    def _start_phone_stream(self, identity: str, track: Any) -> None:
+        if self._closed:
+            return
+        self._stop_phone_stream(identity)
+        stream = self._audio_stream_factory(track)
+        task = asyncio.get_running_loop().create_task(self._forward_phone_audio(identity, stream))
+        self._phone_streams[identity] = (stream, task)
+
+    async def _forward_phone_audio(self, identity: str, stream: Any) -> None:
+        try:
+            async for event in stream:
+                sink = self._audio_sink
+                if sink is not None:
+                    await sink(identity, event)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _logger.warning("Phone audio of %s stopped", identity, exc_info=True)
+
+    def _stop_phone_stream(self, identity: str) -> asyncio.Task[None] | None:
+        entry = self._phone_streams.pop(identity, None)
+        if entry is None:
+            return None
+        stream, task = entry
+        task.cancel()
+        asyncio.get_running_loop().create_task(_close_quietly(stream))
+        return task
+
     async def _publish(self, room: Any, identity: str) -> None:
         name = self._directory.context(identity).output_track
         sample_rate, channels, queue_ms = self._audio_format
@@ -286,13 +413,29 @@ class ListenerAudioRouter:
         track = rtc.LocalAudioTrack.create_audio_track(name, source)
         options = rtc.TrackPublishOptions()
         options.source = rtc.TrackSource.SOURCE_MICROPHONE
+        listen_room = self._phone_rooms.get(identity)
+        new_room = listen_room is None
         try:
-            publication = await room.local_participant.publish_track(track, options)
+            if new_room and self._listen_room_factory is not None:
+                listen_room = await self._listen_room_factory(identity)
+                listen_room.on("participant_connected", self._on_room_event)
+            publication = await (listen_room or room).local_participant.publish_track(
+                track, options
+            )
         except Exception:
             await _close_quietly(source)
+            if new_room:
+                await _disconnect_quietly(listen_room)
             raise
-        self._tracks[identity] = _ListenerTrack(identity, source, track, publication.sid, name)
-        _logger.info("Published %s (%s) for listener", name, publication.sid)
+        self._tracks[identity] = _ListenerTrack(
+            identity, source, track, publication.sid, name, listen_room
+        )
+        _logger.info(
+            "Published %s (%s) for listener%s",
+            name,
+            publication.sid,
+            " in a private listen room" if listen_room is not None else "",
+        )
 
     async def _unpublish(self, room: Any, identity: str) -> None:
         entry = self._tracks.pop(identity, None)
@@ -300,10 +443,13 @@ class ListenerAudioRouter:
             return
         self._subscribed_sids = {pair for pair in self._subscribed_sids if pair[1] != entry.sid}
         try:
-            await room.local_participant.unpublish_track(entry.sid)
+            await (entry.room or room).local_participant.unpublish_track(entry.sid)
         except Exception:
             _logger.warning("Could not unpublish %s", entry.name, exc_info=True)
         await _close_quietly(entry.source)
+        # A phone room outlives its track: the call may still be connecting.
+        if entry.room is not self._phone_rooms.get(identity):
+            await _disconnect_quietly(entry.room)
 
     def _set_permissions(self, audience: dict[str, tuple[str, ...]]) -> None:
         """Only each listener may subscribe to the Runtime track(s) listed for them."""
@@ -355,8 +501,14 @@ class ListenerAudioRouter:
 
         remote = dict(getattr(room, "remote_participants", {}) or {})
         for identity, entry in list(self._tracks.items()):
-            if identity in remote and (identity, entry.sid) not in self._subscribed_sids:
-                if await self._update_subscriptions(room, identity, [entry.sid], True):
+            home = entry.room or room
+            present = (
+                identity in remote
+                if entry.room is None
+                else identity in (getattr(home, "remote_participants", {}) or {})
+            )
+            if present and (identity, entry.sid) not in self._subscribed_sids:
+                if await self._update_subscriptions(home, identity, [entry.sid], True):
                     self._subscribed_sids.add((identity, entry.sid))
 
     async def _update_subscriptions(
@@ -425,10 +577,16 @@ class ListenerAudioRouter:
         if runner is not None and not runner.done():
             runner.cancel()
             await asyncio.gather(runner, return_exceptions=True)
+        streams = [self._stop_phone_stream(identity) for identity in list(self._phone_streams)]
+        await asyncio.gather(*(task for task in streams if task), return_exceptions=True)
         async with self._tracks_lock:
             for entry in list(self._tracks.values()):
                 await _close_quietly(entry.source)
+                await _disconnect_quietly(entry.room)
             self._tracks.clear()
+            for phone_room in self._phone_rooms.values():
+                await _disconnect_quietly(phone_room)
+            self._phone_rooms.clear()
             api_client, self._api = self._api, None
         if api_client is not None:
             await _close_quietly(api_client)
@@ -448,6 +606,15 @@ def _lane_of_destination(destination: str) -> int | None:
     except (IndexError, ValueError):
         return None
     return lane if lane >= 0 else None
+
+
+async def _disconnect_quietly(room: Any | None) -> None:
+    if room is None:
+        return
+    try:
+        await room.disconnect()
+    except Exception:
+        _logger.debug("Disconnecting %r failed", room, exc_info=True)
 
 
 async def _close_quietly(resource: Any) -> None:

@@ -22,6 +22,8 @@ from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from .events import RuntimeEventType
 from .session import RuntimeSession, SessionState
 from .timeline import TimelineTracker
+from .turn_debug import stt_confidence
+from .turn_ids import turn_state
 
 
 def latency_stage(processor_name: str) -> str:
@@ -63,6 +65,15 @@ class RuntimeEventProcessor(FrameProcessor):
         self._assistant_speaking = False
         self._latency_events = control_events and not assistant_output
         self._user_stopped_at: float | None = None
+        # ST-02a: the session-wide turn counter; ``_answering_turn`` is the turn the user
+        # just finished, which the latency events of the response belong to.
+        self._turns = turn_state(session)
+        self._answering_turn: int | None = None
+
+    def _turn_id(self) -> int | None:
+        if self._turns is None:
+            return None
+        return self._turns.current or None
 
     async def process_frame(self, frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
@@ -70,33 +81,48 @@ class RuntimeEventProcessor(FrameProcessor):
             self._feed_timeline(frame, direction)
         if self._transcript_events and isinstance(frame, TranscriptionFrame) and frame.finalized:
             language = frame.language.value if frame.language is not None else None
-            await self._emit(
-                "TranscriptFinal",
-                {
-                    "content": frame.text,
-                    "role": "user",
-                    "user_id": frame.user_id,
-                    "timestamp": frame.timestamp,
-                    "primary_language": language,
-                    "detected_languages": [language] if language else [],
-                },
-            )
+            payload: dict[str, object] = {
+                "content": frame.text,
+                "role": "user",
+                "user_id": frame.user_id,
+                "timestamp": frame.timestamp,
+                "primary_language": language,
+                "detected_languages": [language] if language else [],
+            }
+            if self._turns is not None and not self._turns.current:
+                self._turns.begin()  # a transcript before any turn start opens the first turn
+            turn_id = self._turn_id()
+            if turn_id is not None:
+                payload["turn_id"] = turn_id
+            confidence = stt_confidence(getattr(frame, "result", None))
+            if confidence is not None:
+                payload["confidence"] = confidence
+            await self._emit("TranscriptFinal", payload)
         elif self._assistant_output and isinstance(frame, TextFrame):
             self._assistant_text.append(frame.text)
         elif self._assistant_output and isinstance(frame, LLMFullResponseEndFrame):
             text = "".join(self._assistant_text)
             self._assistant_text.clear()
             if text.strip():
-                await self._emit("TranscriptFinal", {"content": text, "role": "assistant"})
+                payload = {"content": text, "role": "assistant"}
+                turn_id = self._turn_id()
+                if turn_id is not None:
+                    payload["turn_id"] = turn_id
+                await self._emit("TranscriptFinal", payload)
         elif self._latency_events and isinstance(frame, MetricsFrame):
             await self._emit_ttfb_latency(frame)
         elif self._control_events and isinstance(frame, UserStartedSpeakingFrame):
             self._user_stopped_at = None
+            if self._turns is not None and direction == FrameDirection.DOWNSTREAM:
+                self._turns.begin()
             self._session.begin_listening()
             await self._emit("SpeechStarted")
         elif self._control_events and isinstance(frame, UserStoppedSpeakingFrame):
             if self._latency_events:
                 self._user_stopped_at = time.monotonic()
+                self._answering_turn = self._turn_id()
+            if self._turns is not None and direction == FrameDirection.DOWNSTREAM:
+                self._turns.end()
             await self._emit("SpeechStopped")
         elif self._control_events and isinstance(frame, BotStartedSpeakingFrame):
             if self._latency_events and self._user_stopped_at is not None:
@@ -159,16 +185,17 @@ class RuntimeEventProcessor(FrameProcessor):
             or seconds < 0
         ):
             return
+        payload: dict[str, object] = {
+            "metric": metric,
+            "value_ms": round(seconds * 1000, 1),
+            "processor": processor,
+            "model": model,
+        }
+        turn_id = self._answering_turn or self._turn_id()
+        if turn_id is not None:
+            payload["turn_id"] = turn_id
         try:
-            await self._emit(
-                "LatencyMeasured",
-                {
-                    "metric": metric,
-                    "value_ms": round(seconds * 1000, 1),
-                    "processor": processor,
-                    "model": model,
-                },
-            )
+            await self._emit("LatencyMeasured", payload)
         except RuntimeError:
             # Telemetry must not break the media pipeline (e.g. event queue closed).
             pass

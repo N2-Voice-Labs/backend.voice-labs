@@ -11,6 +11,17 @@ as ONE ``LatencyMeasured`` event with ``metric == "utterance_timeline"``::
     T4 first audible audio    ``first_audio``        first *voiced* chunk leaving Runtime
     T5 playback stable        ``stable``             see below
 
+PR-20 splits T3 -> T4 (cascaded and agent translation; omitted when they did not happen)
+with three extra marks, recorded between T3 and T4::
+
+    translation_first_token   first non-empty LLM delta       T3 -> this: LLM time to first token
+    translation_first_chunk   first chunk cut for TTS         -> this: chunking wait
+    tts_request               first text sent to the TTS      this -> T4: TTS time to first byte
+                              (just before the speak frame leaves the processor)
+
+The first chunk and the TTS request are normally microseconds apart; ``tts_request`` is
+kept separate because a language/voice change reaches the TTS between them.
+
 Payload: ``{"metric": "utterance_timeline", "value_ms": T4 - T0, "engine": ...,
 "speaker"?, "listener"?, "marks_ms": {"vad": T1 - T0, ...}}``. A mark that did not happen
 is omitted. ``engine`` is ``cascaded``, ``realtime`` or ``agent_translation``. An
@@ -58,6 +69,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from .turn_ids import turn_state
+
 _logger = logging.getLogger(__name__)
 
 METRIC = "utterance_timeline"
@@ -71,7 +84,16 @@ MAX_GAP_SECONDS = 0.2
 STALE_SECONDS = 15.0
 MAX_QUEUED = 8
 
-MARK_ORDER = ("vad", "first_transcript", "translation_start", "first_audio", "stable")
+MARK_ORDER = (
+    "vad",
+    "first_transcript",
+    "translation_start",
+    "translation_first_token",
+    "translation_first_chunk",
+    "tts_request",
+    "first_audio",
+    "stable",
+)
 
 
 def is_voiced(audio: bytes) -> bool:
@@ -90,6 +112,7 @@ class UtteranceTimeline:
     t0: float
     speaker: str | None = None
     listener: str | None = None
+    turn_id: int | None = None
     marks: dict[str, float] = field(default_factory=dict)
     turn_stopped: bool = False
     # Audio bookkeeping. ``chunks_pushed`` is None when the number of TTS contexts is
@@ -165,7 +188,11 @@ class TimelineTracker:
         now = self._clock()
         t0 = now - max(0.0, start_secs or 0.0)
         timeline = UtteranceTimeline(
-            engine=self.engine, t0=t0, speaker=key or None, marks={"vad": now}
+            engine=self.engine,
+            t0=t0,
+            speaker=key or None,
+            marks={"vad": now},
+            turn_id=self._start_turn(key),
         )
         early = [at for at in self._early_transcript.pop(key, ()) if at >= t0]
         if early:
@@ -189,6 +216,10 @@ class TimelineTracker:
         timeline = self._pending.get(key)
         if timeline is not None:
             timeline.turn_stopped = True
+        if not key:
+            state = turn_state(self._session)
+            if state is not None:
+                state.end()
         self._early_transcript.pop(key, None)
 
     @_safe
@@ -344,6 +375,21 @@ class TimelineTracker:
 
     # -- internals -------------------------------------------------------------
 
+    def _start_turn(self, key: str) -> int | None:
+        """The ``turn_id`` of a new utterance (ST-02a), shared with the session's other events.
+
+        One speaker (``key == ""``) joins the session's turn, which the agent pipeline's
+        ``UserStartedSpeakingFrame`` may have opened already (``begin`` is idempotent); speakers in a two-person
+        session talk over each other, so each utterance gets its own id.
+        """
+
+        state = turn_state(self._session)
+        if state is None:
+            return None
+        if key:
+            return state.new_turn()
+        return state.begin()  # ``turn_stopped`` closed the previous turn
+
     def _head(self) -> UtteranceTimeline | None:
         while self._queue and self._queue[0].finished:
             self._queue.popleft()
@@ -374,6 +420,8 @@ class TimelineTracker:
             "value_ms": marks_ms["first_audio"],
             "engine": timeline.engine,
         }
+        if timeline.turn_id is not None:
+            payload["turn_id"] = timeline.turn_id
         if timeline.speaker:
             payload["speaker"] = timeline.speaker
         if timeline.listener:

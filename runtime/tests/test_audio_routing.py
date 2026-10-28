@@ -377,12 +377,15 @@ class FakeApi:
         self.fail = False
         self.closed = False
         self.room = self
+        self.known_rooms: set[str] = set()
+        self.room_of_call: list[str] = []
 
     async def update_subscriptions(self, request) -> None:
         if self.fail:
             raise RuntimeError("livekit unavailable")
-        assert request.room == "voice-room"
+        assert request.room == "voice-room" or request.room in self.known_rooms
         self.calls.append((request.identity, tuple(request.track_sids), request.subscribe))
+        self.room_of_call.append(request.room)
 
     async def aclose(self) -> None:
         self.closed = True
@@ -873,3 +876,511 @@ def test_hear_original_travels_in_the_session_contract(monkeypatch) -> None:
         }
     )  # fmt: skip
     assert config.interpreter["hear_original"] is True
+
+
+# -- private listening: translations in a room of their own ---------------------------------
+
+
+class FakeListenRoom(FakeRoom):
+    def __init__(self, name) -> None:
+        super().__init__()
+        self.name = name
+        self.disconnected = False
+
+    async def disconnect(self) -> None:
+        self.disconnected = True
+
+
+def make_private_router(directory, *, fail_for=()):
+    api = FakeApi()
+    listen_rooms: dict[str, FakeListenRoom] = {}
+
+    async def listen_room(identity):
+        if identity in fail_for:
+            raise RuntimeError("cannot join the listen room")
+        room = listen_rooms[identity] = FakeListenRoom(f"voice-room--listen--{identity}")
+        api.known_rooms.add(room.name)
+        return room
+
+    router = ListenerAudioRouter(
+        directory,
+        api_settings=LiveKitApiSettings("ws://localhost:7880", "key", "secret"),
+        api_factory=lambda _settings: api,
+        burst=(0.0,),
+        listen_room_factory=listen_room,
+    )
+    return router, api, listen_rooms
+
+
+def test_private_listening_publishes_each_translation_in_the_listeners_own_room(fake_rtc) -> None:
+    async def scenario():
+        directory = directory_with((ALICE, spec("en")), (BOB, spec("ko")))
+        router, api, listen_rooms = make_private_router(directory)
+        room = FakeRoom()
+        room.remote_participants[ALICE] = FakeRemote(ALICE, mic_sid="MIC_A")
+        room.remote_participants[BOB] = FakeRemote(BOB, mic_sid="MIC_B")
+        await router.attach(room, sample_rate=24000)
+        await settle(router)
+        return room, api, router, listen_rooms
+
+    room, api, router, listen_rooms = run_async(scenario())
+    # The session room carries no translation and nobody may subscribe to the Runtime there.
+    assert room.local_participant.published == []
+    assert all(call == {"__allow_all__": False} for call in room.local_participant.permission_calls)
+    # Each listener's track is alone in a room that only they (and the Runtime) join.
+    assert set(listen_rooms) == {ALICE, BOB}
+    for identity, listen_room in listen_rooms.items():
+        assert listen_room.name == f"voice-room--listen--{identity}"
+        assert listen_room.local_participant.published == [
+            (f"translation-for-{identity}", f"TR_translation-for-{identity}")
+        ]
+    assert router.published_tracks() == {
+        ALICE: f"TR_translation-for-{ALICE}",
+        BOB: f"TR_translation-for-{BOB}",
+    }
+    # The originals are still hidden from everybody else (defence in depth, other clients).
+    assert api.unsubscribed(ALICE) == {"MIC_B"} and api.unsubscribed(BOB) == {"MIC_A"}
+    # Nobody has joined a listen room yet: nothing to force-subscribe.
+    assert api.subscribed(ALICE) == set() and api.subscribed(BOB) == set()
+
+
+def test_private_listening_subscribes_a_listener_once_they_join_their_listen_room(fake_rtc) -> None:
+    async def scenario():
+        directory = directory_with((ALICE, spec("en")), (BOB, spec("ko")))
+        router, api, listen_rooms = make_private_router(directory)
+        room = FakeRoom()
+        room.remote_participants[ALICE] = FakeRemote(ALICE)
+        await router.attach(room, sample_rate=24000)
+        await settle(router)
+        listen_rooms[ALICE].join(FakeRemote(ALICE))  # the browser opens its listen connection
+        await settle(router)
+        return api, listen_rooms
+
+    api, listen_rooms = run_async(scenario())
+    assert api.subscribed(ALICE) == {f"TR_translation-for-{ALICE}"}
+    assert api.room_of_call[-1] == f"voice-room--listen--{ALICE}"
+
+
+def test_private_listening_audio_goes_to_the_listeners_room_track(fake_rtc) -> None:
+    async def scenario():
+        directory = directory_with((ALICE, spec("en")), (BOB, spec("ko")))
+        router, _, _ = make_private_router(directory)
+        room = FakeRoom()
+        room.remote_participants[ALICE] = FakeRemote(ALICE)
+        await router.attach(room, sample_rate=24000)
+        await settle(router)
+        frame = object()
+        wrote = await router.write(translation_destination(0), frame)
+        return router, wrote, frame
+
+    router, wrote, frame = run_async(scenario())
+    assert wrote and router._tracks[ALICE].source.frames == [frame]
+
+
+def test_private_listening_leaving_disconnects_the_listen_room_and_close_the_rest(fake_rtc) -> None:
+    async def scenario():
+        directory = directory_with((ALICE, spec("en")), (BOB, spec("ko")))
+        router, _, listen_rooms = make_private_router(directory)
+        room = FakeRoom()
+        room.remote_participants[ALICE] = FakeRemote(ALICE)
+        room.remote_participants[BOB] = FakeRemote(BOB)
+        await router.attach(room, sample_rate=24000)
+        await settle(router)
+        room.leave(BOB)
+        await settle(router)
+        left = listen_rooms[BOB]
+        first_state = (left.disconnected, left.local_participant.unpublished, listen_rooms[ALICE].disconnected)
+        await router.close()
+        return first_state, listen_rooms
+
+    first_state, listen_rooms = run_async(scenario())
+    assert first_state == (True, [f"TR_translation-for-{BOB}"], False)
+    assert listen_rooms[ALICE].disconnected
+
+
+def test_private_listening_never_falls_back_to_the_session_room(fake_rtc) -> None:
+    async def scenario():
+        directory = directory_with((ALICE, spec("en")), (BOB, spec("ko")))
+        router, _, listen_rooms = make_private_router(directory, fail_for={ALICE})
+        room = FakeRoom()
+        room.remote_participants[ALICE] = FakeRemote(ALICE)
+        with pytest.raises(RuntimeError, match="cannot join the listen room"):
+            await router.attach(room, sample_rate=24000)
+        return room, router
+
+    room, router = run_async(scenario())
+    assert room.local_participant.published == [] and router.published_tracks() == {}
+
+
+def test_without_a_listen_room_factory_translations_stay_in_the_session_room(fake_rtc) -> None:
+    async def scenario():
+        directory = directory_with((ALICE, spec("en")), (BOB, spec("ko")))
+        router, _ = make_router(directory)
+        room = FakeRoom()
+        room.remote_participants[ALICE] = FakeRemote(ALICE)
+        await router.attach(room, sample_rate=24000)
+        await settle(router)
+        return room
+
+    room = run_async(scenario())
+    assert room.local_participant.published == [
+        (f"translation-for-{ALICE}", f"TR_translation-for-{ALICE}")
+    ]
+
+
+def test_listen_room_names_follow_the_documented_convention() -> None:
+    from src.runtime.participants import listen_room_name
+
+    assert listen_room_name("voice-labs-1", "guest-ab12") == "voice-labs-1--listen--guest-ab12"
+
+
+def test_pipeline_gives_the_router_listen_rooms_only_for_private_listening(light_models, monkeypatch) -> None:
+    monkeypatch.setenv("LIVEKIT_API_KEY", "key")
+    monkeypatch.setenv("LIVEKIT_API_SECRET", "secret")
+    base = {"languages": ["en", "ko"], "direction": "one_way"}
+
+    def router_for(interpreter, **kwargs):
+        config = pipeline_config(
+            mode="interpreter", interpreter=interpreter, participants={ALICE: spec("en")}, **kwargs
+        )
+        transport, _ = build_livekit_pipeline(config)
+        return transport.output()._router
+
+    assert router_for(base)._listen_room_factory is None
+    assert router_for(base, private_listening=True)._listen_room_factory is not None
+    # Sharing the room (hear_original) never uses listen rooms.
+    assert router_for({**base, "hear_original": True}, private_listening=True)._listen_room_factory is None
+
+
+def test_private_listening_travels_in_the_session_contract_and_needs_participants(monkeypatch) -> None:
+    from src.runtime import api
+
+    for name, value in {
+        "LIVEKIT_URL": "ws://localhost:7880", "DEEPGRAM_API_KEY": "d", "OPENAI_API_KEY": "o",
+        "CARTESIA_API_KEY": "c", "CARTESIA_VOICE_ID": "v",
+    }.items():  # fmt: skip
+        monkeypatch.setenv(name, value)
+
+    plain = api.SessionStart(
+        session_id=uuid4(), conversation_id=uuid4(), agent_id=uuid4(), room_name="room",
+        mode="interpreter", interpreter={"languages": ["en", "ko"], "direction": "one_way"},
+        participants={ALICE: api.ParticipantSpec(language="en")},
+    )  # fmt: skip
+    assert "private_listening" not in plain.model_dump(mode="json")  # contract unchanged
+    private = plain.model_copy(update={"private_listening": True})
+    assert private.model_dump(mode="json")["private_listening"] is True
+    session = {
+        "room_name": "room", "livekit_token": "t", "mode": "interpreter",
+        "interpreter": {"languages": ["en", "ko"], "direction": "one_way"},
+    }  # fmt: skip
+    with pytest.raises(RuntimeError, match="private_listening requires participants"):
+        PipelineConfig.from_environment({**session, "private_listening": True})
+    config = PipelineConfig.from_environment(
+        {**session, "participants": {ALICE: spec("en")}, "private_listening": True}
+    )
+    assert config.private_listening is True
+
+
+# -- phone participants: dialled into a room of their own ----------------------------------
+
+PHONE = "sip-guest-1"  # speaks Korean, on the phone
+
+
+class FakeAudioStream:
+    """Stands in for ``rtc.AudioStream``: yields the queued events, then ends."""
+
+    def __init__(self, track) -> None:
+        self.track = track
+        self.closed = False
+
+    def __aiter__(self):
+        return self._events()
+
+    async def _events(self):
+        for event in self.track.events:
+            yield event
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+def phone_spec(language="ko"):
+    return spec(language) | {"phone_room": True}
+
+
+def make_phone_router(directory, *, factory=True):
+    api = FakeApi()
+    phone_rooms: dict[str, FakeListenRoom] = {}
+    listen_rooms: dict[str, FakeListenRoom] = {}
+    sink_events: list[tuple[str, object]] = []
+
+    async def phone_room(identity):
+        room = phone_rooms[identity] = FakeListenRoom(f"voice-room--phone--{identity}")
+        api.known_rooms.add(room.name)
+        return room
+
+    async def listen_room(identity):
+        assert identity != PHONE, "phones never use a listen room"
+        room = listen_rooms[identity] = FakeListenRoom(f"voice-room--listen--{identity}")
+        api.known_rooms.add(room.name)
+        return room
+
+    async def sink(identity, event) -> None:
+        sink_events.append((identity, event))
+
+    router = ListenerAudioRouter(
+        directory,
+        api_settings=LiveKitApiSettings("ws://localhost:7880", "key", "secret"),
+        api_factory=lambda _settings: api,
+        burst=(0.0,),
+        listen_room_factory=listen_room,
+        phone_room_factory=phone_room if factory else None,
+        audio_stream_factory=FakeAudioStream,
+    )
+    router.listen_rooms = listen_rooms
+    return router, api, phone_rooms, sink, sink_events
+
+
+def phone_mic(events=()):
+    return SimpleNamespace(kind=AUDIO, events=list(events))
+
+
+def test_phone_room_is_joined_before_the_call_is_answered(fake_rtc) -> None:
+    async def scenario():
+        directory = directory_with((ALICE, spec("en")), (PHONE, phone_spec()))
+        router, api, phone_rooms, sink, _ = make_phone_router(directory)
+        room = FakeRoom()
+        room.remote_participants[ALICE] = FakeRemote(ALICE, mic_sid="MIC_A")
+        await router.attach(room, sample_rate=24000, audio_sink=sink)
+        await settle(router)
+        return directory, router, room, phone_rooms
+
+    directory, router, room, phone_rooms = run_async(scenario())
+    # The Runtime is already in the phone room; nobody is in it yet, so nothing is published.
+    assert set(phone_rooms) == {PHONE}
+    assert phone_rooms[PHONE].name == f"voice-room--phone--{PHONE}"
+    assert phone_rooms[PHONE].local_participant.published == []
+    assert not directory.is_present(PHONE) and directory.listener_for(ALICE) is None
+    # The browser's translation keeps using its listen room; the session room carries none.
+    assert room.local_participant.published == []
+    assert router.listen_rooms[ALICE].local_participant.published == [
+        (f"translation-for-{ALICE}", f"TR_translation-for-{ALICE}")
+    ]
+
+
+def test_phone_translation_is_published_in_the_phone_room_only(fake_rtc) -> None:
+    async def scenario():
+        directory = directory_with((ALICE, spec("en")), (PHONE, phone_spec()))
+        router, api, phone_rooms, sink, _ = make_phone_router(directory)
+        room = FakeRoom()
+        room.remote_participants[ALICE] = FakeRemote(ALICE, mic_sid="MIC_A")
+        await router.attach(room, sample_rate=24000, audio_sink=sink)
+        await settle(router)
+        phone_rooms[PHONE].join(FakeRemote(PHONE, mic_sid="MIC_P"))  # the call connects
+        await settle(router)
+        frame = object()
+        wrote = await router.write(translation_destination(1), frame)
+        return directory, router, room, phone_rooms, api, wrote, frame
+
+    directory, router, room, phone_rooms, api, wrote, frame = run_async(scenario())
+    track = f"translation-for-{PHONE}"
+    assert phone_rooms[PHONE].local_participant.published == [(track, f"TR_{track}")]
+    assert room.local_participant.published == [] and PHONE not in router.listen_rooms
+    assert wrote and router._tracks[PHONE].source.frames == [frame]
+    # Present, so each person is the other's listener.
+    assert directory.listener_for(ALICE) == PHONE and directory.listener_for(PHONE) == ALICE
+    # Nothing about the phone is ever allowed in the session room.
+    assert all(
+        PHONE not in call for call in room.local_participant.permission_calls
+    )
+    # The phone leg is subscribed to its translation in its own room; the session room's
+    # originals are not touched on its behalf (it is not there).
+    assert api.subscribed(PHONE) == {f"TR_{track}"}
+    assert api.unsubscribed(PHONE) == set()
+
+
+def test_phone_microphone_is_forwarded_into_the_pipeline_as_that_participant(fake_rtc) -> None:
+    async def scenario():
+        directory = directory_with((ALICE, spec("en")), (PHONE, phone_spec()))
+        router, _, phone_rooms, sink, sink_events = make_phone_router(directory)
+        room = FakeRoom()
+        room.remote_participants[ALICE] = FakeRemote(ALICE)
+        await router.attach(room, sample_rate=24000, audio_sink=sink)
+        await settle(router)
+        events = [object(), object()]
+        phone = FakeRemote(PHONE)
+        phone_rooms[PHONE].join(phone)
+        phone_rooms[PHONE].fire("track_subscribed", phone_mic(events), None, phone)
+        # Someone else's track in the phone room is ignored.
+        other = FakeRemote("other")
+        phone_rooms[PHONE].fire("track_subscribed", phone_mic([object()]), None, other)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        return sink_events, events
+
+    sink_events, events = run_async(scenario())
+    assert sink_events == [(PHONE, event) for event in events]
+
+
+def test_phone_microphone_published_before_the_runtime_looked_is_not_missed(fake_rtc) -> None:
+    async def scenario():
+        directory = directory_with((ALICE, spec("en")), (PHONE, phone_spec()))
+        router, _, phone_rooms, sink, sink_events = make_phone_router(directory)
+        router._phone_room_factory_original = router._phone_room_factory
+        events = [object()]
+
+        async def late(identity):
+            joined = await router._phone_room_factory_original(identity)
+            phone = FakeRemote(PHONE)
+            phone.track_publications["MIC_P"] = SimpleNamespace(
+                sid="MIC_P", kind=AUDIO, track=phone_mic(events)
+            )
+            joined.remote_participants[PHONE] = phone  # answered while we were connecting
+            return joined
+
+        router._phone_room_factory = late
+        room = FakeRoom()
+        room.remote_participants[ALICE] = FakeRemote(ALICE)
+        await router.attach(room, sample_rate=24000, audio_sink=sink)
+        await settle(router)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        return router, sink_events, events
+
+    router, sink_events, events = run_async(scenario())
+    assert sink_events == [(PHONE, event) for event in events]
+    assert PHONE in router.published_tracks()
+
+
+def test_phone_leaving_unpublishes_but_keeps_the_room_until_close(fake_rtc) -> None:
+    async def scenario():
+        directory = directory_with((ALICE, spec("en")), (PHONE, phone_spec()))
+        router, _, phone_rooms, sink, _ = make_phone_router(directory)
+        room = FakeRoom()
+        room.remote_participants[ALICE] = FakeRemote(ALICE)
+        await router.attach(room, sample_rate=24000, audio_sink=sink)
+        await settle(router)
+        phone_rooms[PHONE].join(FakeRemote(PHONE))
+        await settle(router)
+        phone_rooms[PHONE].leave(PHONE)
+        await settle(router)
+        phone_room = phone_rooms[PHONE]
+        after_leave = (phone_room.disconnected, phone_room.local_participant.unpublished)
+        listener = router._directory.listener_for(ALICE)
+        await router.close()
+        return after_leave, listener, phone_room
+
+    after_leave, listener, phone_room = run_async(scenario())
+    assert after_leave == (False, [f"TR_translation-for-{PHONE}"])
+    assert listener is None
+    assert phone_room.disconnected
+
+
+def test_phone_room_participant_without_a_phone_room_factory_never_uses_the_session_room(
+    fake_rtc, caplog
+) -> None:
+    async def scenario():
+        directory = directory_with((ALICE, spec("en")), (PHONE, phone_spec()))
+        router, *_ = make_phone_router(directory, factory=False)
+        room = FakeRoom()
+        room.remote_participants[ALICE] = FakeRemote(ALICE)
+        room.remote_participants[PHONE] = FakeRemote(PHONE)  # even if it is there
+        with pytest.raises(AudioRoutingError, match=PHONE):
+            await router.attach(room, sample_rate=24000)
+        return room, router
+
+    room, router = run_async(scenario())
+    assert PHONE not in router.published_tracks()
+    assert room.local_participant.published == []
+
+
+def test_phone_room_names_follow_the_documented_convention() -> None:
+    from src.runtime.participants import phone_room_name
+
+    assert phone_room_name("voice-labs-1", "sip-guest-ab12") == "voice-labs-1--phone--sip-guest-ab12"
+
+
+def test_phone_room_flag_travels_in_the_directory_contract_only_when_set() -> None:
+    directory = directory_with((ALICE, spec("en")), (PHONE, phone_spec()))
+    contract = directory.as_contract()
+    assert contract[PHONE]["phone_room"] is True and "phone_room" not in contract[ALICE]
+    assert directory.phone_room_identities() == [PHONE]
+
+
+def test_output_hands_phone_audio_to_the_clients_input_queue() -> None:
+    class Router:
+        sink = None
+
+        async def attach(self, room, **kwargs):
+            Router.sink = kwargs["audio_sink"]
+
+    class Client:
+        room = object()
+        _out_sample_rate = 24000
+        _audio_queue: asyncio.Queue = None
+
+    async def go():
+        client = Client()
+        client._audio_queue = asyncio.Queue()
+        output = ListenerRoutedLiveKitOutput(
+            SimpleNamespace(), client, LiveKitParams(audio_out_enabled=True), router=Router()
+        )
+        await output._router.attach(
+            client.room, sample_rate=24000, audio_sink=output._push_phone_audio
+        )
+        event = object()
+        await Router.sink(PHONE, event)
+        return client._audio_queue.get_nowait(), event
+
+    (queued, identity), event = asyncio.run(go())
+    assert queued is event and identity == PHONE
+
+
+def test_pipeline_gives_the_router_phone_rooms_only_for_private_listening(light_models, monkeypatch) -> None:
+    monkeypatch.setenv("LIVEKIT_API_KEY", "key")
+    monkeypatch.setenv("LIVEKIT_API_SECRET", "secret")
+    base = {"languages": ["en", "ko"], "direction": "one_way"}
+
+    def router_for(interpreter, **kwargs):
+        config = pipeline_config(
+            mode="interpreter", interpreter=interpreter, participants={ALICE: spec("en")}, **kwargs
+        )
+        transport, _ = build_livekit_pipeline(config)
+        return transport.output()._router
+
+    assert router_for(base)._phone_room_factory is None
+    assert router_for(base, private_listening=True)._phone_room_factory is not None
+    assert router_for({**base, "hear_original": True}, private_listening=True)._phone_room_factory is None
+
+
+def test_phone_room_participants_need_private_listening_in_the_session_contract(monkeypatch) -> None:
+    for name, value in {
+        "LIVEKIT_URL": "ws://localhost:7880", "DEEPGRAM_API_KEY": "d", "OPENAI_API_KEY": "o",
+        "CARTESIA_API_KEY": "c", "CARTESIA_VOICE_ID": "v",
+    }.items():  # fmt: skip
+        monkeypatch.setenv(name, value)
+    session = {
+        "room_name": "room", "livekit_token": "t", "mode": "interpreter",
+        "interpreter": {"languages": ["en", "ko"], "direction": "one_way"},
+        "participants": {ALICE: spec("en"), PHONE: phone_spec()},
+    }  # fmt: skip
+    with pytest.raises(RuntimeError, match="phone_room participants require private_listening"):
+        PipelineConfig.from_environment(session)
+    config = PipelineConfig.from_environment({**session, "private_listening": True})
+    assert config.participants[PHONE]["phone_room"] is True
+
+
+def test_withdrawn_phone_participant_leaves_its_room(fake_rtc) -> None:
+    async def scenario():
+        directory = directory_with((ALICE, spec("en")), (PHONE, phone_spec()))
+        router, _, phone_rooms, sink, _ = make_phone_router(directory)
+        room = FakeRoom()
+        room.remote_participants[ALICE] = FakeRemote(ALICE)
+        await router.attach(room, sample_rate=24000, audio_sink=sink)
+        await settle(router)
+        await directory.remove(PHONE)  # the call never connected
+        await settle(router)
+        return router, phone_rooms[PHONE]
+
+    router, phone_room = run_async(scenario())
+    assert phone_room.disconnected and router._phone_rooms == {}

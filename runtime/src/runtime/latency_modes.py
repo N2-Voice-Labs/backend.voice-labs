@@ -32,14 +32,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .language_capabilities import realtime_output_languages
+
 LATENCY_MODES = ("instant", "balanced", "accurate")
 DEFAULT_LATENCY_MODE = "balanced"
 
-# gpt-realtime-translate output languages (mirrored by Platform validation and
-# ``realtime_translate.REALTIME_TRANSLATE_OUTPUT_LANGUAGES``).
-_REALTIME_OUTPUT_LANGUAGES = frozenset(
-    {"es", "pt", "fr", "ja", "ru", "zh", "de", "ko", "hi", "id", "vi", "it", "en"}
-)
+# gpt-realtime-translate output languages come from the capability table (ST-20).
+_REALTIME_OUTPUT_LANGUAGES = realtime_output_languages()
 
 
 @dataclass(frozen=True)
@@ -71,9 +70,21 @@ def realtime_allowed(direction: str | None, target: str | None) -> bool:
     return direction == "one_way" and target in _REALTIME_OUTPUT_LANGUAGES
 
 
-def default_engine_for(mode: str | None, direction: str | None, target: str | None) -> str:
-    """The engine a mode picks when the config does not name one."""
+def default_engine_for(
+    mode: str | None,
+    direction: str | None,
+    target: str | None,
+    *,
+    has_glossary: bool = False,
+) -> str:
+    """The engine a mode picks when the config does not name one.
 
+    A glossary (ST-41) keeps ``instant`` on the cascaded engine: the realtime model
+    accepts no instructions or glossary, so it could not honour it.
+    """
+
+    if has_glossary:
+        return "cascaded"
     if (mode or DEFAULT_LATENCY_MODE) == "instant" and realtime_allowed(direction, target):
         return "realtime"
     return "cascaded"

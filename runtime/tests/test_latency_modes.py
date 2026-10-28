@@ -113,6 +113,15 @@ def test_sentence_chunker_clause_threshold_follows_the_mode() -> None:
     assert accurate.flush() == ["Next"]
 
 
+def test_accurate_chunker_speaks_unpunctuated_ru_and_en_text_on_flush() -> None:
+    # PR-10: accurate (sentence-only) must still deliver text that never ends in punctuation,
+    # streamed token by token, for Cyrillic and Latin alike (nothing is lost to the buffer).
+    for text in ("Мы можем предложить вам более раннее время", "Please bring your passport"):
+        chunker = SentenceChunker(PROFILES["accurate"].clause_min_chars)
+        assert [c for token in text.split(" ") for c in chunker.feed(token + " ")] == []
+        assert chunker.flush() == [text]
+
+
 def test_translation_context_length_is_configurable() -> None:
     history = tuple(("en", f"s{i}", "ru", f"t{i}") for i in range(6))
     default = build_translation_messages("x", "en", "ru", history)[0]["content"]

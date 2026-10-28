@@ -878,3 +878,87 @@ def test_stock_shared_resampler_does_bleed_between_participants() -> None:
         return out
 
     assert _peak(asyncio.run(run_shared())[BOB]) > 1000
+
+
+def test_private_listening_contract_needs_participants(runtime_api) -> None:
+    with TestClient(api.app) as client:
+        response = client.post(
+            "/sessions", json=start_payload(private_listening=True), headers=runtime_api
+        )
+        assert (response.status_code, response.json()["detail"]) == (
+            422,
+            "private_listening_requires_participants",
+        )
+        payload = start_payload(participants={ALICE: spec("en")}, private_listening=True)
+        assert client.post("/sessions", json=payload, headers=runtime_api).status_code == 202
+        # The Platform's retry of the same contract is recognised, not a conflict.
+        assert client.post("/sessions", json=payload, headers=runtime_api).json() == {
+            "status": "already_running"
+        }
+
+
+def test_phone_room_participants_need_private_listening(runtime_api) -> None:
+    phone = {**spec("ko"), "phone_room": True}
+    with TestClient(api.app) as client:
+        response = client.post(
+            "/sessions",
+            json=start_payload(participants={ALICE: spec("en"), BOB: phone}),
+            headers=runtime_api,
+        )
+        assert (response.status_code, response.json()["detail"]) == (
+            422,
+            "phone_room_requires_private_listening",
+        )
+        payload = start_payload(
+            participants={ALICE: spec("en"), BOB: phone}, private_listening=True
+        )
+        assert client.post("/sessions", json=payload, headers=runtime_api).status_code == 202
+        key = payload["session_id"]
+        assert api._participant_directories[key].phone_room_identities() == [BOB]
+        # The stored contract keeps the flag (and only where it is set).
+        stored = api._session_contracts[key]["participants"]
+        assert stored[BOB]["phone_room"] is True and "phone_room" not in stored[ALICE]
+
+
+def test_add_phone_participant_to_a_private_listening_session(runtime_api) -> None:
+    body = {"identity": "sip-guest-1", "language": "ko", "phone_room": True}
+    plain = start_payload(participants={ALICE: spec("en")})
+    private = start_payload(participants={ALICE: spec("en")}, private_listening=True)
+    with TestClient(api.app) as client:
+        for payload in (plain, private):
+            assert client.post("/sessions", json=payload, headers=runtime_api).status_code == 202
+        refused = client.post(
+            f"/sessions/{plain['session_id']}/participants", json=body, headers=runtime_api
+        )
+        assert (refused.status_code, refused.json()["detail"]) == (
+            422,
+            "phone_room_requires_private_listening",
+        )
+        key = private["session_id"]
+        added = client.post(f"/sessions/{key}/participants", json=body, headers=runtime_api)
+        assert added.status_code == 200
+        assert api._participant_directories[key].phone_room_identities() == ["sip-guest-1"]
+        assert api._session_contracts[key]["participants"]["sip-guest-1"]["phone_room"] is True
+
+
+def test_unanswered_phone_participant_can_be_withdrawn(runtime_api) -> None:
+    phone = {"identity": "sip-guest-1", "language": "ko", "phone_room": True}
+    private = start_payload(participants={ALICE: spec("en")}, private_listening=True)
+    key = private["session_id"]
+    with TestClient(api.app) as client:
+        assert client.post("/sessions", json=private, headers=runtime_api).status_code == 202
+        url = f"/sessions/{key}/participants"
+        assert client.post(url, json=phone, headers=runtime_api).status_code == 200
+        directory = api._participant_directories[key]
+
+        refused = client.delete(f"{url}/{ALICE}", headers=runtime_api)  # not a phone
+        assert (refused.status_code, refused.json()["detail"]) == (409, "participant_not_removable")
+        assert client.delete(f"{url}/sip-guest-1").status_code == 401
+        assert client.delete(f"{url}/nobody", headers=runtime_api).status_code == 404
+
+        removed = client.delete(f"{url}/sip-guest-1", headers=runtime_api)
+        assert removed.json() == {"status": "removed", "participants": 1}
+        assert "sip-guest-1" not in directory
+        assert set(api._session_contracts[key]["participants"]) == {ALICE}
+        # The slot is free again for the retry.
+        assert client.post(url, json=phone, headers=runtime_api).status_code == 200
