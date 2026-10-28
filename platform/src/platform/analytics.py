@@ -10,8 +10,9 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .db import get_db
+from .context import AuthContext, require
 from .models import Conversation, Message, RuntimeEvent
+from .tenancy import get_scoped_db
 
 router = APIRouter(tags=["analytics"])
 
@@ -87,13 +88,23 @@ def distribution(values: list[float]) -> dict[str, Any]:
     }
 
 
+def _org(model: type, org: list[str]) -> list[Any]:
+    return [model.organization_id == org[0]] if org else []  # type: ignore[attr-defined]
+
+
 @router.get("/analytics/summary")
 async def analytics_summary(
     agent_id: UUID | None = None,
     since: datetime | None = None,
-    db: Session = Depends(get_db),
+    ctx: AuthContext = Depends(require("member")),
+    db: Session = Depends(get_scoped_db),
 ) -> dict[str, Any]:
+    # Every query below carries an explicit organisation filter: the aggregate/column
+    # selects must not depend on the session listener alone.
+    org = [ctx.org_id] if ctx.org_id else []
     conversations = select(Conversation.id)
+    if org:
+        conversations = conversations.where(Conversation.organization_id == ctx.org_id)
     if agent_id is not None:
         conversations = conversations.where(Conversation.agent_id == str(agent_id))
     if since is not None:
@@ -104,13 +115,13 @@ async def analytics_summary(
         )
     rows = (
         db.query(Conversation.status, Conversation.outcome, Conversation.channel)
-        .filter(Conversation.id.in_(conversations))
+        .filter(Conversation.id.in_(conversations), *_org(Conversation, org))
         .all()
     )
     languages = Counter(
         language or "unknown"
         for (language,) in db.query(Message.primary_language).filter(
-            Message.conversation_id.in_(conversations)
+            Message.conversation_id.in_(conversations), *_org(Message, org)
         )
     )
     samples: dict[str, list[float]] = {}
@@ -119,6 +130,7 @@ async def analytics_summary(
     for (payload,) in db.query(RuntimeEvent.payload).filter(
         RuntimeEvent.event_type == "LatencyMeasured",
         RuntimeEvent.conversation_id.in_(conversations),
+        *_org(RuntimeEvent, org),
     ):
         sample = latency_sample(payload)
         if sample:

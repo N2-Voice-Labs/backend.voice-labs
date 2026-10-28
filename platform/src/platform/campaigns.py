@@ -8,7 +8,10 @@ configuration nothing dials and targets stay ``pending``.
 
 Target lifecycle: ``pending -> calling -> completed | failed | no_answer``. A failed
 or unanswered attempt goes back to ``pending`` while ``attempts < max_attempts``.
-``completed`` means the callee answered and was connected to the agent; the call
+Session-creation refusals for capacity/admission reasons (active-session cap, rate limit,
+runtime at capacity, provider/runtime down) are *deferred*: the target returns to
+``pending`` with its attempt refunded and the worker backs off (exponential, capped at
+60 s) instead of burning attempts. ``completed`` means the callee answered and was connected to the agent; the call
 itself is tracked on the conversation (``conversation_id``).
 
 Limitations: the dispatcher is per-process (not safe to run on several replicas), does
@@ -25,16 +28,18 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-from sqlalchemy import func, update
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from . import sip
-from .db import SessionLocal, get_db
+from .context import AuthContext, require
+from .db import SessionLocal
 from .models import Agent as AgentRecord
 from .models import Campaign as CampaignRecord
 from .models import CampaignTarget as TargetRecord
 from .models import Deployment as DeploymentRecord
+from .tenancy import get_owned, get_scoped_db, scoped, scoped_session_for
 from .validation import reject_secret_configuration, validate_e164
 
 router = APIRouter(tags=["campaigns"])
@@ -178,7 +183,7 @@ class Target(BaseModel):
 
 
 class DialNextResult(BaseModel):
-    result: Literal["completed", "failed", "no_answer"]
+    result: Literal["completed", "failed", "no_answer", "deferred"]
     target: Target
 
 
@@ -186,17 +191,21 @@ class StatusIn(BaseModel):
     status: CampaignStatus
 
 
-def get_campaign_or_404(campaign_id: UUID, db: Session) -> CampaignRecord:
-    record = db.get(CampaignRecord, str(campaign_id))
-    if record is None:
-        raise HTTPException(status_code=404, detail="campaign_not_found")
-    return record
+def get_campaign_or_404(
+    campaign_id: UUID, db: Session, ctx: AuthContext
+) -> CampaignRecord:
+    return get_owned(
+        db, ctx, CampaignRecord, str(campaign_id), not_found_detail="campaign_not_found"
+    )
 
 
 def campaign_detail(record: CampaignRecord, db: Session) -> CampaignDetail:
     counts = dict(
         db.query(TargetRecord.status, func.count())
-        .filter(TargetRecord.campaign_id == record.id)
+        .filter(
+            TargetRecord.campaign_id == record.id,
+            TargetRecord.organization_id == record.organization_id,
+        )
         .group_by(TargetRecord.status)
         .all()
     )
@@ -211,13 +220,24 @@ def campaign_detail(record: CampaignRecord, db: Session) -> CampaignDetail:
     "/campaigns", response_model=CampaignDetail, status_code=status.HTTP_201_CREATED
 )
 async def create_campaign(
-    payload: CampaignIn, db: Session = Depends(get_db)
+    payload: CampaignIn,
+    ctx: AuthContext = Depends(require("admin")),
+    db: Session = Depends(get_scoped_db),
 ) -> CampaignDetail:
     check_timezone(payload.timezone)
     check_schedule(payload.schedule_start, payload.schedule_end)
-    if db.get(AgentRecord, str(payload.agent_id)) is None:
+    # Org-scoped lookups: another organisation's agent/deployment is indistinguishable
+    # from a nonexistent one (both 422 invalid_*_id).
+    agent = db.scalars(
+        scoped(db, ctx, AgentRecord).where(AgentRecord.id == str(payload.agent_id))
+    ).first()
+    deployment = db.scalars(
+        scoped(db, ctx, DeploymentRecord).where(
+            DeploymentRecord.id == str(payload.deployment_id)
+        )
+    ).first()
+    if agent is None:
         raise HTTPException(status_code=422, detail="invalid_agent_id")
-    deployment = db.get(DeploymentRecord, str(payload.deployment_id))
     if deployment is None:
         raise HTTPException(status_code=422, detail="invalid_deployment_id")
     if deployment.agent_id != str(payload.agent_id):
@@ -241,9 +261,10 @@ async def create_campaign(
 async def list_campaigns(
     agent_id: UUID | None = None,
     status: CampaignStatus | None = None,
-    db: Session = Depends(get_db),
+    ctx: AuthContext = Depends(require("member")),
+    db: Session = Depends(get_scoped_db),
 ) -> list[Campaign]:
-    query = db.query(CampaignRecord)
+    query = db.query(CampaignRecord).filter(CampaignRecord.organization_id == ctx.org_id)
     if agent_id is not None:
         query = query.filter(CampaignRecord.agent_id == str(agent_id))
     if status is not None:
@@ -254,15 +275,22 @@ async def list_campaigns(
 
 
 @router.get("/campaigns/{campaign_id}", response_model=CampaignDetail)
-async def get_campaign(campaign_id: UUID, db: Session = Depends(get_db)) -> CampaignDetail:
-    return campaign_detail(get_campaign_or_404(campaign_id, db), db)
+async def get_campaign(
+    campaign_id: UUID,
+    ctx: AuthContext = Depends(require("member")),
+    db: Session = Depends(get_scoped_db),
+) -> CampaignDetail:
+    return campaign_detail(get_campaign_or_404(campaign_id, db, ctx), db)
 
 
 @router.patch("/campaigns/{campaign_id}", response_model=CampaignDetail)
 async def update_campaign(
-    campaign_id: UUID, payload: CampaignPatch, db: Session = Depends(get_db)
+    campaign_id: UUID,
+    payload: CampaignPatch,
+    ctx: AuthContext = Depends(require("admin")),
+    db: Session = Depends(get_scoped_db),
 ) -> CampaignDetail:
-    record = get_campaign_or_404(campaign_id, db)
+    record = get_campaign_or_404(campaign_id, db, ctx)
     if record.status not in EDITABLE:
         raise HTTPException(status_code=409, detail="campaign_not_editable")
     changes = payload.model_dump(exclude_unset=True)
@@ -281,9 +309,12 @@ async def update_campaign(
 
 @router.post("/campaigns/{campaign_id}/targets", response_model=TargetsAdded)
 async def add_targets(
-    campaign_id: UUID, payload: TargetsIn, db: Session = Depends(get_db)
+    campaign_id: UUID,
+    payload: TargetsIn,
+    ctx: AuthContext = Depends(require("admin")),
+    db: Session = Depends(get_scoped_db),
 ) -> TargetsAdded:
-    record = get_campaign_or_404(campaign_id, db)
+    record = get_campaign_or_404(campaign_id, db, ctx)
     if record.status not in TARGETS_EDITABLE:
         raise HTTPException(status_code=409, detail="campaign_not_editable")
     unique: dict[str, TargetIn] = {}
@@ -298,7 +329,11 @@ async def add_targets(
             )
         }
         new = [
-            TargetRecord(campaign_id=record.id, **item.model_dump())
+            TargetRecord(
+                campaign_id=record.id,
+                organization_id=record.organization_id,
+                **item.model_dump(),
+            )
             for phone, item in unique.items()
             if phone not in existing
         ]
@@ -320,10 +355,14 @@ async def list_targets(
     status: str | None = None,
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
-    db: Session = Depends(get_db),
+    ctx: AuthContext = Depends(require("member")),
+    db: Session = Depends(get_scoped_db),
 ) -> list[Target]:
-    record = get_campaign_or_404(campaign_id, db)
-    query = db.query(TargetRecord).filter(TargetRecord.campaign_id == record.id)
+    record = get_campaign_or_404(campaign_id, db, ctx)
+    query = db.query(TargetRecord).filter(
+        TargetRecord.campaign_id == record.id,
+        TargetRecord.organization_id == record.organization_id,
+    )
     if status is not None:
         query = query.filter(TargetRecord.status == status)
     rows = query.order_by(TargetRecord.created_at, TargetRecord.id)
@@ -332,15 +371,22 @@ async def list_targets(
 
 @router.post("/campaigns/{campaign_id}/status", response_model=CampaignDetail)
 async def change_campaign_status(
-    campaign_id: UUID, payload: StatusIn, db: Session = Depends(get_db)
+    campaign_id: UUID,
+    payload: StatusIn,
+    ctx: AuthContext = Depends(require("admin")),
+    db: Session = Depends(get_scoped_db),
 ) -> CampaignDetail:
-    record = get_campaign_or_404(campaign_id, db)
+    record = get_campaign_or_404(campaign_id, db, ctx)
     if payload.status not in TRANSITIONS[record.status]:
         raise HTTPException(
             status_code=409, detail="invalid_campaign_status_transition"
         )
     if payload.status in {"scheduled", "running"}:
-        deployment = db.get(DeploymentRecord, record.deployment_id)
+        deployment = db.scalars(
+            scoped(db, ctx, DeploymentRecord).where(
+                DeploymentRecord.id == record.deployment_id
+            )
+        ).first()
         if deployment is None or deployment.status != "active":
             raise HTTPException(status_code=409, detail="deployment_not_active")
         has_targets = (
@@ -359,14 +405,18 @@ async def change_campaign_status(
 
 
 @router.post("/campaigns/{campaign_id}/dial-next", response_model=DialNextResult)
-async def dial_next(campaign_id: UUID, db: Session = Depends(get_db)) -> DialNextResult:
+async def dial_next(
+    campaign_id: UUID,
+    ctx: AuthContext = Depends(require("admin")),
+    db: Session = Depends(get_scoped_db),
+) -> DialNextResult:
     """Dial exactly one pending target and wait for the attempt to resolve.
 
     For demos and tests. Returns once the callee answered or the attempt failed; it does
     not wait for the call to end.
     """
 
-    record = get_campaign_or_404(campaign_id, db)
+    record = get_campaign_or_404(campaign_id, db, ctx)
     if not sip.sip_configured():
         raise HTTPException(status_code=409, detail="sip_not_configured")
     if record.status != "running":
@@ -385,6 +435,19 @@ MAX_CONCURRENT_CALLS = 10
 POLL_INTERVAL_S = 3.0
 CALL_WAIT_TIMEOUT_S = 3600.0
 _TERMINAL_SESSION_STATUSES = {"ended", "failed"}
+# Admission/capacity refusals from session creation. They say nothing about the callee,
+# so the target goes back to pending without consuming an attempt and the worker backs off.
+DEFERRABLE_SESSION_CODES = frozenset(
+    {
+        "too_many_active_sessions",
+        "rate_limited",
+        "runtime_at_capacity",
+        "provider_unavailable",
+        "runtime_unavailable",
+    }
+)
+DEFER_BACKOFF_BASE_S = 2.0
+DEFER_BACKOFF_MAX_S = 60.0
 _dispatchers: dict[str, "asyncio.Task[None]"] = {}
 
 
@@ -426,11 +489,37 @@ def claim_next_target(db: Session, record: CampaignRecord) -> TargetRecord | Non
     return None
 
 
-async def _wait_for_session_end(session_id: str) -> None:
+def defer_delay(consecutive_deferrals: int) -> float:
+    """Exponential backoff (base * 2^(n-1)) capped at ``DEFER_BACKOFF_MAX_S``."""
+
+    exponent = max(consecutive_deferrals, 1) - 1
+    return min(DEFER_BACKOFF_BASE_S * (2**exponent), DEFER_BACKOFF_MAX_S)
+
+
+async def _defer_sleep(seconds: float) -> None:
+    await asyncio.sleep(seconds)
+
+
+def deferral_code(exc: sip.SessionCreateError) -> str | None:
+    """The deferrable admission/capacity code behind a failed session create, else None.
+
+    ``SessionCreateError`` only carries the status; the original ``HTTPException`` (with
+    the structured ``detail``) is its ``__cause__``.
+    """
+
+    if exc.status_code not in (429, 503):
+        return None
+    detail = getattr(exc.__cause__, "detail", None)
+    code = detail.get("code") if isinstance(detail, dict) else detail
+    return code if isinstance(code, str) and code in DEFERRABLE_SESSION_CODES else None
+
+
+async def _wait_for_session_end(session_id: str, org_id: str) -> None:
     waited = 0.0
     unreadable = 0
     while waited < CALL_WAIT_TIMEOUT_S:
-        status_value = await sip.get_session_status(session_id)
+        # A fresh short-lived session per poll: no transaction is held while sleeping.
+        status_value = await sip.get_session_status(session_id, org_id=org_id)
         unreadable = unreadable + 1 if status_value is None else 0
         if status_value in _TERMINAL_SESSION_STATUSES or unreadable >= 3:
             return
@@ -444,13 +533,22 @@ async def process_target(
     target: TargetRecord,
     *,
     wait_for_end: bool,
-) -> Literal["completed", "failed", "no_answer"]:
-    """Run one claimed attempt: open a session, dial into its room, record the result."""
+) -> Literal["completed", "failed", "no_answer", "deferred"]:
+    """Run one claimed attempt: open a session, dial into its room, record the result.
 
-    outcome: Literal["completed", "failed", "no_answer"] = "failed"
+    ``deferred`` means session creation was refused for capacity/admission reasons: the
+    claim's attempt is refunded and the target returns to ``pending``.
+    """
+
+    outcome: Literal["completed", "failed", "no_answer", "deferred"] = "failed"
     session_id: str | None = None
     try:
-        session = await sip.create_voice_session(record.agent_id, record.deployment_id)
+        session = await sip.create_voice_session(
+            record.agent_id,
+            record.deployment_id,
+            org_id=record.organization_id,
+            db=db,
+        )
         session_id = str(session["session_id"])
         target.conversation_id = str(session["conversation_id"])
         db.commit()
@@ -465,19 +563,28 @@ async def process_target(
         outcome = "no_answer" if exc.no_answer else "failed"
         _logger.warning("Dial failed for target %s: %s", target.id, exc)
     except (sip.SessionCreateError, sip.SipError) as exc:
-        _logger.warning("Attempt failed for target %s: %s", target.id, exc)
+        db.rollback()
+        code = deferral_code(exc) if isinstance(exc, sip.SessionCreateError) else None
+        if code is not None:
+            outcome = "deferred"
+            _logger.warning("Deferring target %s: %s (%s)", target.id, exc, code)
+        else:
+            _logger.warning("Attempt failed for target %s: %s", target.id, exc)
     except Exception:
         _logger.exception("Unexpected dialer error for target %s", target.id)
     if outcome != "completed" and session_id is not None:
-        await sip.end_voice_session(session_id)
+        await sip.end_voice_session(session_id, org_id=record.organization_id)
     db.refresh(target)
-    if outcome == "completed" or target.attempts >= record.max_attempts:
+    if outcome == "deferred":
+        target.attempts = max(target.attempts - 1, 0)  # undo the claim's increment
+        target.status = "pending"
+    elif outcome == "completed" or target.attempts >= record.max_attempts:
         target.status = outcome
     else:
         target.status = "pending"  # retry later
     db.commit()
     if outcome == "completed" and wait_for_end and session_id is not None:
-        await _wait_for_session_end(session_id)
+        await _wait_for_session_end(session_id, record.organization_id)
     return outcome
 
 
@@ -505,24 +612,43 @@ def finish_if_drained(db: Session, record: CampaignRecord) -> bool:
 async def run_campaign_batch(campaign_id: str, max_concurrent: int = 1) -> None:
     """Dial a running campaign's pending targets, ``max_concurrent`` calls at a time.
 
-    Each worker re-reads the campaign before taking a target, so pausing or cancelling
-    stops new calls (calls already connected keep going). When nothing is left the
-    campaign is marked ``completed``.
+    Runs under the campaign's own organisation: every worker uses a session pinned to
+    ``campaign.organization_id`` (:func:`scoped_session_for`) and the sessions it opens
+    are created with a ``system`` context for that organisation. Each worker re-reads the
+    campaign before taking a target, so pausing or cancelling stops new calls (calls
+    already connected keep going). When nothing is left the campaign is marked
+    ``completed``.
     """
 
+    with SessionLocal() as lookup:  # unscoped: the org is only known from the campaign
+        org_id = lookup.scalar(
+            select(CampaignRecord.organization_id).where(CampaignRecord.id == campaign_id)
+        )
+    if org_id is None:
+        return
+
     async def worker() -> None:
+        deferrals = 0
         while True:
-            with SessionLocal() as db:
+            with scoped_session_for(org_id) as db:
                 record = db.get(CampaignRecord, campaign_id)
                 if record is None or record.status != "running":
                     return
                 target = claim_next_target(db, record)
                 if target is None:
                     return
-                await process_target(db, record, target, wait_for_end=True)
+                outcome = await process_target(db, record, target, wait_for_end=True)
+            if outcome == "deferred":
+                # Capacity/admission refusal: back off, then re-read the campaign (it may
+                # have been paused) and try again. The target is still pending, so the
+                # campaign cannot complete meanwhile.
+                deferrals += 1
+                await _defer_sleep(defer_delay(deferrals))
+            else:
+                deferrals = 0
 
     await asyncio.gather(*(worker() for _ in range(max(1, max_concurrent))))
-    with SessionLocal() as db:
+    with scoped_session_for(org_id) as db:
         record = db.get(CampaignRecord, campaign_id)
         if record is not None:
             finish_if_drained(db, record)

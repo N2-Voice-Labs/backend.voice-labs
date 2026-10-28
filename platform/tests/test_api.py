@@ -13,6 +13,7 @@ os.environ.setdefault("PLATFORM_AUTO_CREATE_SCHEMA", "1")
 from fastapi.testclient import TestClient
 
 from src.platform.main import app
+from src.platform.models import DEFAULT_ORGANIZATION_ID
 from src.platform.db import SessionLocal
 from src.platform.models import Message, ProviderConfig, VoiceSession
 
@@ -133,6 +134,7 @@ def test_session_creation_hands_off_exact_session_contract(monkeypatch) -> None:
                 "session_id": session["session_id"],
                 "conversation_id": session["conversation_id"],
                 "agent_id": agent["id"],
+                "organization_id": DEFAULT_ORGANIZATION_ID,
                 "room_name": session["room_name"],
                 "system_prompt": "Be concise",
                 "voice_id": "voice-7",
@@ -174,6 +176,8 @@ def test_runtime_state_retries_with_original_contract_after_runtime_forgets_it(
             return RuntimeResponse({"status": "accepted"})
 
         async def get(self, url: str, **kwargs: object) -> RuntimeResponse:
+            if url.endswith("/health/providers"):  # session preflight, not a state poll
+                return RuntimeResponse({"overall": "ok", "providers": []})
             requests.append({"method": "GET", "url": url, **kwargs})
             return RuntimeResponse({"status": "not_running"})
 
@@ -359,6 +363,7 @@ def test_session_created_without_runtime_configuration_can_handoff_later(
             "session_id": session["session_id"],
             "conversation_id": session["conversation_id"],
             "agent_id": agent["id"],
+            "organization_id": DEFAULT_ORGANIZATION_ID,
             "room_name": session["room_name"],
             "system_prompt": "Resume this exact contract.",
             "voice_id": "deferred-voice",
@@ -1139,6 +1144,56 @@ def test_explicit_failure_can_upgrade_an_ended_session(monkeypatch) -> None:
             client.get(f"/voice/sessions/{session['session_id']}").json()["status"]
             == "failed"
         )
+
+
+def test_provider_failure_events_are_accepted_and_the_session_fails(monkeypatch) -> None:
+    monkeypatch.setenv("PLATFORM_RUNTIME_TOKEN", "runtime-secret")
+    headers = {"X-Runtime-Token": "runtime-secret"}
+    with TestClient(app) as client:
+        agent = client.post("/agents", json={"name": "Provider failure agent"}).json()
+        session = client.post("/voice/sessions", json={"agent_id": agent["id"]}).json()
+
+        def send(event_type: str, payload: dict) -> dict:
+            event = {
+                "event_id": str(uuid4()),
+                "event_type": event_type,
+                "schema_version": 1,
+                "session_id": session["session_id"],
+                "conversation_id": session["conversation_id"],
+                "agent_id": agent["id"],
+                "payload": payload,
+            }
+            return client.post("/runtime/events", json=event, headers=headers).json()
+
+        assert send("EngineFallback", {"from": "realtime", "to": "cascaded"}) == {
+            "status": "accepted"
+        }
+        failed = {
+            "provider": "cartesia",
+            "kind": "tts",
+            "category": "quota",
+            "stage": "synthesis",
+            "retryable": False,
+            "attempt": 1,
+            "message": "cartesia tts is out of credit or quota",
+        }
+        assert send("ProviderError", failed) == {"status": "accepted"}
+        # A ProviderError event alone does not end the session; the terminal event does.
+        assert (
+            client.get(f"/voice/sessions/{session['session_id']}").json()["status"]
+            != "failed"
+        )
+        assert send(
+            "SessionFailed", {"outcome": "failed", "reason": "provider_failed"}
+        ) == {"status": "accepted"}
+        assert (
+            client.get(f"/voice/sessions/{session['session_id']}").json()["status"]
+            == "failed"
+        )
+        listed = client.get(f"/conversations/{session['conversation_id']}/runtime-state")
+        assert listed.status_code == 200
+        types = [event["event_type"] for event in listed.json()["events"]]
+        assert "ProviderError" in types and "EngineFallback" in types
 
 
 def test_transcript_event_is_persisted(monkeypatch) -> None:

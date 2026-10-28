@@ -8,10 +8,11 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from .db import get_db
+from .context import AuthContext, require
 from .models import Agent as AgentRecord
 from .models import AgentTool
 from .models import Tool as ToolRecord
+from .tenancy import get_owned, get_scoped_db, scoped
 from .validation import reject_secret_configuration
 
 router = APIRouter(tags=["tools"])
@@ -89,11 +90,10 @@ class AgentToolsIn(BaseModel):
     tool_ids: list[UUID]
 
 
-def get_tool_or_404(tool_id: UUID, db: Session) -> ToolRecord:
-    record = db.get(ToolRecord, str(tool_id))
-    if record is None:
-        raise HTTPException(status_code=404, detail="tool_not_found")
-    return record
+def get_tool_or_404(tool_id: UUID, db: Session, ctx: AuthContext) -> ToolRecord:
+    return get_owned(
+        db, ctx, ToolRecord, str(tool_id), not_found_detail="tool_not_found"
+    )
 
 
 def commit_or_conflict(db: Session) -> None:
@@ -105,7 +105,11 @@ def commit_or_conflict(db: Session) -> None:
 
 
 @router.post("/tools", response_model=Tool, status_code=status.HTTP_201_CREATED)
-async def create_tool(payload: ToolIn, db: Session = Depends(get_db)) -> ToolRecord:
+async def create_tool(
+    payload: ToolIn,
+    db: Session = Depends(get_scoped_db),
+    ctx: AuthContext = Depends(require("admin")),
+) -> ToolRecord:
     record = ToolRecord(**payload.model_dump())
     db.add(record)
     commit_or_conflict(db)
@@ -115,7 +119,9 @@ async def create_tool(payload: ToolIn, db: Session = Depends(get_db)) -> ToolRec
 
 @router.get("/tools", response_model=list[Tool])
 async def list_tools(
-    enabled: bool | None = None, db: Session = Depends(get_db)
+    enabled: bool | None = None,
+    db: Session = Depends(get_scoped_db),
+    ctx: AuthContext = Depends(require("member")),
 ) -> list[ToolRecord]:
     query = db.query(ToolRecord)
     if enabled is not None:
@@ -124,15 +130,22 @@ async def list_tools(
 
 
 @router.get("/tools/{tool_id}", response_model=Tool)
-async def get_tool(tool_id: UUID, db: Session = Depends(get_db)) -> ToolRecord:
-    return get_tool_or_404(tool_id, db)
+async def get_tool(
+    tool_id: UUID,
+    db: Session = Depends(get_scoped_db),
+    ctx: AuthContext = Depends(require("member")),
+) -> ToolRecord:
+    return get_tool_or_404(tool_id, db, ctx)
 
 
 @router.patch("/tools/{tool_id}", response_model=Tool)
 async def patch_tool(
-    tool_id: UUID, payload: ToolPatch, db: Session = Depends(get_db)
+    tool_id: UUID,
+    payload: ToolPatch,
+    db: Session = Depends(get_scoped_db),
+    ctx: AuthContext = Depends(require("admin")),
 ) -> ToolRecord:
-    record = get_tool_or_404(tool_id, db)
+    record = get_tool_or_404(tool_id, db, ctx)
     for key, value in payload.model_dump(exclude_unset=True).items():
         setattr(record, key, value)
     commit_or_conflict(db)
@@ -141,26 +154,37 @@ async def patch_tool(
 
 
 @router.delete("/tools/{tool_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_tool(tool_id: UUID, db: Session = Depends(get_db)) -> Response:
-    get_tool_or_404(tool_id, db).enabled = False
+async def delete_tool(
+    tool_id: UUID,
+    db: Session = Depends(get_scoped_db),
+    ctx: AuthContext = Depends(require("admin")),
+) -> Response:
+    get_tool_or_404(tool_id, db, ctx).enabled = False
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-def get_agent_or_404(agent_id: UUID, db: Session) -> AgentRecord:
-    agent = db.get(AgentRecord, str(agent_id))
-    if agent is None:
-        raise HTTPException(status_code=404, detail="agent_not_found")
-    return agent
+def get_agent_or_404(agent_id: UUID, db: Session, ctx: AuthContext) -> AgentRecord:
+    return get_owned(
+        db, ctx, AgentRecord, str(agent_id), not_found_detail="agent_not_found"
+    )
 
 
 @router.put("/agents/{agent_id}/tools", response_model=list[Tool])
 async def set_agent_tools(
-    agent_id: UUID, payload: AgentToolsIn, db: Session = Depends(get_db)
+    agent_id: UUID,
+    payload: AgentToolsIn,
+    db: Session = Depends(get_scoped_db),
+    ctx: AuthContext = Depends(require("admin")),
 ) -> list[ToolRecord]:
-    get_agent_or_404(agent_id, db)
+    get_agent_or_404(agent_id, db, ctx)
     ids = list(dict.fromkeys(str(tool_id) for tool_id in payload.tool_ids))
-    tools = db.query(ToolRecord).filter(ToolRecord.id.in_(ids)).all() if ids else []
+    tools: list[ToolRecord] = []
+    if ids:
+        # Org-scoped: another organisation's tool looks exactly like a missing one (422).
+        tools = list(
+            db.scalars(scoped(db, ctx, ToolRecord).where(ToolRecord.id.in_(ids)))
+        )
     if len(tools) != len(ids) or not all(tool.enabled for tool in tools):
         raise HTTPException(status_code=422, detail="invalid_tool_id")
     db.query(AgentTool).filter(AgentTool.agent_id == str(agent_id)).delete()
@@ -171,9 +195,11 @@ async def set_agent_tools(
 
 @router.get("/agents/{agent_id}/tools", response_model=list[Tool])
 async def list_agent_tools(
-    agent_id: UUID, db: Session = Depends(get_db)
+    agent_id: UUID,
+    db: Session = Depends(get_scoped_db),
+    ctx: AuthContext = Depends(require("member")),
 ) -> list[ToolRecord]:
-    get_agent_or_404(agent_id, db)
+    get_agent_or_404(agent_id, db, ctx)
     return (
         db.query(ToolRecord)
         .join(AgentTool, AgentTool.tool_id == ToolRecord.id)

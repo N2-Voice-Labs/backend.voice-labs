@@ -7,12 +7,15 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel, Field, field_validator
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from .context import AuthContext, require
 from .db import get_db
 from .models import Agent as AgentRecord
 from .models import AgentKnowledgeDocument, KnowledgeDocument
 from .runtime_auth import require_runtime_token
+from .tenancy import bypass, get_owned, get_scoped_db, scoped
 from .validation import reject_secret_configuration
 
 router = APIRouter(tags=["knowledge"])
@@ -89,18 +92,25 @@ def document_dict(record: KnowledgeDocument) -> dict[str, Any]:
     return {**summary_dict(record), "content": record.content}
 
 
-def get_document_or_404(document_id: UUID, db: Session) -> KnowledgeDocument:
-    record = db.get(KnowledgeDocument, str(document_id))
-    if record is None:
-        raise HTTPException(status_code=404, detail="knowledge_document_not_found")
-    return record
+def get_document_or_404(
+    document_id: UUID, db: Session, ctx: AuthContext
+) -> KnowledgeDocument:
+    return get_owned(
+        db,
+        ctx,
+        KnowledgeDocument,
+        str(document_id),
+        not_found_detail="knowledge_document_not_found",
+    )
 
 
 @router.post(
     "/knowledge/documents", response_model=Document, status_code=status.HTTP_201_CREATED
 )
 async def create_document(
-    payload: DocumentIn, db: Session = Depends(get_db)
+    payload: DocumentIn,
+    db: Session = Depends(get_scoped_db),
+    ctx: AuthContext = Depends(require("admin")),
 ) -> dict[str, Any]:
     data = payload.model_dump()
     record = KnowledgeDocument(metadata_json=data.pop("metadata"), version=1, **data)
@@ -112,7 +122,9 @@ async def create_document(
 
 @router.get("/knowledge/documents", response_model=list[DocumentSummary])
 async def list_documents(
-    enabled: bool | None = None, db: Session = Depends(get_db)
+    enabled: bool | None = None,
+    db: Session = Depends(get_scoped_db),
+    ctx: AuthContext = Depends(require("member")),
 ) -> list[dict[str, Any]]:
     query = db.query(KnowledgeDocument)
     if enabled is not None:
@@ -122,16 +134,21 @@ async def list_documents(
 
 @router.get("/knowledge/documents/{document_id}", response_model=Document)
 async def get_document(
-    document_id: UUID, db: Session = Depends(get_db)
+    document_id: UUID,
+    db: Session = Depends(get_scoped_db),
+    ctx: AuthContext = Depends(require("member")),
 ) -> dict[str, Any]:
-    return document_dict(get_document_or_404(document_id, db))
+    return document_dict(get_document_or_404(document_id, db, ctx))
 
 
 @router.patch("/knowledge/documents/{document_id}", response_model=Document)
 async def patch_document(
-    document_id: UUID, payload: DocumentPatch, db: Session = Depends(get_db)
+    document_id: UUID,
+    payload: DocumentPatch,
+    db: Session = Depends(get_scoped_db),
+    ctx: AuthContext = Depends(require("admin")),
 ) -> dict[str, Any]:
-    record = get_document_or_404(document_id, db)
+    record = get_document_or_404(document_id, db, ctx)
     for key, value in payload.model_dump(exclude_unset=True).items():
         if key == "content" and value != record.content:
             record.version += 1
@@ -142,30 +159,39 @@ async def patch_document(
 
 
 @router.delete("/knowledge/documents/{document_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_document(document_id: UUID, db: Session = Depends(get_db)) -> Response:
-    get_document_or_404(document_id, db).enabled = False
+async def delete_document(
+    document_id: UUID,
+    db: Session = Depends(get_scoped_db),
+    ctx: AuthContext = Depends(require("admin")),
+) -> Response:
+    get_document_or_404(document_id, db, ctx).enabled = False
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-def get_agent_or_404(agent_id: UUID, db: Session) -> AgentRecord:
-    agent = db.get(AgentRecord, str(agent_id))
-    if agent is None:
-        raise HTTPException(status_code=404, detail="agent_not_found")
-    return agent
+def get_agent_or_404(agent_id: UUID, db: Session, ctx: AuthContext) -> AgentRecord:
+    return get_owned(
+        db, ctx, AgentRecord, str(agent_id), not_found_detail="agent_not_found"
+    )
 
 
 @router.put("/agents/{agent_id}/knowledge", response_model=list[DocumentSummary])
 async def set_agent_knowledge(
-    agent_id: UUID, payload: AgentKnowledgeIn, db: Session = Depends(get_db)
+    agent_id: UUID,
+    payload: AgentKnowledgeIn,
+    db: Session = Depends(get_scoped_db),
+    ctx: AuthContext = Depends(require("admin")),
 ) -> list[dict[str, Any]]:
-    get_agent_or_404(agent_id, db)
+    get_agent_or_404(agent_id, db, ctx)
     ids = list(dict.fromkeys(str(i) for i in payload.document_ids))
-    docs = (
-        db.query(KnowledgeDocument).filter(KnowledgeDocument.id.in_(ids)).all()
-        if ids
-        else []
-    )
+    docs: list[KnowledgeDocument] = []
+    if ids:
+        # Org-scoped: another organisation's document looks exactly like a missing one.
+        docs = list(
+            db.scalars(
+                scoped(db, ctx, KnowledgeDocument).where(KnowledgeDocument.id.in_(ids))
+            )
+        )
     if len(docs) != len(ids) or not all(doc.enabled for doc in docs):
         raise HTTPException(status_code=422, detail="invalid_knowledge_document_id")
     db.query(AgentKnowledgeDocument).filter(
@@ -181,9 +207,11 @@ async def set_agent_knowledge(
 
 @router.get("/agents/{agent_id}/knowledge", response_model=list[DocumentSummary])
 async def list_agent_knowledge(
-    agent_id: UUID, db: Session = Depends(get_db)
+    agent_id: UUID,
+    db: Session = Depends(get_scoped_db),
+    ctx: AuthContext = Depends(require("member")),
 ) -> list[dict[str, Any]]:
-    get_agent_or_404(agent_id, db)
+    get_agent_or_404(agent_id, db, ctx)
     docs = (
         db.query(KnowledgeDocument)
         .join(
@@ -300,22 +328,30 @@ async def search_agent_knowledge(
     Returns snippets from enabled documents assigned to the agent,
     ranked by keyword relevance.
     """
-    # Verify agent exists
-    get_agent_or_404(agent_id, db)
+    # Runtime callbacks carry no organisation: resolve it from the agent, then require
+    # documents to belong to that same organisation (defence against stale cross-org
+    # links in agent_knowledge_documents).
+    with bypass(db):
+        agent = db.scalars(
+            select(AgentRecord).where(AgentRecord.id == str(agent_id))
+        ).first()
+        if agent is None:
+            raise HTTPException(status_code=404, detail="agent_not_found")
 
-    # Get all enabled documents assigned to this agent
-    docs = (
-        db.query(KnowledgeDocument)
-        .join(
-            AgentKnowledgeDocument,
-            AgentKnowledgeDocument.document_id == KnowledgeDocument.id,
+        # Get all enabled documents assigned to this agent
+        docs = (
+            db.query(KnowledgeDocument)
+            .join(
+                AgentKnowledgeDocument,
+                AgentKnowledgeDocument.document_id == KnowledgeDocument.id,
+            )
+            .filter(
+                AgentKnowledgeDocument.agent_id == str(agent_id),
+                KnowledgeDocument.enabled == True,
+                KnowledgeDocument.organization_id == agent.organization_id,
+            )
+            .all()
         )
-        .filter(
-            AgentKnowledgeDocument.agent_id == str(agent_id),
-            KnowledgeDocument.enabled == True,
-        )
-        .all()
-    )
 
     # Tokenize query
     query_tokens = _tokenize(payload.query)

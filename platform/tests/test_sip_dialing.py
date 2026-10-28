@@ -1,22 +1,23 @@
 """Outbound SIP: dial helper, campaign dispatcher, dial-next, and interpreter bridge.
 
-livekit-api and the Platform self-calls are mocked; nothing touches the network.
+livekit-api and the in-process session service are mocked; nothing touches the network.
 """
 
 import asyncio
+import json
 import os
 from uuid import uuid4
 
 os.environ.setdefault("PLATFORM_DATABASE_URL", "sqlite://")
 os.environ.setdefault("PLATFORM_AUTO_CREATE_SCHEMA", "1")
 
-import httpx
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from livekit import api
 from livekit.protocol.sip import SIPParticipantInfo
 
-from src.platform import campaigns, sip
+from src.platform import campaigns, sessions, sip
 from src.platform.db import SessionLocal
 from src.platform.main import app
 from src.platform.models import Campaign, CampaignTarget
@@ -32,7 +33,6 @@ def sip_env(monkeypatch):
     monkeypatch.setenv("LIVEKIT_API_KEY", "key")
     monkeypatch.setenv("LIVEKIT_API_SECRET", "secret")
     monkeypatch.setenv("LIVEKIT_SIP_TRUNK_ID", "ST_trunk")
-    monkeypatch.setenv("PLATFORM_API_URL", "http://platform.test")
     monkeypatch.setattr(campaigns, "POLL_INTERVAL_S", 0)
     # Tests drive the dispatcher explicitly; moving a campaign to running must not
     # start a background one.
@@ -101,37 +101,58 @@ def sip_call_error(code: int, reason: str) -> api.SipCallError:
 
 
 class FakePlatform:
-    """Mock transport for the Platform's own POST/GET /voice/sessions calls."""
+    """Stands in for the in-process session service the SIP code calls.
 
-    def __init__(self, session_status="ended", fail_create=False):
+    Records one ``(method, path, content)`` tuple per call in ``requests`` (the same
+    shape the HTTP mock used) plus the organisation and principal of every context.
+    """
+
+    def __init__(self, session_status="ended", fail_create=False, create_errors=None):
         self.session_status = session_status
         self.fail_create = fail_create
+        # Scripted HTTPExceptions raised by successive open_voice_session calls (then ok).
+        self.create_errors = list(create_errors or [])
+        self.create_calls = 0
+        self.on_create_call = None
         self.requests: list[tuple[str, str, bytes]] = []
+        self.contexts: list = []
         self.sessions = 0
 
-    def handler(self, request: httpx.Request) -> httpx.Response:
-        self.requests.append((request.method, request.url.path, request.content))
-        if request.method == "POST" and request.url.path == "/voice/sessions":
-            if self.fail_create:
-                return httpx.Response(503, json={"detail": "runtime_unavailable"})
-            self.sessions += 1
-            sid = str(uuid4())
-            return httpx.Response(
-                201,
-                json={
-                    "session_id": sid,
-                    "conversation_id": str(uuid4()),
-                    "room_name": f"voice-labs-{sid}",
-                },
-            )
-        if request.method == "GET" and request.url.path.startswith("/voice/sessions/"):
-            return httpx.Response(200, json={"status": self.session_status})
-        if request.url.path.endswith("/end"):
-            return httpx.Response(200, json={"status": "ended"})
-        return httpx.Response(404)
+    async def open_voice_session(self, db, ctx, *, agent_id, deployment_id=None, participant=None):
+        self.contexts.append(ctx)
+        body = json.dumps(
+            {"agent_id": str(agent_id), "deployment_id": deployment_id and str(deployment_id)}
+        ).encode()
+        self.requests.append(("POST", "/voice/sessions", body))
+        self.create_calls += 1
+        if self.on_create_call is not None:
+            self.on_create_call(self.create_calls)
+        if self.create_errors:
+            raise self.create_errors.pop(0)
+        if self.fail_create:
+            raise HTTPException(status_code=404, detail="agent_not_found")
+        self.sessions += 1
+        sid = str(uuid4())
+        return {
+            "session_id": sid,
+            "conversation_id": str(uuid4()),
+            "room_name": f"voice-labs-{sid}",
+        }
+
+    async def get_session_status(self, db, ctx, session_id):
+        self.contexts.append(ctx)
+        self.requests.append(("GET", f"/voice/sessions/{session_id}", b""))
+        return self.session_status
+
+    async def end_session(self, db, ctx, session_id):
+        self.contexts.append(ctx)
+        self.requests.append(("POST", f"/voice/sessions/{session_id}/end", b""))
+        return {"status": "ended"}
 
     def install(self, monkeypatch):
-        monkeypatch.setattr(sip, "http_transport", httpx.MockTransport(self.handler))
+        monkeypatch.setattr(sessions, "open_voice_session", self.open_voice_session)
+        monkeypatch.setattr(sessions, "get_session_status", self.get_session_status)
+        monkeypatch.setattr(sessions, "end_session", self.end_session)
 
     def ended(self) -> int:
         return sum(1 for _, path, _ in self.requests if path.endswith("/end"))
@@ -377,6 +398,107 @@ def test_batch_session_create_failure_marks_failed_without_dialing(sip_env, monk
     assert fake.created == []
     (target,) = targets_of(campaign["id"])
     assert (target.status, target.attempts) == ("failed", 1)
+
+
+DEFERRABLE = [
+    HTTPException(429, {"code": "too_many_active_sessions", "message": "cap"}),
+    HTTPException(429, {"code": "rate_limited", "message": "slow down"}),
+    HTTPException(503, {"code": "runtime_at_capacity", "message": "busy"}),
+    HTTPException(503, {"code": "provider_unavailable", "message": "down"}),
+    HTTPException(503, {"code": "runtime_unavailable", "message": "down"}),
+    HTTPException(503, "runtime_unavailable"),
+]
+
+
+@pytest.mark.parametrize("error", DEFERRABLE, ids=lambda e: str(e.detail)[:40])
+def test_batch_defers_targets_on_capacity_errors_without_burning_attempts(
+    sip_env, monkeypatch, error
+):
+    """Admission/capacity refusals return the target to pending (attempt refunded) and
+    the worker backs off and retries instead of failing every target."""
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(campaigns, "_defer_sleep", fake_sleep)
+    fake = FakeLiveKit()
+    # Three refusals in a row, then capacity frees up.
+    platform = FakePlatform(create_errors=[error, error, error])
+    platform.install(monkeypatch)
+    monkeypatch.setattr(sip, "_new_client", fake.factory())
+    with TestClient(app) as client:
+        campaign, numbers = make_running_campaign(client, targets=2, max_attempts=1)
+        run_batch(campaign["id"])
+    rows = targets_of(campaign["id"])
+    assert [t.status for t in rows] == ["completed", "completed"]
+    assert [t.attempts for t in rows] == [1, 1]  # refusals did not consume attempts
+    assert platform.create_calls == 5
+    assert len(sleeps) == 3 and sleeps == sorted(sleeps) and max(sleeps) <= 60
+    assert campaign_status(campaign["id"]) == "completed"
+
+
+def test_campaign_is_not_completed_while_targets_are_deferred(sip_env, monkeypatch):
+    fake = FakeLiveKit()
+    refusal = HTTPException(429, {"code": "too_many_active_sessions"})
+    platform = FakePlatform(create_errors=[refusal] * 50)
+    platform.install(monkeypatch)
+    monkeypatch.setattr(sip, "_new_client", fake.factory())
+
+    async def fake_sleep(seconds):
+        pass
+
+    monkeypatch.setattr(campaigns, "_defer_sleep", fake_sleep)
+
+    with TestClient(app) as client:
+        campaign, _ = make_running_campaign(client, targets=3, max_attempts=2)
+
+        def pause_after_three(call: int) -> None:
+            if call == 3:
+                client.post(f"/campaigns/{campaign['id']}/status", json={"status": "paused"})
+
+        platform.on_create_call = pause_after_three
+        run_batch(campaign["id"], max_concurrent=2)
+    rows = targets_of(campaign["id"])
+    assert [t.status for t in rows] == ["pending"] * 3
+    assert [t.attempts for t in rows] == [0, 0, 0]
+    assert campaign_status(campaign["id"]) == "paused"
+    assert fake.created == []
+
+
+def test_defer_backoff_is_exponential_and_capped(monkeypatch):
+    monkeypatch.setattr(campaigns, "DEFER_BACKOFF_BASE_S", 2.0)
+    monkeypatch.setattr(campaigns, "DEFER_BACKOFF_MAX_S", 60.0)
+    delays = [campaigns.defer_delay(n) for n in range(1, 9)]
+    assert delays[:4] == [2.0, 4.0, 8.0, 16.0]
+    assert delays[-1] == 60.0 and max(delays) == 60.0
+
+
+def test_batch_hard_session_errors_still_fail_the_target(sip_env, monkeypatch):
+    for error in (HTTPException(404, "agent_not_found"), HTTPException(409, "x")):
+        fake = FakeLiveKit()
+        FakePlatform(create_errors=[error]).install(monkeypatch)
+        monkeypatch.setattr(sip, "_new_client", fake.factory())
+        with TestClient(app) as client:
+            campaign, _ = make_running_campaign(client, max_attempts=1)
+            run_batch(campaign["id"])
+        (target,) = targets_of(campaign["id"])
+        assert (target.status, target.attempts) == ("failed", 1)
+
+
+def test_dial_next_defers_on_capacity_error(sip_env, monkeypatch):
+    refusal = HTTPException(429, {"code": "too_many_active_sessions"})
+    FakePlatform(create_errors=[refusal]).install(monkeypatch)
+    monkeypatch.setattr(sip, "_new_client", FakeLiveKit().factory())
+    with TestClient(app) as client:
+        campaign, _ = make_running_campaign(client, max_attempts=1)
+        response = client.post(f"/campaigns/{campaign['id']}/dial-next")
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["result"] == "deferred"
+        assert (body["target"]["status"], body["target"]["attempts"]) == ("pending", 0)
+        assert client.get(f"/campaigns/{campaign['id']}").json()["status"] == "running"
 
 
 def test_batch_stops_when_campaign_paused(sip_env, monkeypatch):

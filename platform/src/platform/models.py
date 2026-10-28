@@ -13,6 +13,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -23,7 +24,18 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-class Agent(Base):
+DEFAULT_ORGANIZATION_ID = "00000000-0000-0000-0000-000000000001"
+
+
+class TenantMixin:
+    """Row belongs to exactly one organization (see tenancy.py for write-time stamping)."""
+
+    organization_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("organizations.id"), nullable=False, index=True
+    )
+
+
+class Agent(TenantMixin, Base):
     __tablename__ = "agents"
     id: Mapped[str] = mapped_column(
         String(36), primary_key=True, default=lambda: str(uuid4())
@@ -60,7 +72,7 @@ class Agent(Base):
     )
 
 
-class ProviderConfig(Base):
+class ProviderConfig(TenantMixin, Base):
     __tablename__ = "provider_configs"
     id: Mapped[str] = mapped_column(
         String(36), primary_key=True, default=lambda: str(uuid4())
@@ -75,7 +87,7 @@ class ProviderConfig(Base):
     )
 
 
-class Conversation(Base):
+class Conversation(TenantMixin, Base):
     __tablename__ = "conversations"
     __table_args__ = (
         Index("ix_conversations_agent_started_at", "agent_id", "started_at"),
@@ -105,7 +117,7 @@ class Conversation(Base):
     )
 
 
-class Message(Base):
+class Message(TenantMixin, Base):
     __tablename__ = "messages"
     __table_args__ = (
         Index(
@@ -125,7 +137,7 @@ class Message(Base):
     )
 
 
-class VoiceSession(Base):
+class VoiceSession(TenantMixin, Base):
     __tablename__ = "voice_sessions"
     __table_args__ = (
         Index(
@@ -149,9 +161,13 @@ class VoiceSession(Base):
     # SHA-256 hex digests of session tokens (RM-004); the tokens themselves are never stored.
     session_token_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     guest_token_hashes: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    # Time of the last accepted Runtime event; the reaper's liveness signal (ST-13).
+    last_event_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
 
 
-class RuntimeEvent(Base):
+class RuntimeEvent(TenantMixin, Base):
     __tablename__ = "runtime_events"
     __table_args__ = (
         UniqueConstraint("event_id"),
@@ -176,7 +192,7 @@ class RuntimeEvent(Base):
     )
 
 
-class Voice(Base):
+class Voice(TenantMixin, Base):
     __tablename__ = "voices"
     id: Mapped[str] = mapped_column(
         String(36), primary_key=True, default=lambda: str(uuid4())
@@ -194,6 +210,17 @@ class Voice(Base):
     sample_reference: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     consent: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Hard-delete tombstone (status "deleting" while provider cleanup is pending).
+    deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    deleted_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    provider_deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    sample_deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow
     )
@@ -202,8 +229,18 @@ class Voice(Base):
     )
 
 
-class Deployment(Base):
+class Deployment(TenantMixin, Base):
     __tablename__ = "deployments"
+    __table_args__ = (
+        # Phone numbers are globally unique among active deployments (inbound routing).
+        Index(
+            "uq_deployments_active_phone_number",
+            "phone_number",
+            unique=True,
+            postgresql_where=text("status = 'active' AND phone_number IS NOT NULL"),
+            sqlite_where=text("status = 'active' AND phone_number IS NOT NULL"),
+        ),
+    )
     id: Mapped[str] = mapped_column(
         String(36), primary_key=True, default=lambda: str(uuid4())
     )
@@ -221,7 +258,7 @@ class Deployment(Base):
     )
 
 
-class Campaign(Base):
+class Campaign(TenantMixin, Base):
     __tablename__ = "campaigns"
     id: Mapped[str] = mapped_column(
         String(36), primary_key=True, default=lambda: str(uuid4())
@@ -247,7 +284,7 @@ class Campaign(Base):
     )
 
 
-class CampaignTarget(Base):
+class CampaignTarget(TenantMixin, Base):
     __tablename__ = "campaign_targets"
     __table_args__ = (
         UniqueConstraint(
@@ -275,12 +312,13 @@ class CampaignTarget(Base):
     )
 
 
-class Tool(Base):
+class Tool(TenantMixin, Base):
     __tablename__ = "tools"
+    __table_args__ = (UniqueConstraint("organization_id", "name", name="uq_tools_organization_id_name"),)
     id: Mapped[str] = mapped_column(
         String(36), primary_key=True, default=lambda: str(uuid4())
     )
-    name: Mapped[str] = mapped_column(String(100), unique=True)
+    name: Mapped[str] = mapped_column(String(100))
     description: Mapped[str] = mapped_column(Text)
     tool_type: Mapped[str] = mapped_column(String(50), default="http")
     input_schema: Mapped[dict] = mapped_column(JSON, default=dict)
@@ -303,7 +341,7 @@ class AgentTool(Base):
     )
 
 
-class KnowledgeDocument(Base):
+class KnowledgeDocument(TenantMixin, Base):
     __tablename__ = "knowledge_documents"
     id: Mapped[str] = mapped_column(
         String(36), primary_key=True, default=lambda: str(uuid4())
@@ -331,3 +369,100 @@ class AgentKnowledgeDocument(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow
     )
+
+
+# -- Organisations, API keys, audit log -------------------------------------------------
+
+ORGANIZATION_ROLES = ("owner", "admin", "member")
+
+
+class Organization(Base):
+    __tablename__ = "organizations"
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid4())
+    )
+    name: Mapped[str] = mapped_column(String(200))
+    slug: Mapped[str] = mapped_column(String(63), unique=True)
+    status: Mapped[str] = mapped_column(String(20), default="active")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class ApiKey(Base):
+    __tablename__ = "api_keys"
+    __table_args__ = (
+        Index("ix_api_keys_organization_id_revoked_at", "organization_id", "revoked_at"),
+    )
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid4())
+    )
+    organization_id: Mapped[str] = mapped_column(
+        ForeignKey("organizations.id"), index=True
+    )
+    name: Mapped[str] = mapped_column(String(200))
+    key_prefix: Mapped[str] = mapped_column(String(16))
+    key_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    role: Mapped[str] = mapped_column(String(20))
+    created_by_key_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow
+    )
+    last_used_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    revoked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
+class AuditLog(Base):
+    """Append-only; deliberately no foreign keys so rows outlive what they describe."""
+
+    __tablename__ = "audit_log"
+    __table_args__ = (
+        Index("ix_audit_log_organization_id_created_at", "organization_id", "created_at"),
+        Index("ix_audit_log_resource_type_resource_id", "resource_type", "resource_id"),
+    )
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid4())
+    )
+    organization_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    actor_type: Mapped[str] = mapped_column(String(20))
+    actor_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    action: Mapped[str] = mapped_column(String(80))
+    resource_type: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    resource_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    metadata_json: Mapped[dict] = mapped_column("metadata", JSON, default=dict)
+    request_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow
+    )
+
+
+class ProblemReport(TenantMixin, Base):
+    """A "report a problem" note on a conversation (ST-02b); filed by staff or a guest."""
+
+    __tablename__ = "problem_reports"
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid4())
+    )
+    conversation_id: Mapped[str] = mapped_column(
+        ForeignKey("conversations.id"), index=True
+    )
+    session_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    note: Mapped[str] = mapped_column(Text)
+    # Who filed it: "api_key:<id>", "session:<id>", or the principal name.
+    reporter: Mapped[str] = mapped_column(String(100))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow
+    )
+
+
+from . import tenancy  # noqa: E402,F401  (registers the before_flush stamping hook)

@@ -1,4 +1,4 @@
-"""Outbound SIP through LiveKit, plus the Platform self-call used to open sessions.
+"""Outbound SIP through LiveKit, plus the in-process helpers that open and end sessions.
 
 Everything here is gated by ``LIVEKIT_SIP_TRUNK_ID`` (the id of a LiveKit *outbound*
 SIP trunk) together with the normal ``LIVEKIT_URL`` / ``LIVEKIT_API_KEY`` /
@@ -12,25 +12,27 @@ Optional tuning:
     Seconds to let the callee ring (LiveKit default is 30).
 ``LIVEKIT_SIP_KRISP``
     ``1`` enables Krisp noise cancellation on the SIP leg.
-``PLATFORM_API_URL``
-    Where the Platform reaches itself to open voice sessions (default
-    ``http://localhost:8000``).
+
+Sessions are opened and ended by calling :mod:`.sessions` directly under a ``system``
+context for the deployment's / campaign's organisation; the Platform no longer calls its
+own HTTP API (which would need credentials and carry no organisation).
 """
 
 import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
-import httpx
+from fastapi import HTTPException
+from sqlalchemy.orm import Session
+
+from .context import AuthContext
+from .tenancy import scoped_session_for
 
 SIP_IDENTITY_PREFIX = "sip-"
 # SIP final responses that mean "nobody took the call": request timeout, temporarily
 # unavailable, busy, request terminated, busy everywhere, declined.
 NO_ANSWER_SIP_CODES = frozenset({408, 480, 486, 487, 600, 603})
-_DEFAULT_PLATFORM_URL = "http://localhost:8000"
-_SESSION_TIMEOUT_S = 15.0
-
-# Test seam: ``httpx`` transport used for calls the Platform makes to itself.
-http_transport: httpx.AsyncBaseTransport | None = None
 
 
 class SipError(Exception):
@@ -63,7 +65,7 @@ class SipDialError(SipError):
 
 
 class SessionCreateError(Exception):
-    """``POST /voice/sessions`` failed when the Platform called itself."""
+    """Opening a voice session in-process failed (carries the HTTP-style status)."""
 
     def __init__(self, message: str, status_code: int | None = None) -> None:
         super().__init__(message)
@@ -187,61 +189,82 @@ async def hangup(room_name: str, participant_identity: str) -> None:
         return
 
 
-async def create_voice_session(agent_id: str, deployment_id: str | None) -> dict[str, Any]:
-    """Open a voice session through the Platform's own ``POST /voice/sessions``.
+def system_ctx(org_id: str) -> AuthContext:
+    """Context for the Platform's own background work (bridge calls, campaign dialer)."""
 
-    Going through HTTP keeps every session validation (agent enabled, deployment
-    active, provider checks, runtime hand-off) in one place.
+    return AuthContext(org_id=org_id, principal="system", role="admin")
+
+
+@contextmanager
+def _db_for(org_id: str, db: Session | None) -> Iterator[Session]:
+    """The caller's session, or a short-lived one pinned to ``org_id``."""
+
+    if db is not None:
+        yield db
+    else:
+        with scoped_session_for(org_id) as scoped_db:
+            yield scoped_db
+
+
+async def create_voice_session(
+    agent_id: str,
+    deployment_id: str | None,
+    *,
+    org_id: str,
+    db: Session | None = None,
+) -> dict[str, Any]:
+    """Open a voice session in-process through :func:`sessions.open_voice_session`.
+
+    Same validation and Runtime hand-off as ``POST /voice/sessions`` without an HTTP
+    round trip (which would need credentials and an organisation). ``HTTPException``
+    failures surface as :class:`SessionCreateError` carrying the status code.
     """
 
-    base = os.getenv("PLATFORM_API_URL", _DEFAULT_PLATFORM_URL).rstrip("/")
-    body: dict[str, Any] = {"agent_id": agent_id}
-    if deployment_id is not None:
-        body["deployment_id"] = deployment_id
+    from . import sessions  # sessions imports this module
+
+    ctx = system_ctx(org_id)
     try:
-        async with httpx.AsyncClient(
-            timeout=_SESSION_TIMEOUT_S, transport=http_transport
-        ) as client:
-            response = await client.post(f"{base}/voice/sessions", json=body)
-    except httpx.HTTPError as exc:
-        raise SessionCreateError(f"platform_unreachable: {type(exc).__name__}") from exc
-    if response.status_code != 201:
+        with _db_for(org_id, db) as session_db:
+            data = await sessions.open_voice_session(
+                session_db, ctx, agent_id=agent_id, deployment_id=deployment_id
+            )
+    except HTTPException as exc:
         raise SessionCreateError(
-            f"session_create_http_{response.status_code}", response.status_code
-        )
+            f"session_create_http_{exc.status_code}", exc.status_code
+        ) from exc
     try:
-        data = response.json()
         data["session_id"], data["conversation_id"], data["room_name"]
-    except (ValueError, KeyError, TypeError) as exc:
+    except (KeyError, TypeError) as exc:
         raise SessionCreateError("session_create_bad_response") from exc
     return data
 
 
-async def get_session_status(session_id: str) -> str | None:
-    """Current ``status`` of a voice session, or None if it cannot be read."""
+async def get_session_status(
+    session_id: str, *, org_id: str, db: Session | None = None
+) -> str | None:
+    """Current ``status`` of an organisation's voice session, or None if unreadable."""
 
-    base = os.getenv("PLATFORM_API_URL", _DEFAULT_PLATFORM_URL).rstrip("/")
+    from . import sessions
+
     try:
-        async with httpx.AsyncClient(
-            timeout=_SESSION_TIMEOUT_S, transport=http_transport
-        ) as client:
-            response = await client.get(f"{base}/voice/sessions/{session_id}")
-        if response.status_code != 200:
-            return None
-        status = response.json().get("status")
-        return status if isinstance(status, str) else None
-    except (httpx.HTTPError, ValueError, AttributeError):
+        with _db_for(org_id, db) as session_db:
+            value = await sessions.get_session_status(
+                session_db, system_ctx(org_id), session_id
+            )
+    except Exception:
         return None
+    return value if isinstance(value, str) else None
 
 
-async def end_voice_session(session_id: str) -> None:
-    """Best-effort ``POST /voice/sessions/{id}/end``. Never raises."""
+async def end_voice_session(
+    session_id: str, *, org_id: str, db: Session | None = None
+) -> None:
+    """Best-effort end of an organisation's session. Never raises."""
 
-    base = os.getenv("PLATFORM_API_URL", _DEFAULT_PLATFORM_URL).rstrip("/")
+    from . import sessions
+
     try:
-        async with httpx.AsyncClient(
-            timeout=_SESSION_TIMEOUT_S, transport=http_transport
-        ) as client:
-            await client.post(f"{base}/voice/sessions/{session_id}/end")
-    except httpx.HTTPError:
+        with _db_for(org_id, db) as session_db:
+            await sessions.end_session(session_db, system_ctx(org_id), session_id)
+    except Exception:
         return

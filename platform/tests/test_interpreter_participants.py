@@ -48,6 +48,10 @@ class RuntimeClient:
         self.requests.append({"url": url, **kwargs})
         return self.respond(url)
 
+    async def delete(self, url: str, **kwargs: object) -> RuntimeResponse:
+        self.requests.append({"url": url, "method": "DELETE", **kwargs})
+        return RuntimeResponse({"status": "removed"})
+
     async def get(self, url: str, **kwargs: object) -> RuntimeResponse:
         # Status poll of ensure-running: the Runtime lost the session.
         return RuntimeResponse({"status": "not_running"})
@@ -323,10 +327,270 @@ def test_add_participant_runtime_failure_is_not_persisted(runtime) -> None:
         url = f"/voice/sessions/{session_id}/participants"
         state["participant_status"] = 503
         failed = client.post(url, json={"language": "ko"})
-        assert (failed.status_code, failed.json()["detail"]) == (503, "runtime_unavailable")
+        assert (failed.status_code, failed.json()["detail"]["code"]) == (503, "runtime_unavailable")
         assert len(contract_for(session_id)["participants"]) == 1
 
         # 404: the Runtime does not hold the session; the stored contract is enough.
         state["participant_status"] = 404
         assert client.post(url, json={"language": "ko"}).status_code == 200
     assert len(contract_for(session_id)["participants"]) == 2
+
+
+# -- private listening: participants can never receive another person's microphone -----------
+
+
+def grants(token: str) -> dict:
+    return jwt.decode(token, options={"verify_signature": False})["video"]
+
+
+def test_interpreter_participants_cannot_subscribe_in_the_session_room(
+    runtime, livekit, monkeypatch
+) -> None:
+    requests, _ = runtime
+    monkeypatch.setenv("PLATFORM_PRIVATE_LISTENING", "1")
+    with TestClient(app) as client:
+        agent = make_agent(client)
+        created = create_session(client, agent, language="en").json()
+        session_id = created["session_id"]
+        guest = client.post(
+            f"/voice/sessions/{session_id}/participants", json={"language": "ko"}
+        ).json()
+
+    room = f"voice-labs-{session_id}"
+    for identity, connection in (
+        (f"browser-{session_id}", created["connection"]),
+        (guest["participant_identity"], guest["connection"]),
+    ):
+        # Session room: publish the microphone, receive nothing (LiveKit refuses every
+        # subscription, auto, client-requested or forced through the server API).
+        main = grants(connection["token"])
+        assert (main["room"], main["canPublish"], main["canSubscribe"]) == (room, True, False)
+        # Listen room: subscribe-only, joined by this person and the Runtime alone.
+        listen = connection["listen"]
+        assert listen["url"] == "ws://livekit.test" == connection["url"]
+        assert listen["room_name"] == f"{room}--listen--{identity}"
+        assert listen["track"] == f"translation-for-{identity}"
+        token = jwt.decode(listen["token"], options={"verify_signature": False})
+        assert token["sub"] == identity
+        assert token["video"]["room"] == listen["room_name"]
+        assert (token["video"]["canSubscribe"], token["video"]["canPublish"]) == (True, False)
+        assert token["video"]["canPublishData"] is False
+    # The Runtime is told to publish translations into the listen rooms.
+    assert requests[0]["json"]["private_listening"] is True
+    assert contract_for(session_id)["private_listening"] is True
+
+
+def test_hear_original_sessions_keep_one_shared_room(runtime, livekit) -> None:
+    requests, _ = runtime
+    with TestClient(app) as client:
+        agent = make_agent(
+            client,
+            interpreter={"languages": ["en", "ko"], "direction": "one_way", "hear_original": True},
+        )
+        created = create_session(client, agent, language="en").json()
+        guest = client.post(
+            f"/voice/sessions/{created['session_id']}/participants", json={"language": "ko"}
+        ).json()
+    for connection in (created["connection"], guest["connection"]):
+        assert "listen" not in connection
+        assert grants(connection["token"])["canSubscribe"] is True
+    assert "private_listening" not in requests[0]["json"]
+    assert "private_listening" not in contract_for(created["session_id"])
+
+
+def test_interpreter_without_a_participant_and_plain_agents_are_unchanged(runtime, livekit) -> None:
+    with TestClient(app) as client:
+        interpreter = create_session(client, make_agent(client))
+        plain = client.post("/voice/sessions", json={"agent_id": client.post("/agents", json={"name": "p"}).json()["id"]})
+    for response in (interpreter, plain):
+        connection = response.json()["connection"]
+        assert set(connection) == {"url", "token"}
+        assert grants(connection["token"])["canSubscribe"] is True
+        assert "private_listening" not in contract_for(response.json()["session_id"])
+
+
+def test_private_listening_is_off_by_default(runtime, livekit, monkeypatch) -> None:
+    requests, _ = runtime
+    monkeypatch.delenv("PLATFORM_PRIVATE_LISTENING", raising=False)
+    with TestClient(app) as client:
+        created = create_session(client, make_agent(client), language="en").json()
+    assert set(created["connection"]) == {"url", "token"}
+    assert grants(created["connection"]["token"])["canSubscribe"] is True
+    assert "private_listening" not in requests[0]["json"]
+
+
+def test_a_guest_follows_the_privacy_mode_the_session_started_with(runtime, livekit, monkeypatch) -> None:
+    monkeypatch.setenv("PLATFORM_PRIVATE_LISTENING", "1")
+    with TestClient(app) as client:
+        session_id = create_session(client, make_agent(client), language="en").json()["session_id"]
+        monkeypatch.setenv("PLATFORM_PRIVATE_LISTENING", "0")  # changed mid-call: no effect
+        guest = client.post(
+            f"/voice/sessions/{session_id}/participants", json={"language": "ko"}
+        ).json()
+    assert grants(guest["connection"]["token"])["canSubscribe"] is False
+    assert "listen" in guest["connection"]
+
+
+def test_listen_room_name_convention() -> None:
+    from src.platform.livekit import listen_room_name
+
+    assert listen_room_name("voice-labs-1", "guest-ab12") == "voice-labs-1--listen--guest-ab12"
+
+
+# -- phone participants -----------------------------------------------------------------------
+
+
+@pytest.fixture
+def sip_trunk(monkeypatch):
+    """A configured trunk; ``dials`` records what would be dialled (no SIP call is made)."""
+
+    monkeypatch.setenv("LIVEKIT_URL", "ws://livekit.test")
+    monkeypatch.setenv("LIVEKIT_API_KEY", "devkey")
+    monkeypatch.setenv("LIVEKIT_API_SECRET", "s" * 40)
+    monkeypatch.setenv("LIVEKIT_SIP_TRUNK_ID", "ST_test")
+    dials: list[dict] = []
+    hangups: list[tuple[str, str]] = []
+    state = {"fail": False}
+
+    async def dial(number, room, identity, *, display_name=None):
+        dials.append({"number": number, "room": room, "identity": identity, "name": display_name})
+        if state["fail"]:
+            raise sip_module.SipDialError("no answer", sip_status_code=480)
+        return "PA_phone"
+
+    async def hangup(room, identity):
+        hangups.append((room, identity))
+
+    from src.platform import sip as sip_module
+
+    monkeypatch.setattr(sip_module, "dial", dial)
+    monkeypatch.setattr(sip_module, "hangup", hangup)
+    return dials, hangups, state
+
+
+PHONE = {"language": "ko", "phone_number": "+821012345678", "display_name": "Bob"}
+
+
+def phone_url(session_id: str) -> str:
+    return f"/voice/sessions/{session_id}/phone-participants"
+
+
+def test_phone_participant_is_dialled_into_a_room_only_the_runtime_shares(
+    runtime, livekit, sip_trunk, monkeypatch
+) -> None:
+    requests, _ = runtime
+    dials, hangups, _ = sip_trunk
+    monkeypatch.setenv("PLATFORM_PRIVATE_LISTENING", "1")
+    with TestClient(app) as client:
+        session_id = create_session(client, make_agent(client), language="en").json()["session_id"]
+        response = client.post(phone_url(session_id), json=PHONE)
+        assert response.status_code == 201, response.text
+        body = response.json()
+
+        identity = body["participant_identity"]
+        phone_room = f"voice-labs-{session_id}--phone--{identity}"
+        assert identity.startswith("sip-guest-")
+        assert body == {
+            "participant_identity": identity,
+            "participant_id": "PA_phone",
+            "phone_number": "+821012345678",
+            "room_name": phone_room,
+            "private_listening": True,
+        }
+        # Never the session room, so the other person's microphone is not in it at all.
+        assert dials == [
+            {"number": "+821012345678", "room": phone_room, "identity": identity, "name": "Bob"}
+        ]
+        entry = {"language": "ko", "voice_id": None, "display_name": "Bob", "phone_room": True}
+        assert contract_for(session_id)["participants"][identity] == entry
+        # The Runtime joined the phone room (was told) before the call was placed.
+        notify = [r for r in requests if r["url"].endswith("/participants")][-1]
+        assert notify["json"] == {"identity": identity, **entry}
+
+        # Ending the session hangs the call up in the room it lives in.
+        assert client.post(f"/voice/sessions/{session_id}/end").status_code == 200
+    assert hangups == [(phone_room, identity)]
+
+
+def test_phone_participant_without_private_listening_joins_the_session_room(
+    runtime, livekit, sip_trunk, monkeypatch
+) -> None:
+    dials, hangups, _ = sip_trunk
+    monkeypatch.delenv("PLATFORM_PRIVATE_LISTENING", raising=False)
+    with TestClient(app) as client:
+        session_id = create_session(client, make_agent(client), language="en").json()["session_id"]
+        body = client.post(phone_url(session_id), json=PHONE).json()
+        identity = body["participant_identity"]
+        assert body["room_name"] == f"voice-labs-{session_id}" and not body["private_listening"]
+        assert dials[0]["room"] == f"voice-labs-{session_id}"
+        assert "phone_room" not in contract_for(session_id)["participants"][identity]
+        client.post(f"/voice/sessions/{session_id}/end")
+    assert hangups == [(f"voice-labs-{session_id}", identity)]
+
+
+def test_hear_original_phone_participant_stays_in_the_shared_room(
+    runtime, livekit, sip_trunk, monkeypatch
+) -> None:
+    dials, _, _ = sip_trunk
+    monkeypatch.setenv("PLATFORM_PRIVATE_LISTENING", "1")
+    with TestClient(app) as client:
+        agent = make_agent(
+            client, interpreter={"languages": ["en", "ko"], "direction": "one_way", "hear_original": True}
+        )
+        session_id = create_session(client, agent, language="en").json()["session_id"]
+        body = client.post(phone_url(session_id), json=PHONE).json()
+    assert body["room_name"] == f"voice-labs-{session_id}" and not body["private_listening"]
+    assert dials[0]["room"] == f"voice-labs-{session_id}"
+
+
+def test_unanswered_phone_call_withdraws_the_participant_and_frees_the_slot(
+    runtime, livekit, sip_trunk, monkeypatch
+) -> None:
+    requests, _ = runtime
+    _, _, state = sip_trunk
+    monkeypatch.setenv("PLATFORM_PRIVATE_LISTENING", "1")
+    with TestClient(app) as client:
+        session_id = create_session(client, make_agent(client), language="en").json()["session_id"]
+        state["fail"] = True
+        failed = client.post(phone_url(session_id), json=PHONE)
+        assert (failed.status_code, failed.json()["detail"]) == (502, "sip_dial_failed")
+        assert len(contract_for(session_id)["participants"]) == 1
+        deleted = requests[-1]
+        assert deleted["method"] == "DELETE"
+        assert deleted["url"].startswith(f"http://runtime.test/sessions/{session_id}/participants/sip-guest-")
+        assert deleted["headers"] == {"X-Runtime-Token": "shared-secret"}
+        state["fail"] = False
+        assert client.post(phone_url(session_id), json=PHONE).status_code == 201
+
+
+def test_phone_participant_validations(runtime, livekit, monkeypatch) -> None:
+    monkeypatch.delenv("LIVEKIT_SIP_TRUNK_ID", raising=False)
+    with TestClient(app) as client:
+        session_id = create_session(client, make_agent(client), language="en").json()["session_id"]
+        url = phone_url(session_id)
+        assert client.post(url, json={**PHONE, "phone_number": "0101234"}).status_code == 422
+        assert client.post(url, json={**PHONE, "language": "xx"}).json()["detail"] == "invalid_participant_language"
+        assert client.post(url, json={**PHONE, "language": "en"}).json()["detail"] == "participant_languages_must_differ"
+        not_configured = client.post(url, json=PHONE)
+        assert (not_configured.status_code, not_configured.json()["detail"]) == (409, "sip_not_configured")
+        assert client.post(phone_url(str(uuid4())), json=PHONE).status_code == 404
+
+
+def test_phone_participant_needs_an_open_slot_and_a_creator_token(
+    runtime, livekit, sip_trunk
+) -> None:
+    with TestClient(app) as client:
+        session_id = create_session(client, make_agent(client), language="en").json()["session_id"]
+        assert client.post(phone_url(session_id), json=PHONE).status_code == 201
+        full = client.post(phone_url(session_id), json={**PHONE, "language": "en"})
+        assert (full.status_code, full.json()["detail"]) == (409, "session_full")
+    from src.platform import auth
+
+    assert ("POST", "/voice/sessions/{session_id}/phone-participants") in auth.SESSION_SCOPED_ROUTES
+    assert auth.SESSION_SCOPED_ROUTES[("POST", "/voice/sessions/{session_id}/phone-participants")].creator_only
+
+
+def test_phone_room_name_convention() -> None:
+    from src.platform.livekit import phone_room_name
+
+    assert phone_room_name("voice-labs-1", "sip-guest-ab12") == "voice-labs-1--phone--sip-guest-ab12"

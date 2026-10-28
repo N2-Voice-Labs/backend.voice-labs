@@ -362,3 +362,59 @@ def test_migration_0007_up_and_down_on_sqlite() -> None:
         engine.dispose()
     finally:
         db_path.unlink(missing_ok=True)
+
+
+def test_unknown_vlk_key_is_generic_401(client) -> None:
+    response = client.get("/agents", headers=bearer("vlk_does-not-exist"))
+    assert response.status_code == 401
+    assert response.json() == {"detail": "invalid_api_key"}
+    assert response.headers["www-authenticate"] == "Bearer"
+
+
+def test_admin_key_with_unknown_org_header_is_404(client) -> None:
+    response = client.get("/agents", headers={**ADMIN, "X-Organization-Id": str(uuid4())})
+    assert response.status_code == 404
+    assert response.json() == {"detail": {"code": "organization_not_found"}}
+
+
+def test_guest_cannot_end_the_creators_session(client) -> None:
+    session = make_session(client)
+    sid = session["session_id"]
+    added = client.post(
+        f"/voice/sessions/{sid}/participants",
+        json={"language": "ko"},
+        headers=bearer(session["session_token"]),
+    )
+    guest = bearer(added.json()["session_token"])
+    response = client.post(f"/voice/sessions/{sid}/end", headers=guest)
+    assert response.status_code == 403
+    assert response.json() == {"detail": "forbidden"}
+    # The creator (and admin) still can.
+    assert client.post(f"/voice/sessions/{sid}/end", headers=bearer(session["session_token"])).status_code == 200
+
+
+def test_cors_preflight_allows_org_and_request_id_headers(client) -> None:
+    response = client.options(
+        "/agents",
+        headers={
+            "Origin": "http://localhost:3000",
+            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Headers": "x-organization-id, x-request-id, authorization",
+        },
+    )
+    assert response.status_code == 200
+    allowed = response.headers["access-control-allow-headers"].lower()
+    assert "x-organization-id" in allowed and "x-request-id" in allowed
+
+
+def test_request_id_is_echoed_as_response_header(client) -> None:
+    echoed = client.get("/agents", headers={**ADMIN, "X-Request-Id": "req-abc"})
+    assert echoed.headers["x-request-id"] == "req-abc"
+    generated = client.get("/agents", headers=ADMIN)
+    assert len(generated.headers["x-request-id"]) == 36
+    rejected = client.get("/agents", headers={"X-Request-Id": "req-rej"})
+    assert rejected.status_code == 401 and rejected.headers["x-request-id"] == "req-rej"
+    cors = client.get(
+        "/agents", headers={**ADMIN, "Origin": "http://localhost:3000"}
+    )
+    assert "x-request-id" in cors.headers["access-control-expose-headers"].lower()

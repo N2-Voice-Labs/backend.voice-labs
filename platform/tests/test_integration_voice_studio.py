@@ -102,7 +102,12 @@ def test_agent_voice_profile_validation_and_runtime_voice_id() -> None:
         assert contract["voice_id"] == "provider-voice-42"
         assert "voice_profile_id" not in contract
 
-        client.delete(f"/voices/{ready['id']}")
+        # A voice an agent still uses cannot be hard-deleted; disable it instead.
+        assert client.delete(f"/voices/{ready['id']}").status_code == 409
+        disabled = client.post(
+            f"/voices/{ready['id']}/status", json={"status": "disabled"}
+        )
+        assert disabled.status_code == 200
         invalid_patch = client.patch(
             f"/agents/{agent['id']}", json={"voice_profile_id": ready["id"]}
         )

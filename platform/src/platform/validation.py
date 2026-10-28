@@ -1,6 +1,9 @@
 """Shared request-validation helpers (importable without importing ``main``)."""
 
+import json
 import re
+from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 SECRET_KEY_PARTS = ("secret", "password", "token", "api_key", "apikey")
@@ -19,21 +22,29 @@ OUTCOMES = frozenset(
         "other",
     }
 )
-INTERPRETER_LANGUAGES = frozenset(
-    {"en", "ru", "ko", "ja", "zh", "es", "fr", "de", "it", "pt", "nl", "hi", "tr", "pl"}
+# Language support (ST-20) comes from one table, vendored from Runtime's
+# ``runtime.language_capabilities`` (a drift test keeps both equal). Regenerate with
+# ``python runtime/src/runtime/language_capabilities.py >
+# platform/src/platform/language_capabilities.json`` from the workspace root.
+LANGUAGE_CAPABILITIES: dict[str, dict[str, Any]] = json.loads(
+    Path(__file__).with_name("language_capabilities.json").read_text(encoding="utf-8")
 )
-# Target (output) languages of OpenAI ``gpt-realtime-translate``; the model accepts 70+
-# input languages. Verified 2026-10-18 against
-# https://developers.openai.com/cookbook/examples/voice_solutions/realtime_translation_guide
-# ("13 target output languages": Spanish, Portuguese, French, Japanese, Russian, Chinese,
-# German, Korean, Hindi, Indonesian, Vietnamese, Italian, English).
-REALTIME_TRANSLATE_OUTPUT_LANGUAGES = frozenset(
-    {"es", "pt", "fr", "ja", "ru", "zh", "de", "ko", "hi", "id", "vi", "it", "en"}
-)
+
+
+def _languages_where(predicate: Callable[[dict[str, Any]], bool]) -> frozenset[str]:
+    return frozenset(code for code, row in LANGUAGE_CAPABILITIES.items() if predicate(row))
+
+
+# Cascaded stack: Deepgram fixed-language STT and Cartesia TTS.
+INTERPRETER_LANGUAGES = _languages_where(lambda row: row["stt_fixed"] and row["tts"])
+# Target (output) languages of OpenAI ``gpt-realtime-translate`` (the model accepts 70+
+# input languages).
+REALTIME_TRANSLATE_OUTPUT_LANGUAGES = _languages_where(lambda row: row["realtime_output"])
+# Deepgram nova-3 ``multi`` (code-switching) set: per-utterance language detection.
+AUTO_DIRECTION_LANGUAGES = _languages_where(lambda row: row["stt_multi"])
 # Interpreter latency modes (RM-011); mirrored by Runtime's ``latency_modes``.
 LATENCY_MODES = ("instant", "balanced", "accurate")
 DEFAULT_LATENCY_MODE = "balanced"
-AUTO_DIRECTION_LANGUAGES = frozenset({"en", "es", "fr", "de", "hi", "ru", "pt", "ja", "it", "nl"})
 E164_PATTERN = r"^\+[1-9]\d{6,14}$"
 _E164_RE = re.compile(E164_PATTERN)
 
@@ -177,3 +188,28 @@ def validate_glossary(value: Any) -> list[dict[str, Any]]:
             )
         normalized.append(result)
     return normalized
+
+
+def validate_enabled_languages(value: Any) -> list[str]:
+    """Plain-agent ``enabled_languages`` (ST-20): each needs fixed-language STT and TTS."""
+
+    if not isinstance(value, list):
+        raise ValueError("enabled_languages must be a list")
+    result: list[str] = []
+    for item in value:
+        code = item.strip().lower() if isinstance(item, str) else item
+        row = LANGUAGE_CAPABILITIES.get(code) if isinstance(code, str) else None
+        if row is None:
+            raise ValueError(f"unsupported language in enabled_languages: {item}")
+        if not row["stt_fixed"] or not row["tts"]:
+            missing = [
+                label
+                for label, flag in (("speech recognition", "stt_fixed"), ("speech synthesis", "tts"))
+                if not row[flag]
+            ]
+            raise ValueError(
+                f"unsupported language in enabled_languages: {code} "
+                f"(no {' or '.join(missing)} support)"
+            )
+        result.append(code)
+    return result

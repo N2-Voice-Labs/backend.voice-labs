@@ -1,0 +1,114 @@
+{
+  "en": {
+    "name": "English",
+    "stt_fixed": true,
+    "stt_multi": true,
+    "tts": true,
+    "realtime_output": true
+  },
+  "ru": {
+    "name": "Russian",
+    "stt_fixed": true,
+    "stt_multi": true,
+    "tts": true,
+    "realtime_output": true
+  },
+  "ko": {
+    "name": "Korean",
+    "stt_fixed": true,
+    "stt_multi": false,
+    "tts": true,
+    "realtime_output": true
+  },
+  "ja": {
+    "name": "Japanese",
+    "stt_fixed": true,
+    "stt_multi": true,
+    "tts": true,
+    "realtime_output": true
+  },
+  "zh": {
+    "name": "Chinese",
+    "stt_fixed": true,
+    "stt_multi": false,
+    "tts": true,
+    "realtime_output": true
+  },
+  "es": {
+    "name": "Spanish",
+    "stt_fixed": true,
+    "stt_multi": true,
+    "tts": true,
+    "realtime_output": true
+  },
+  "fr": {
+    "name": "French",
+    "stt_fixed": true,
+    "stt_multi": true,
+    "tts": true,
+    "realtime_output": true
+  },
+  "de": {
+    "name": "German",
+    "stt_fixed": true,
+    "stt_multi": true,
+    "tts": true,
+    "realtime_output": true
+  },
+  "it": {
+    "name": "Italian",
+    "stt_fixed": true,
+    "stt_multi": true,
+    "tts": true,
+    "realtime_output": true
+  },
+  "pt": {
+    "name": "Portuguese",
+    "stt_fixed": true,
+    "stt_multi": true,
+    "tts": true,
+    "realtime_output": true
+  },
+  "nl": {
+    "name": "Dutch",
+    "stt_fixed": true,
+    "stt_multi": true,
+    "tts": true,
+    "realtime_output": false
+  },
+  "hi": {
+    "name": "Hindi",
+    "stt_fixed": true,
+    "stt_multi": true,
+    "tts": true,
+    "realtime_output": true
+  },
+  "tr": {
+    "name": "Turkish",
+    "stt_fixed": true,
+    "stt_multi": false,
+    "tts": true,
+    "realtime_output": false
+  },
+  "pl": {
+    "name": "Polish",
+    "stt_fixed": true,
+    "stt_multi": false,
+    "tts": true,
+    "realtime_output": false
+  },
+  "id": {
+    "name": "Indonesian",
+    "stt_fixed": false,
+    "stt_multi": false,
+    "tts": false,
+    "realtime_output": true
+  },
+  "vi": {
+    "name": "Vietnamese",
+    "stt_fixed": false,
+    "stt_multi": false,
+    "tts": false,
+    "realtime_output": true
+  }
+}

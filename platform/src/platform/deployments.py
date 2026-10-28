@@ -6,12 +6,14 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from . import sip
-from .db import get_db
+from .context import AuthContext, require
 from .models import Agent as AgentRecord
 from .models import Deployment as DeploymentRecord
+from .tenancy import get_owned, get_scoped_db, scoped
 from .validation import validate_deployment_configuration, validate_e164
 
 router = APIRouter(tags=["deployments"])
@@ -83,20 +85,41 @@ def check_phone_invariant(channel: str, phone_number: str | None) -> None:
         raise HTTPException(status_code=422, detail="phone_number_only_for_sip")
 
 
-def get_deployment_or_404(deployment_id: UUID, db: Session) -> DeploymentRecord:
-    record = db.get(DeploymentRecord, str(deployment_id))
-    if record is None:
-        raise HTTPException(status_code=404, detail="deployment_not_found")
-    return record
+def get_deployment_or_404(
+    deployment_id: UUID, db: Session, ctx: AuthContext
+) -> DeploymentRecord:
+    return get_owned(
+        db, ctx, DeploymentRecord, str(deployment_id), not_found_detail="deployment_not_found"
+    )
+
+
+def commit_deployment(db: Session) -> None:
+    """Commit; the active-phone partial unique index surfaces as 409 ``phone_number_in_use``."""
+
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        if "phone_number" not in str(exc.orig):
+            raise
+        raise HTTPException(
+            status_code=409, detail={"code": "phone_number_in_use"}
+        ) from exc
 
 
 @router.post(
     "/deployments", response_model=Deployment, status_code=status.HTTP_201_CREATED
 )
 async def create_deployment(
-    payload: DeploymentIn, db: Session = Depends(get_db)
+    payload: DeploymentIn,
+    ctx: AuthContext = Depends(require("admin")),
+    db: Session = Depends(get_scoped_db),
 ) -> Deployment:
-    agent = db.get(AgentRecord, str(payload.agent_id))
+    # Org-scoped lookup: another organisation's agent is indistinguishable from a
+    # nonexistent one (both 422 invalid_agent_id).
+    agent = db.scalars(
+        scoped(db, ctx, AgentRecord).where(AgentRecord.id == str(payload.agent_id))
+    ).first()
     if agent is None or agent.status == "disabled":
         raise HTTPException(status_code=422, detail="invalid_agent_id")
     check_phone_invariant(payload.channel, payload.phone_number)
@@ -104,7 +127,7 @@ async def create_deployment(
         **{**payload.model_dump(), "agent_id": str(payload.agent_id)}
     )
     db.add(record)
-    db.commit()
+    commit_deployment(db)
     db.refresh(record)
     return Deployment.model_validate(record)
 
@@ -114,9 +137,12 @@ async def list_deployments(
     agent_id: UUID | None = None,
     channel: Channel | None = None,
     status: DeploymentStatus | None = None,
-    db: Session = Depends(get_db),
+    ctx: AuthContext = Depends(require("member")),
+    db: Session = Depends(get_scoped_db),
 ) -> list[Deployment]:
-    query = db.query(DeploymentRecord)
+    query = db.query(DeploymentRecord).filter(
+        DeploymentRecord.organization_id == ctx.org_id
+    )
     if agent_id is not None:
         query = query.filter(DeploymentRecord.agent_id == str(agent_id))
     if channel is not None:
@@ -131,16 +157,21 @@ async def list_deployments(
 
 @router.get("/deployments/{deployment_id}", response_model=Deployment)
 async def get_deployment(
-    deployment_id: UUID, db: Session = Depends(get_db)
+    deployment_id: UUID,
+    ctx: AuthContext = Depends(require("member")),
+    db: Session = Depends(get_scoped_db),
 ) -> Deployment:
-    return Deployment.model_validate(get_deployment_or_404(deployment_id, db))
+    return Deployment.model_validate(get_deployment_or_404(deployment_id, db, ctx))
 
 
 @router.patch("/deployments/{deployment_id}", response_model=Deployment)
 async def update_deployment(
-    deployment_id: UUID, payload: DeploymentPatch, db: Session = Depends(get_db)
+    deployment_id: UUID,
+    payload: DeploymentPatch,
+    ctx: AuthContext = Depends(require("admin")),
+    db: Session = Depends(get_scoped_db),
 ) -> Deployment:
-    record = get_deployment_or_404(deployment_id, db)
+    record = get_deployment_or_404(deployment_id, db, ctx)
     if record.status == "archived":
         raise HTTPException(status_code=409, detail="deployment_archived")
     changes = payload.model_dump(exclude_unset=True)
@@ -149,7 +180,7 @@ async def update_deployment(
     )
     for key, value in changes.items():
         setattr(record, key, value)
-    db.commit()
+    commit_deployment(db)
     db.refresh(record)
     return Deployment.model_validate(record)
 
@@ -158,9 +189,11 @@ async def update_deployment(
     "/deployments/{deployment_id}", status_code=status.HTTP_204_NO_CONTENT
 )
 async def archive_deployment(
-    deployment_id: UUID, db: Session = Depends(get_db)
+    deployment_id: UUID,
+    ctx: AuthContext = Depends(require("admin")),
+    db: Session = Depends(get_scoped_db),
 ) -> None:
-    record = get_deployment_or_404(deployment_id, db)
+    record = get_deployment_or_404(deployment_id, db, ctx)
     record.status = "archived"
     db.commit()
 
@@ -195,7 +228,10 @@ class BridgeCall(BaseModel):
     status_code=status.HTTP_201_CREATED,
 )
 async def bridge_call(
-    deployment_id: UUID, payload: BridgeCallIn, db: Session = Depends(get_db)
+    deployment_id: UUID,
+    payload: BridgeCallIn,
+    ctx: AuthContext = Depends(require("member")),
+    db: Session = Depends(get_scoped_db),
 ) -> BridgeCall:
     """Phone interpreter: dial both parties into one room with the interpreter agent.
 
@@ -210,11 +246,13 @@ async def bridge_call(
     session is ended and ``from`` is hung up.
     """
 
-    record = get_deployment_or_404(deployment_id, db)
-    agent = db.get(AgentRecord, record.agent_id)
+    record = get_deployment_or_404(deployment_id, db, ctx)
+    agent = get_owned(
+        db, ctx, AgentRecord, record.agent_id, not_found_detail="agent_not_found"
+    )
     if record.channel != "sip":
         raise HTTPException(status_code=422, detail="deployment_not_sip")
-    if agent is None or agent.mode != "interpreter":
+    if agent.mode != "interpreter":
         raise HTTPException(status_code=422, detail="agent_not_interpreter")
     interpreter = agent.interpreter or {}
     if (
@@ -229,7 +267,9 @@ async def bridge_call(
     if not sip.sip_configured():
         raise HTTPException(status_code=409, detail="sip_not_configured")
     try:
-        session = await sip.create_voice_session(record.agent_id, record.id)
+        session = await sip.create_voice_session(
+            record.agent_id, record.id, org_id=ctx.org_id, db=db
+        )
     except sip.SessionCreateError as exc:
         raise HTTPException(status_code=502, detail="session_create_failed") from exc
     session_id = str(session["session_id"])
@@ -241,7 +281,7 @@ async def bridge_call(
             participant_id = await sip.dial(number, room_name, identity)
         except sip.SipError as exc:
             await asyncio.gather(
-                sip.end_voice_session(session_id),
+                sip.end_voice_session(session_id, org_id=ctx.org_id),
                 *(sip.hangup(room_name, item.identity) for item in participants),
             )
             raise HTTPException(

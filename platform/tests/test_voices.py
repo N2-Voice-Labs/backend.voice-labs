@@ -241,11 +241,11 @@ def test_patch_voice() -> None:
         assert client.patch(f"/voices/{uuid4()}", json={"name": "x"}).status_code == 404
 
 
-def test_delete_voice_soft_disables() -> None:
+def test_delete_voice_tombstones() -> None:
     with TestClient(app) as client:
         voice = make_library_voice(client)
         assert client.delete(f"/voices/{voice['id']}").status_code == 204
-        assert client.get(f"/voices/{voice['id']}").json()["status"] == "disabled"
+        assert client.get(f"/voices/{voice['id']}").json()["status"] == "deleted"
         assert client.delete(f"/voices/{uuid4()}").status_code == 404
 
 

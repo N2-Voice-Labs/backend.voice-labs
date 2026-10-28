@@ -5,6 +5,7 @@ import os
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
+from urllib.parse import quote
 from uuid import UUID
 
 import httpx
@@ -16,10 +17,13 @@ from pydantic import (
     StrictBool,
     field_validator,
 )
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
-from .db import get_db
-from .models import ProviderConfig, Voice as VoiceRecord, utcnow
+from . import audit, storage
+from .context import AuthContext, get_ctx, require, role_at_least
+from .models import Agent as AgentRecord, ProviderConfig, Voice as VoiceRecord, utcnow
+from .tenancy import bypass, get_owned, get_scoped_db, link_check, scoped
 
 _logger = logging.getLogger(__name__)
 router = APIRouter(tags=["voices"])
@@ -32,7 +36,11 @@ TRANSITIONS = {
     "ready": {"disabled"},
     "disabled": {"ready"},
 }
-VoiceStatus = Literal["pending", "processing", "ready", "failed", "disabled"]
+# "deleting" (provider cleanup pending) and "deleted" (tombstone) are set only by
+# DELETE /voices/{id}; they have no outgoing transitions.
+VoiceStatus = Literal[
+    "pending", "processing", "ready", "failed", "disabled", "deleting", "deleted"
+]
 VoiceSource = Literal["library", "clone", "design"]
 SAMPLE_REFERENCE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://\S+$")
 
@@ -107,44 +115,112 @@ class Voice(BaseModel):
     sample_reference: str | None
     consent: dict[str, Any] | None
     failure_reason: str | None
+    deleted_at: Any = None
     created_at: Any
     updated_at: Any
 
 
-def validate_tts_provider(provider_id: UUID | None, db: Session) -> str | None:
+def validate_tts_provider(
+    provider_id: UUID | None, db: Session, ctx: AuthContext
+) -> str | None:
     if provider_id is None:
         return None
-    provider = db.get(ProviderConfig, str(provider_id))
+    # Look the provider up across organisations so another org's id is a 404
+    # (provider_config_not_found) rather than indistinguishable from a bad kind.
+    with bypass(db):
+        provider = db.scalars(
+            select(ProviderConfig).where(ProviderConfig.id == str(provider_id))
+        ).first()
+    link_check(ctx, provider)
     if provider is None or provider.kind != "tts" or not provider.enabled:
         raise HTTPException(status_code=422, detail="invalid_tts_provider_id")
     return provider.id
 
 
-def get_voice_or_404(voice_id: UUID, db: Session) -> VoiceRecord:
-    record = db.get(VoiceRecord, str(voice_id))
-    if record is None:
+def _is_admin(ctx: AuthContext) -> bool:
+    return ctx.principal in {"superadmin", "dev", "system"} or role_at_least(
+        ctx.role, "admin"
+    )
+
+
+def get_voice_or_404(
+    voice_id: UUID, db: Session, ctx: AuthContext, *, include_deleted: bool = False
+) -> VoiceRecord:
+    record = get_owned(
+        db, ctx, VoiceRecord, str(voice_id), not_found_detail="voice_not_found"
+    )
+    if record.status == "deleted" and not include_deleted:
         raise HTTPException(status_code=404, detail="voice_not_found")
     return record
 
 
-def save_voice(db: Session, payload: VoiceBase, **fields: Any) -> VoiceRecord:
+def require_superadmin(ctx: AuthContext = Depends(get_ctx)) -> AuthContext:
+    if ctx.principal not in {"superadmin", "dev"}:
+        raise HTTPException(status_code=403, detail={"code": "superadmin_required"})
+    return ctx
+
+
+def save_voice(
+    db: Session,
+    ctx: AuthContext,
+    payload: VoiceBase,
+    audit_metadata: dict[str, Any] | None = None,
+    **fields: Any,
+) -> VoiceRecord:
     record = VoiceRecord(
         name=payload.name,
-        tts_provider_id=validate_tts_provider(payload.tts_provider_id, db),
+        tts_provider_id=validate_tts_provider(payload.tts_provider_id, db, ctx),
         languages=payload.languages,
         style=payload.style.model_dump(exclude_none=True),
         **fields,
     )
     db.add(record)
+    db.flush()
+    audit.record(
+        db,
+        ctx,
+        "voice.created",
+        resource_type="voice",
+        resource_id=record.id,
+        metadata={"source": record.source, **(audit_metadata or {})},
+    )
     db.commit()
     db.refresh(record)
     return record
 
 
+def _foreign_clone_voice_exists(
+    db: Session, ctx: AuthContext, provider_voice_id: str
+) -> bool:
+    """True when another organisation owns a cloned voice with this provider id."""
+
+    if ctx.org_id is None:
+        return False
+    with bypass(db):
+        return (
+            db.scalars(
+                select(VoiceRecord.id).where(
+                    VoiceRecord.source == "clone",
+                    VoiceRecord.provider_voice_id == provider_voice_id,
+                    VoiceRecord.organization_id != ctx.org_id,
+                )
+            ).first()
+            is not None
+        )
+
+
 @router.post("/voices", response_model=Voice, status_code=status.HTTP_201_CREATED)
-async def create_voice(payload: VoiceIn, db: Session = Depends(get_db)) -> Voice:
+async def create_voice(
+    payload: VoiceIn,
+    ctx: AuthContext = Depends(require("admin")),
+    db: Session = Depends(get_scoped_db),
+) -> Voice:
+    if _foreign_clone_voice_exists(db, ctx, payload.provider_voice_id):
+        # Another organisation's cloned voice must not be reachable by raw id.
+        raise HTTPException(status_code=422, detail="invalid_provider_voice_id")
     record = save_voice(
         db,
+        ctx,
         payload,
         source="library",
         status="ready",
@@ -154,7 +230,11 @@ async def create_voice(payload: VoiceIn, db: Session = Depends(get_db)) -> Voice
 
 
 @router.post("/voices/clone", response_model=Voice, status_code=status.HTTP_201_CREATED)
-async def clone_voice(payload: VoiceCloneIn, db: Session = Depends(get_db)) -> Voice:
+async def clone_voice(
+    payload: VoiceCloneIn,
+    ctx: AuthContext = Depends(require("admin")),
+    db: Session = Depends(get_scoped_db),
+) -> Voice:
     if payload.consent is None or not payload.consent.confirmed:
         raise HTTPException(status_code=422, detail="voice_consent_required")
     if len(payload.sample_reference) > 1024 or not SAMPLE_REFERENCE_RE.match(
@@ -165,7 +245,15 @@ async def clone_voice(payload: VoiceCloneIn, db: Session = Depends(get_db)) -> V
     consent["recorded_at"] = utcnow().isoformat()
     record = save_voice(
         db,
+        ctx,
         payload,
+        # Consent summary only: never the sample URL.
+        audit_metadata={
+            "consent": {
+                "method": payload.consent.method,
+                "subject_name": payload.consent.subject_name,
+            }
+        },
         source="clone",
         status="pending",
         sample_reference=payload.sample_reference,
@@ -178,10 +266,13 @@ async def clone_voice(payload: VoiceCloneIn, db: Session = Depends(get_db)) -> V
     "/voices/design", response_model=Voice, status_code=status.HTTP_201_CREATED
 )
 async def design_voice(
-    payload: VoiceDesignIn, db: Session = Depends(get_db)
+    payload: VoiceDesignIn,
+    ctx: AuthContext = Depends(require("admin")),
+    db: Session = Depends(get_scoped_db),
 ) -> Voice:
     record = save_voice(
         db,
+        ctx,
         payload,
         source="design",
         status="pending",
@@ -194,26 +285,42 @@ async def design_voice(
 async def list_voices(
     status: VoiceStatus | None = None,
     source: VoiceSource | None = None,
-    db: Session = Depends(get_db),
+    include_deleted: bool = False,
+    ctx: AuthContext = Depends(require("member")),
+    db: Session = Depends(get_scoped_db),
 ) -> list[Voice]:
-    query = db.query(VoiceRecord)
+    query = scoped(db, ctx, VoiceRecord)
+    # Tombstones are visible to admins only, and only when asked for.
+    if status != "deleted" and not (include_deleted and _is_admin(ctx)):
+        query = query.where(VoiceRecord.status != "deleted")
+    elif status == "deleted" and not _is_admin(ctx):
+        return []
     if status is not None:
-        query = query.filter(VoiceRecord.status == status)
+        query = query.where(VoiceRecord.status == status)
     if source is not None:
-        query = query.filter(VoiceRecord.source == source)
-    return [Voice.model_validate(item) for item in query.all()]
+        query = query.where(VoiceRecord.source == source)
+    return [Voice.model_validate(item) for item in db.scalars(query).all()]
 
 
 @router.get("/voices/{voice_id}", response_model=Voice)
-async def get_voice(voice_id: UUID, db: Session = Depends(get_db)) -> Voice:
-    return Voice.model_validate(get_voice_or_404(voice_id, db))
+async def get_voice(
+    voice_id: UUID,
+    ctx: AuthContext = Depends(require("member")),
+    db: Session = Depends(get_scoped_db),
+) -> Voice:
+    # Tombstones answer admins (id, status, consent, deleted_at) and 404 for members.
+    record = get_voice_or_404(voice_id, db, ctx, include_deleted=_is_admin(ctx))
+    return Voice.model_validate(record)
 
 
 @router.patch("/voices/{voice_id}", response_model=Voice)
 async def update_voice(
-    voice_id: UUID, payload: VoicePatch, db: Session = Depends(get_db)
+    voice_id: UUID,
+    payload: VoicePatch,
+    ctx: AuthContext = Depends(require("admin")),
+    db: Session = Depends(get_scoped_db),
 ) -> Voice:
-    record = get_voice_or_404(voice_id, db)
+    record = get_voice_or_404(voice_id, db, ctx)
     changes = payload.model_dump(exclude_unset=True, exclude_none=True)
     for key, value in changes.items():
         setattr(record, key, value)
@@ -224,9 +331,15 @@ async def update_voice(
 
 @router.post("/voices/{voice_id}/status", response_model=Voice)
 async def update_voice_status(
-    voice_id: UUID, payload: VoiceStatusIn, db: Session = Depends(get_db)
+    voice_id: UUID,
+    payload: VoiceStatusIn,
+    ctx: AuthContext = Depends(require_superadmin),
+    db: Session = Depends(get_scoped_db),
 ) -> Voice:
-    record = get_voice_or_404(voice_id, db)
+    record = get_voice_or_404(voice_id, db, ctx, include_deleted=True)
+    if record.source == "clone" and payload.provider_voice_id is not None:
+        # Clone ids come from provisioning only; never from a caller-supplied value.
+        raise HTTPException(status_code=422, detail={"code": "provider_voice_id_managed"})
     if payload.status not in TRANSITIONS.get(record.status, set()):
         raise HTTPException(status_code=409, detail="invalid_voice_status_transition")
     if record.status == "disabled" and not record.provider_voice_id:
@@ -235,19 +348,178 @@ async def update_voice_status(
     provider_voice_id = payload.provider_voice_id or record.provider_voice_id
     if payload.status == "ready" and not provider_voice_id:
         raise HTTPException(status_code=422, detail="provider_voice_id_required")
+    previous_status = record.status
     record.status = payload.status
     record.provider_voice_id = provider_voice_id
     record.failure_reason = payload.failure_reason if payload.status == "failed" else None
+    audit.record(
+        db,
+        ctx,
+        "voice.status_changed",
+        resource_type="voice",
+        resource_id=record.id,
+        metadata={"from": previous_status, "to": payload.status},
+    )
     db.commit()
     db.refresh(record)
     return Voice.model_validate(record)
 
 
+def _agents_using_voice(
+    db: Session, ctx: AuthContext, voice_id: str, provider_voice_id: str | None = None
+) -> list[str]:
+    """Ids of live (not archived/disabled) agents in the org that select this voice.
+
+    Agents select a voice either by profile (``voice_profile_id``) or by a raw
+    ``voice_id`` equal to the clone's ``provider_voice_id``; both count as in use.
+    """
+
+    selects = AgentRecord.voice_profile_id == voice_id
+    if provider_voice_id:
+        selects = or_(selects, AgentRecord.voice_id == provider_voice_id)
+    return list(
+        db.scalars(
+            scoped(db, ctx, AgentRecord).with_only_columns(AgentRecord.id).where(
+                selects, AgentRecord.status != "disabled"
+            )
+        )
+    )
+
+
+async def _delete_at_provider(
+    runtime_url: str, runtime_token: str, provider: str, provider_voice_id: str
+) -> tuple[bool, bool]:
+    """Ask Runtime to delete the provider voice. Returns ``(deleted, retryable)``.
+
+    Runtime answers 204 for success (including a provider-side 404, so retries are
+    idempotent); anything else is a failure.
+    """
+
+    url = (
+        f"{runtime_url.rstrip('/')}/voices/"
+        f"{quote(provider, safe='')}/{quote(provider_voice_id, safe='')}"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=PROVIDER_DELETE_TIMEOUT_SECONDS) as client:
+            response = await client.delete(url, headers={"X-Runtime-Token": runtime_token})
+    except httpx.HTTPError:
+        return False, True
+    if response.status_code in {200, 202, 204}:
+        return True, False
+    retryable = response.status_code >= 500
+    if response.status_code in {502, 503}:
+        try:
+            body = response.json()
+            if isinstance(body, dict) and isinstance(body.get("retryable"), bool):
+                retryable = body["retryable"] or response.status_code == 503
+        except ValueError:
+            pass
+    return False, retryable
+
+
 @router.delete("/voices/{voice_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_voice(voice_id: UUID, db: Session = Depends(get_db)) -> None:
-    record = get_voice_or_404(voice_id, db)
-    record.status = "disabled"
+async def delete_voice(
+    voice_id: UUID,
+    ctx: AuthContext = Depends(require("admin")),
+    db: Session = Depends(get_scoped_db),
+) -> Response:
+    """Hard delete: provider voice + stored audio are removed, consent is retained.
+
+    The row stays as a tombstone. A failed provider delete leaves the voice in
+    ``deleting`` (unusable) and the call can simply be repeated.
+    """
+
+    record = get_voice_or_404(voice_id, db, ctx, include_deleted=True)
+    if record.status == "deleted":
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    agent_ids = _agents_using_voice(db, ctx, record.id, record.provider_voice_id)
+    if agent_ids:
+        raise HTTPException(
+            status_code=409, detail={"code": "voice_in_use", "agent_ids": agent_ids}
+        )
+
+    now = utcnow()
+    provider_deleted = False
+    if record.provider_voice_id and record.source in {"clone", "design"}:
+        runtime_url = os.getenv("RUNTIME_API_URL")
+        runtime_token = os.getenv("PLATFORM_RUNTIME_TOKEN", "")
+        if not runtime_url or not runtime_token:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "runtime_unavailable",
+                    "message": "Runtime is not configured; the provider voice was not deleted.",
+                },
+            )
+        provider = _voice_provider(db, ctx, record)
+        provider_deleted, retryable = await _delete_at_provider(
+            runtime_url,
+            runtime_token,
+            (provider.provider if provider else None) or "cartesia",
+            record.provider_voice_id,
+        )
+        if not provider_deleted:
+            # Unusable from now on; retrying DELETE is safe and idempotent.
+            record.status = "deleting"
+            audit.record(
+                db,
+                ctx,
+                "voice.delete_failed",
+                resource_type="voice",
+                resource_id=record.id,
+                metadata={"source": record.source, "retryable": retryable},
+            )
+            db.commit()
+            raise HTTPException(
+                status_code=502,
+                detail={"code": "voice_provider_delete_failed", "retryable": retryable},
+            )
+
+    sample_deleted = False
+    if record.sample_reference:
+        sample_deleted = storage.delete(record.sample_reference) == "deleted"
+    storage.delete_prefix(f"voices/{record.id}/previews/")
+
+    record.sample_reference = None
+    record.design_prompt = None
+    record.provider_voice_id = None
+    record.style = {}
+    record.failure_reason = None
+    record.status = "deleted"
+    record.deleted_at = now
+    record.deleted_by = (ctx.key_id or ctx.principal)[:64]
+    if provider_deleted:
+        record.provider_deleted_at = now
+    if sample_deleted:
+        record.sample_deleted_at = now
+    audit.record(
+        db,
+        ctx,
+        "voice.deleted",
+        resource_type="voice",
+        resource_id=record.id,
+        metadata={
+            "source": record.source,
+            "provider_deleted": provider_deleted,
+            "sample_deleted": sample_deleted,
+        },
+    )
     db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+PROVIDER_DELETE_TIMEOUT_SECONDS = 20.0
+
+
+def _voice_provider(
+    db: Session, ctx: AuthContext, record: VoiceRecord
+) -> ProviderConfig | None:
+    if not record.tts_provider_id:
+        return None
+    return db.scalars(
+        scoped(db, ctx, ProviderConfig).where(ProviderConfig.id == record.tts_provider_id)
+    ).first()
 
 
 class VoicePreviewIn(BaseModel):
@@ -256,16 +528,15 @@ class VoicePreviewIn(BaseModel):
 
 @router.post("/voices/{voice_id}/preview")
 async def preview_voice(
-    voice_id: UUID, payload: VoicePreviewIn, db: Session = Depends(get_db)
+    voice_id: UUID,
+    payload: VoicePreviewIn,
+    ctx: AuthContext = Depends(require("member")),
+    db: Session = Depends(get_scoped_db),
 ) -> Response:
-    record = get_voice_or_404(voice_id, db)
+    record = get_voice_or_404(voice_id, db, ctx)
     if record.status != "ready" or not record.provider_voice_id:
         raise HTTPException(status_code=409, detail="voice_not_ready")
-    provider = (
-        db.get(ProviderConfig, record.tts_provider_id)
-        if record.tts_provider_id
-        else None
-    )
+    provider = _voice_provider(db, ctx, record)
     runtime_url = os.getenv("RUNTIME_API_URL")
     if not runtime_url:
         raise HTTPException(status_code=503, detail="runtime_not_configured")
@@ -296,6 +567,15 @@ async def preview_voice(
         raise HTTPException(status_code=502, detail="voice_preview_failed") from exc
     if not audio:
         raise HTTPException(status_code=502, detail="voice_preview_failed")
+    audit.record(
+        db,
+        ctx,
+        "voice.previewed",
+        resource_type="voice",
+        resource_id=record.id,
+        metadata={"text_length": len(payload.text)},
+    )
+    db.commit()
     return Response(content=audio, media_type="audio/wav")
 
 
@@ -347,10 +627,14 @@ def _is_stale_processing(record: VoiceRecord) -> bool:
 
 
 @router.post("/voices/{voice_id}/provision", response_model=Voice)
-async def provision_voice(voice_id: UUID, db: Session = Depends(get_db)) -> Voice:
+async def provision_voice(
+    voice_id: UUID,
+    ctx: AuthContext = Depends(require("admin")),
+    db: Session = Depends(get_scoped_db),
+) -> Voice:
     """Clone a consented sample at the TTS provider via Runtime (Platform never touches audio)."""
 
-    record = get_voice_or_404(voice_id, db)
+    record = get_voice_or_404(voice_id, db, ctx)
     if record.source != "clone" or not (
         record.status in {"pending", "failed"} or _is_stale_processing(record)
     ):
@@ -367,11 +651,7 @@ async def provision_voice(voice_id: UUID, db: Session = Depends(get_db)) -> Voic
     runtime_token = os.getenv("PLATFORM_RUNTIME_TOKEN", "")
     if not runtime_token:
         raise HTTPException(status_code=503, detail="runtime_auth_not_configured")
-    provider = (
-        db.get(ProviderConfig, record.tts_provider_id)
-        if record.tts_provider_id
-        else None
-    )
+    provider = _voice_provider(db, ctx, record)
     language = _clone_language(record.languages)
     if language is None:
         raise HTTPException(status_code=422, detail="invalid_voice_language")
@@ -410,11 +690,27 @@ async def provision_voice(voice_id: UUID, db: Session = Depends(get_db)) -> Voic
     if provider_voice_id is None:
         record.status = "failed"
         record.failure_reason = failure_reason
+        audit.record(
+            db,
+            ctx,
+            "voice.provision_failed",
+            resource_type="voice",
+            resource_id=record.id,
+            metadata={"source": record.source, "failure_reason": failure_reason},
+        )
         db.commit()
         raise HTTPException(status_code=502, detail="voice_provisioning_failed")
     record.status = "ready"
     record.provider_voice_id = provider_voice_id
     record.failure_reason = None
+    audit.record(
+        db,
+        ctx,
+        "voice.provisioned",
+        resource_type="voice",
+        resource_id=record.id,
+        metadata={"source": record.source},
+    )
     db.commit()
     db.refresh(record)
     return Voice.model_validate(record)

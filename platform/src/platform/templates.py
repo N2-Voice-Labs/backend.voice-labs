@@ -7,8 +7,9 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from .db import get_db
+from .context import AuthContext, require
 from .models import Agent as AgentRecord
+from .tenancy import get_scoped_db
 
 router = APIRouter(tags=["templates"])
 
@@ -92,13 +93,17 @@ class AgentFromTemplateResponse(BaseModel):
 
 
 @router.get("/agent-templates")
-async def list_agent_templates() -> list[AgentTemplateResponse]:
+async def list_agent_templates(
+    ctx: AuthContext = Depends(require("member")),
+) -> list[AgentTemplateResponse]:
     """List all available agent templates."""
     return [AgentTemplateResponse(**template) for template in AGENT_TEMPLATES.values()]
 
 
 @router.get("/agent-templates/{key}")
-async def get_agent_template(key: str) -> AgentTemplateResponse:
+async def get_agent_template(
+    key: str, ctx: AuthContext = Depends(require("member"))
+) -> AgentTemplateResponse:
     """Get a specific agent template by key."""
     if key not in AGENT_TEMPLATES:
         raise HTTPException(
@@ -113,7 +118,8 @@ async def get_agent_template(key: str) -> AgentTemplateResponse:
 async def create_agent_from_template(
     key: str,
     overrides: AgentFromTemplateIn,
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_scoped_db),
+    ctx: AuthContext = Depends(require("admin")),
 ) -> AgentFromTemplateResponse:
     """Create an agent from a template with optional overrides."""
     if key not in AGENT_TEMPLATES:
@@ -149,6 +155,7 @@ async def create_agent_from_template(
         system_prompt=system_prompt,
         enabled_languages=enabled_languages,
         status="enabled",
+        organization_id=ctx.org_id,
     )
 
     db.add(agent)
