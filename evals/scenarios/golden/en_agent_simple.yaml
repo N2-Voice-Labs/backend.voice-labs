@@ -1,0 +1,18 @@
+id: en_agent_simple
+mode: agent
+description: >
+  Smoke test of the plain agent path: an English caller asks about an appointment and the
+  agent must answer (audibly and in the transcript) in English within a few seconds.
+agent_config:
+  system_prompt: >
+    You are a concise receptionist at a medical clinic. Answer in English in one or two short
+    sentences.
+  enabled_languages: [en, ru]
+audio:
+  - en-ru-01   # "Good morning, I have an appointment with the doctor at ten thirty."
+expect:
+  min_replies: 1
+  reply_language: en
+  max_reply_latency_ms: 3000
+  min_heard_ratio: 1.0
+enforce: false

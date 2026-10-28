@@ -1,0 +1,26 @@
+id: ko_en_interpreter_two_way
+mode: interpreter
+description: >
+  Two-person Korean <-> English call on the cascaded engine. Korean is not in Deepgram's
+  code-switching set, so direction "auto" is invalid; the lanes are explicit instead: the
+  Korean caller (speaker 0) is heard in English by the guest, and the English guest
+  (speaker 1) is heard in Korean by the caller. The reverse lane is UNVERIFIED with
+  direction one_way (the Runtime may only translate languages[0] -> languages[1]); a
+  failing reverse lane is a finding, which is why the scenario is report-only.
+agent_config:
+  interpreter:
+    languages: [ko, en]
+    direction: one_way
+    engine: cascaded
+    latency_mode: balanced
+two_person: true
+audio:
+  - {ref: ko-en-01, speaker: 0}   # 안녕하세요, 비자 연장 때문에 예약하고 싶은데요.
+  - {ref: en-ko-01, speaker: 1}   # Hello, I would like to make an appointment with a doctor ...
+  - {ref: ko-en-02, speaker: 0}
+  - {ref: en-ko-02, speaker: 1}
+expect:
+  min_replies: 4
+  min_heard_ratio: 0.75
+  max_p95_ms: 2500   # after the end of the speaker's utterance (cascaded target is 1.5 s p95)
+enforce: false

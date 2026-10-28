@@ -1,0 +1,19 @@
+id: en_ru_code_switch_agent
+mode: agent
+description: >
+  Russian sentences with English words ("Мне нужно book an appointment на завтра"). The agent
+  must understand them and answer in Russian (Cyrillic-dominant reply).
+agent_config:
+  system_prompt: >
+    You are a concise receptionist at a medical clinic. Callers mix Russian and English.
+    Answer in Russian; English words the caller used may stay in English.
+  enabled_languages: [en, ru]
+audio:
+  - mixed-01   # "Мне нужно book an appointment на завтра утром."
+  - mixed-04   # "Я забыл password от личного кабинета, как сделать reset?"
+expect:
+  min_replies: 2
+  reply_language: ru
+  max_reply_latency_ms: 3500
+  min_heard_ratio: 1.0
+enforce: false

@@ -1,0 +1,48 @@
+id: ru_en_interpreter_accurate
+mode: interpreter
+description: >
+  Russian -> English interpretation in latency mode "accurate" over 30 utterances (the 20
+  ru-en items plus the 10 Russian-with-English mixed items). At most one of 30 may go
+  untranslated: 29/30 = 0.966.
+agent_config:
+  interpreter:
+    languages: [ru, en]
+    direction: one_way
+    engine: cascaded
+    latency_mode: accurate
+audio:
+  - ru-en-01
+  - ru-en-02
+  - ru-en-03
+  - ru-en-04
+  - ru-en-05
+  - ru-en-06
+  - ru-en-07
+  - ru-en-08
+  - ru-en-09
+  - ru-en-10
+  - ru-en-11
+  - ru-en-12
+  - ru-en-13
+  - ru-en-14
+  - ru-en-15
+  - ru-en-16
+  - ru-en-17
+  - ru-en-18
+  - ru-en-19
+  - ru-en-20
+  - mixed-01
+  - mixed-02
+  - mixed-03
+  - mixed-04
+  - mixed-05
+  - mixed-06
+  - mixed-07
+  - mixed-08
+  - mixed-09
+  - mixed-10
+expect:
+  reply_language: en
+  min_heard_ratio: 0.966
+  max_p95_ms: 3000   # after the end of speech; "accurate" trades latency for quality
+enforce: false

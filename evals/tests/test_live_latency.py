@@ -207,6 +207,15 @@ def test_stage_breakdown_and_overlap_check() -> None:
     stages = live.stage_summary(server)
     assert stages["vad"] == {"count": 2, "p50": 0.2, "p95": 0.25}
     assert "first_transcript" not in stages
+    split = live.stage_summary({"marks": {
+        "translation_start": {"count": 2, "p50": 2600, "p95": 2900},
+        "translation_first_token": {"count": 2, "p50": 3000, "p95": 3300},
+        "translation_first_chunk": {"count": 2, "p50": 3100, "p95": 3400},
+        "tts_request": {"count": 2, "p50": 3100, "p95": 3400},
+        "first_audio": {"count": 2, "p50": 3700, "p95": 4000}}})
+    assert list(split) == ["translation_start", "translation_first_token",
+                           "translation_first_chunk", "tts_request", "first_audio"]
+    assert split["translation_first_token"] == {"count": 2, "p50": 3.0, "p95": 3.3}
     results = [
         {"speech_start_s": 1.0, "heard_start_s": 4.0},
         {"speech_start_s": 3.0, "heard_start_s": 3.5},   # heard before the next utterance? no
@@ -218,3 +227,8 @@ def test_stage_breakdown_and_overlap_check() -> None:
     report = live.build_report([live.summarize_cell(
         live.Cell("cascaded", "balanced", "one_way", "ko-en"), "cascaded", [], {"cascaded": server})], {})
     assert "## Where the time goes" in report and "T3 translation start" in report
+    for label in ("LLM first token", "First chunk to TTS", "TTS request", "T4 first audio"):
+        assert label in report
+    assert report.index("T3 translation start") < report.index("LLM first token") < report.index(
+        "First chunk to TTS"
+    ) < report.index("TTS request") < report.index("T4 first audio")

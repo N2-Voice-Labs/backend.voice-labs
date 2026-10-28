@@ -12,6 +12,7 @@ are stored in git.**
 | Metrics: WER, code-switch WER, CER, chrF, terminology recall, p50/p95 | `src/evals/metrics.py` |
 | Runner: `stt`, `translate`, `cascade` | `src/evals/run.py` |
 | Live latency report (p50/p95 per engine and mode, NS-01) | `src/evals/live_latency.py` |
+| Golden-path suite (end-to-end scenarios, ST-03) | `src/evals/golden/`, `scenarios/golden/*.yaml` |
 
 Run everything from this directory (`evals/`). The commands below use the workspace
 Python (`~/.venvs/voice-labs/bin/python`, which has `httpx`); the tests and the generator
@@ -110,6 +111,45 @@ python -m src.evals.live_latency --platform http://localhost:8300 --confirm-bill
 Needs `livekit` and `httpx` (the workspace Python). The unit tests cover the plan, speech
 and onset detection, percentiles and the report with no network. See the module docstring
 and `stack.voice-labs/docs/evaluation.md`.
+
+## Golden-path suite (billable, needs running servers)
+
+A handful of end-to-end scenarios against a running Platform + Runtime + LiveKit stack: an
+agent answers in the caller's language, a code-switched call, a Korean-English and a
+Russian-English interpreter call, a glossary term, a deliberately failing provider and a
+tool call. Each scenario is a YAML file in `scenarios/golden/` (schema and field docs in
+`src/evals/golden/scenarios.py`); it creates an agent through the Platform API, plays dataset
+audio through a fake microphone, then reads transcripts (`GET /conversations/{id}/messages`)
+and runtime events (`/runtime-state`) back and scores them: reply heard, reply latency,
+p95, reply language (script heuristic for en/ru/ko), heard ratio, glossary terms, provider
+error / session failed, tool called. Every scenario starts as `enforce: false`: it is
+reported but never fails the run. Set `enforce: true` once the numbers are stable.
+
+```bash
+python -m src.evals.golden --dry-run                              # plan and skip reasons, no network
+python -m src.evals.golden --platform http://localhost:8300 --confirm-billable \
+    [--only ru_agent_reply_language] [--report-dir DIR]          # default ~/.cache/voice-labs-evals/golden/<run-id>
+```
+
+Writes `report.json` and `report.md`; exit code 1 only if an **enforced** scenario failed
+(2 for setup errors, 0 otherwise). Without `--confirm-billable` it only prints the plan.
+Scenarios are YAML (needs PyYAML, present in the workspace Python) or JSON. Audio entries are
+dataset v1 ids (render them first with `generate_audio`), `human_v1:<name>`, or wav paths.
+
+| Env var | Effect |
+|---|---|
+| `VL_API`, `PLATFORM_API_KEY` | Platform URL and admin key (same as `live_latency`) |
+| `EVALS_HUMAN_AUDIO_DIR` | folder of consented human recordings; scenarios using `human_v1:<name>` are skipped while it is unset or the file is missing |
+| `EVALS_TOOL_SERVER_URL` | `tool_call` is skipped without it (placeholder: attaching the tool to the agent is not implemented yet) |
+| `EVALS_PROVIDER_DOWN_CONFIRMED` | `provider_down` is skipped without it; set it only when the Runtime was started with a deliberately invalid provider key, otherwise the scenario cannot pass |
+| `EVALS_DISCORD_WEBHOOK_URL` | post a short summary to this Discord webhook after the run (never printed or written to the report) |
+
+Intent: run the suite nightly (and before releases) from a machine that has the stack, keep
+the Markdown report as the history, and promote a scenario to `enforce: true` once it has
+been green for a week. There is no CI or scheduler for it yet. Dataset v1 is synthetic
+(macOS `say`), so latency and language results are regression signals, not human-speech
+accuracy; add `human_v1` recordings later. The unit tests (`tests/test_golden_*.py`) use a
+fake Platform and fake audio driver and need no network.
 
 ## Add real, consented recordings later
 

@@ -286,7 +286,10 @@ def pick_timeline(timeline: dict[str, Any], engine: str) -> dict[str, Any] | Non
 
 # Runtime timeline marks (ms after T0, see runtime/timeline.py) in pipeline order.
 STAGE_MARKS = (("vad", "T1 VAD"), ("first_transcript", "T2 first transcript"),
-               ("translation_start", "T3 translation start"), ("first_audio", "T4 first audio"),
+               ("translation_start", "T3 translation start"),
+               ("translation_first_token", "LLM first token"),
+               ("translation_first_chunk", "First chunk to TTS"),
+               ("tts_request", "TTS request"), ("first_audio", "T4 first audio"),
                ("stable", "T5 stable"))
 
 
@@ -404,8 +407,11 @@ def build_report(rows: list[dict[str, Any]], meta: dict[str, Any]) -> str:
         "Seconds after the speaker started (T0), p50 / p95 over the cell's utterances, from the "
         "Runtime's `utterance_timeline` marks. Compare T3 with the speech length: for the "
         "cascaded engine, T3 minus speech length is the end-of-turn wait plus the final "
-        "transcript; T4 minus T3 is translation plus first TTS audio. The realtime engine does "
-        "not report T2/T3. *Overlapping* counts utterances whose heard translation started "
+        "transcript; T4 minus T3 is translation plus first TTS audio, split by the columns "
+        "between them: *LLM first token* minus T3 is the LLM time to first token, *First chunk "
+        "to TTS* minus *LLM first token* is the chunking wait, and T4 minus *TTS request* is the "
+        "TTS time to first byte (cascaded engine only). The realtime engine does "
+        "not report T2/T3 or these. *Overlapping* counts utterances whose heard translation started "
         "before the utterance or after the next one began (their numbers are unreliable).\n\n"
         "Seconds. *Runtime* is the Platform's p50/p95 of `utterance_timeline` T4 - T0 (nearest "
         "rank). *Heard* is measured on the received translation track (linear interpolation), "

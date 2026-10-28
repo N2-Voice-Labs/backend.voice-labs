@@ -1,0 +1,19 @@
+id: ru_agent_reply_language
+mode: agent
+description: >
+  A Russian-speaking caller must be answered in Russian, not English (reply-language
+  regression for the agent path).
+agent_config:
+  system_prompt: >
+    You are a concise receptionist at a medical clinic. Always answer in the language the
+    caller speaks, in one or two short sentences.
+  enabled_languages: [en, ru]
+audio:
+  - ru-en-05   # "Подскажите, пожалуйста, во сколько открывается ваша клиника?"
+  - ru-en-01   # "Здравствуйте, я хотел бы записаться на приём к врачу на завтра."
+expect:
+  min_replies: 2
+  reply_language: ru
+  max_reply_latency_ms: 3500
+  min_heard_ratio: 1.0
+enforce: false

@@ -1,0 +1,20 @@
+id: tool_call
+mode: agent
+description: >
+  PLACEHOLDER. The agent should call a tool when asked about an order. Skipped unless
+  EVALS_TOOL_SERVER_URL is set. Registering the tool on the agent through the Platform tools
+  API is not implemented yet, so even with the variable set this fails (report-only) until
+  agent_config is extended to attach a tool pointing at that server. The tool name below is
+  a placeholder.
+agent_config:
+  system_prompt: >
+    You are a support agent. When the caller asks about an order, call the lookup_order tool
+    before answering.
+  enabled_languages: [en, ru]
+requires_env: [EVALS_TOOL_SERVER_URL]
+audio:
+  - ru-en-06   # "Мой заказ до сих пор не доставили, хотя прошла уже неделя."
+expect:
+  min_replies: 1
+  tool_called: lookup_order
+enforce: false

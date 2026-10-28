@@ -1,0 +1,20 @@
+id: provider_down
+mode: agent
+description: >
+  Failure path: with a provider that cannot work, the session must fail visibly
+  (SessionFailed / RuntimeFailed event, failed session status, or the Platform answering 503
+  runtime_unavailable) instead of hanging silently.
+
+  THIS SCENARIO NEEDS A DELIBERATELY BROKEN STACK. Start the Runtime with an invalid key for
+  one provider (for example DEEPGRAM_API_KEY=invalid in the Runtime's environment, never in
+  git), then export EVALS_PROVIDER_DOWN_CONFIRMED=1 for the evals run. Without the variable it
+  is skipped, because on a healthy stack it would always fail.
+agent_config:
+  system_prompt: You are a concise receptionist.
+  enabled_languages: [en, ru]
+requires_env: [EVALS_PROVIDER_DOWN_CONFIRMED]
+audio:
+  - en-ru-01
+expect:
+  expect_session_failed: true
+enforce: false

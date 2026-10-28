@@ -1,0 +1,22 @@
+id: glossary_term
+mode: interpreter
+description: >
+  The glossary must win over the model's own wording: "residence permit" is rendered as
+  "вид на жительство" when interpreting English to Russian.
+agent_config:
+  interpreter:
+    languages: [en, ru]
+    direction: one_way
+    engine: cascaded
+    latency_mode: balanced
+    glossary:
+      - source: residence permit
+        translations: {ru: вид на жительство}
+audio:
+  - en-ru-02       # "I would like to extend my residence permit for another year."
+  - domain-terms-03
+expect:
+  reply_language: ru
+  glossary_terms: ["вид на жительство"]
+  min_heard_ratio: 1.0
+enforce: false
