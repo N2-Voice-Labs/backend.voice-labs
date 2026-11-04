@@ -5,7 +5,8 @@ import pytest
 pytest.importorskip("pipecat")
 
 from src.runtime import speech_providers
-from src.runtime.pipeline import PipelineConfig
+from src.runtime import pipeline as pipeline_module
+from src.runtime.pipeline import PipelineConfig, register_tts_credentials
 from src.runtime.speech_providers import (
     build_llm,
     build_stt,
@@ -51,7 +52,7 @@ def restore_registries():
     """Undo any ``register_*`` made by a test (factories, settings and capabilities)."""
 
     tables = [*speech_providers._REGISTRIES.values(), speech_providers._SETTING_TYPES,
-              speech_providers._CAPABILITIES]
+              speech_providers._CAPABILITIES, pipeline_module._TTS_CREDENTIALS]
     saved = [dict(table) for table in tables]
     yield
     for table, snapshot in zip(tables, saved):
@@ -84,11 +85,30 @@ def test_session_start_rejects_unknown_providers_and_follows_the_registry(
         "CARTESIA_VOICE_ID": "voice",
     }.items():
         monkeypatch.setenv(key, value)
-    with pytest.raises(RuntimeError, match="unsupported tts provider: elevenlabs"):
-        PipelineConfig.from_environment({"providers": {"tts": "elevenlabs"}})
-    register_tts("elevenlabs", lambda config, settings, **extra: None)
-    config = PipelineConfig.from_environment({"providers": {"tts": "elevenlabs"}})
-    assert config.providers["tts"] == "elevenlabs"
+    with pytest.raises(RuntimeError, match="unsupported tts provider: espeak"):
+        PipelineConfig.from_environment({"providers": {"tts": "espeak"}})
+    register_tts("espeak", lambda config, settings, **extra: None)
+    # Registered but without a credential mapping: fail closed, never borrow cartesia's.
+    with pytest.raises(RuntimeError, match="tts provider has no credential mapping: espeak"):
+        PipelineConfig.from_environment({"providers": {"tts": "espeak"}})
+    register_tts_credentials("espeak", ())
+    config = PipelineConfig.from_environment({"providers": {"tts": "espeak"}})
+    assert config.providers["tts"] == "espeak"
+    # Explicitly credential-less: no cartesia fallback through the accessors.
+    assert config.tts_api_key == ""
+    assert config.tts_voice_id == ""
+
+
+def test_register_tts_credentials_validates_fields_and_unmapped_accessors_are_empty(
+    restore_registries,
+) -> None:
+    with pytest.raises(ValueError):
+        register_tts_credentials("x", ("openai_api_key",))
+    with pytest.raises(ValueError):
+        register_tts_credentials("x", ("cartesia_api_key", "cartesia_voice_id", "elevenlabs_api_key"))
+    config = _config(providers={"stt": "deepgram", "llm": "openai", "tts": "unmapped"})
+    assert config.tts_api_key == ""
+    assert config.tts_voice_id == ""
 
 
 def test_deepgram_factory_builds_the_service_with_the_session_settings(monkeypatch) -> None:
@@ -255,6 +275,7 @@ def test_provider_settings_keys_follow_the_registered_provider(
         lambda config, settings, **extra: None,
         settings={"model": str, "stability": (int, float)},
     )
+    register_tts_credentials("fake", ())
     config = PipelineConfig.from_environment(
         {
             "providers": {"tts": "fake"},
@@ -323,6 +344,7 @@ def fake_providers(restore_registries):
     register_stt("fake", stt, settings={"model": str, "language": str}, features=("keyterms",))
     register_llm("fake", llm, settings={"model": str})
     register_tts("fake", tts, settings={"language": str})
+    register_tts_credentials("fake", ())
     return calls
 
 
@@ -425,3 +447,108 @@ def test_pipelines_fail_for_unregistered_provider_before_building(light_models) 
     config = _config(providers={"stt": "whisper", "llm": "openai", "tts": "cartesia"})
     with pytest.raises(RuntimeError, match="unsupported stt provider: whisper"):
         build_livekit_pipeline(config)
+
+
+# -- the interpreter never uses the agent system prompt ----------------------------------
+
+_SECRET_PROMPT = "SECRET-AGENT-PROMPT-DO-NOT-USE"
+
+
+def _spy_translators(monkeypatch):
+    """Record every message list handed to a translator, with no network involved."""
+
+    from src.runtime import interpreter
+
+    seen: list[list[dict[str, str]]] = []
+
+    class FakeClient:
+        class chat:
+            class completions:
+                @staticmethod
+                async def create(**kwargs):
+                    seen.append(kwargs["messages"])
+                    raise AssertionError("stop")
+
+    original = interpreter.OpenAITranslator.__init__
+
+    def init(self, **kwargs):
+        original(self, **{**kwargs, "client": FakeClient()})
+
+    monkeypatch.setattr(interpreter.OpenAITranslator, "__init__", init)
+    return seen
+
+
+def _translators(worker):
+    from src.runtime.interpreter import TranslationProcessor
+
+    return [p for p in _inner(worker) if isinstance(p, TranslationProcessor)]
+
+
+def _assert_prompt_unused(fake_providers, worker, seen) -> None:
+    import asyncio
+
+    from src.runtime.interpreter import build_translation_messages
+
+    # The LLM registry entry (fake_providers) was never asked for a service.
+    assert "llm" not in [c[0] for c in fake_providers]
+    # No factory call (stt/tts settings and extras) mentions the prompt.
+    assert _SECRET_PROMPT not in repr(fake_providers)
+    processors = _translators(worker)
+    assert processors
+    for processor in processors:
+        async def run():
+            async for _ in processor._translate(build_translation_messages("hello", "en", "ko")):
+                pass
+
+        with pytest.raises(AssertionError):
+            asyncio.run(run())
+    assert seen and _SECRET_PROMPT not in repr(seen)
+
+
+def test_cascaded_interpreter_ignores_agent_system_prompt(
+    light_models, fake_providers, monkeypatch
+) -> None:
+    from src.runtime import pipeline
+
+    seen = _spy_translators(monkeypatch)
+    llm_calls: list[tuple] = []
+    monkeypatch.setattr(pipeline, "build_llm", lambda *a, **k: llm_calls.append(a))
+    config = _fake_config(
+        mode="interpreter",
+        interpreter={"languages": ["en", "ru"], "direction": "auto"},
+        system_instruction=_SECRET_PROMPT,
+    )
+    _, worker = pipeline.build_livekit_pipeline(config)
+
+    assert llm_calls == []
+    _assert_prompt_unused(fake_providers, worker, seen)
+
+
+def test_two_participant_interpreter_ignores_agent_system_prompt(
+    light_models, fake_providers, monkeypatch
+) -> None:
+    from uuid import uuid4
+
+    from src.runtime import pipeline
+    from src.runtime.participants import ParticipantDirectory
+    from src.runtime.session import RuntimeSession
+
+    seen = _spy_translators(monkeypatch)
+    llm_calls: list[tuple] = []
+    monkeypatch.setattr(pipeline, "build_llm", lambda *a, **k: llm_calls.append(a))
+    participants = {
+        "alice": {"language": "en", "voice_id": "v-a"},
+        "bob": {"language": "ko", "voice_id": "v-b"},
+    }
+    config = _fake_config(
+        mode="interpreter",
+        interpreter={"languages": ["en", "ko"], "direction": "one_way"},
+        participants=participants,
+        system_instruction=_SECRET_PROMPT,
+    )
+    session = RuntimeSession(uuid4(), uuid4(), uuid4())
+    session.participants = ParticipantDirectory.from_mapping(("en", "ko"), participants)
+    _, worker = pipeline.build_livekit_pipeline(config, session)
+
+    assert llm_calls == []
+    _assert_prompt_unused(fake_providers, worker, seen)

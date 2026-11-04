@@ -185,6 +185,26 @@ def get_owned(
     return row
 
 
+def get_public_agent(
+    db: Session, ctx: "AuthContext", agent_id: Any, *, allow_system: bool = False
+) -> Any:
+    """Agent by id within ``ctx.org_id``; 404 ``agent_not_found`` when missing, foreign
+    *or* system-managed (the hidden interpreter agents behind ``/translations``).
+
+    ``allow_system`` is only for in-process callers that created the hidden agent.
+    """
+
+    from .models import Agent
+
+    stmt = scoped(db, ctx, Agent).where(Agent.id == str(agent_id))
+    if not allow_system:
+        stmt = stmt.where(Agent.system.is_(False))
+    row = db.scalars(stmt).first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="agent_not_found")
+    return row
+
+
 def link_check(ctx: "AuthContext", *rows: Any) -> None:
     """Assert every linked row belongs to ``ctx.org_id`` (e.g. agent_id on a campaign).
 

@@ -1,5 +1,6 @@
 import asyncio
 import hmac
+import logging
 import os
 import re
 from collections import OrderedDict
@@ -74,6 +75,8 @@ async def lifespan(_: FastAPI):
     if tasks:
         await asyncio.gather(*(task for _, task in tasks), return_exceptions=True)
 
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Voice Labs Runtime", version="0.1.0", lifespan=lifespan)
 
@@ -253,10 +256,25 @@ async def start_session(
         or not hmac.compare_digest(x_runtime_token, expected)
     ):
         raise HTTPException(status_code=401, detail="invalid_runtime_token")
+    # An ElevenLabs voice id goes into a URL path; refuse an unsafe default voice here,
+    # before anything is stored or started, instead of failing once the pipeline is built.
+    if (
+        payload.providers.get("tts") == "elevenlabs"
+        and payload.voice_id
+        and not _VOICE_ID_RE.fullmatch(payload.voice_id)
+    ):
+        raise HTTPException(status_code=422, detail="invalid_voice_id")
     key = str(payload.session_id)
     session_status = _session_states.get(key)
     if session_status in _TERMINAL_SESSION_STATES:
         return {"status": "already_finished", "session_status": session_status}
+    if "mode" not in payload.model_fields_set:
+        # An omitted mode silently becomes an answering AI agent; a translation session
+        # that lost its mode would talk back instead of interpreting. Platform always
+        # sends it, so this points at a misbehaving caller.
+        logger.warning(
+            "session %s started without an explicit mode; defaulting to 'agent'", key
+        )
     if payload.private_listening and not payload.participants:
         raise HTTPException(status_code=422, detail="private_listening_requires_participants")
     directory: ParticipantDirectory | None = None

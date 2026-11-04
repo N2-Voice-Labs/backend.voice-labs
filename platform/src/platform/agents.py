@@ -19,7 +19,7 @@ from sqlalchemy import select
 from .context import AuthContext, require
 from .models import Agent as AgentRecord
 from .models import ProviderConfig, Voice
-from .tenancy import bypass, get_owned, get_scoped_db, scoped
+from .tenancy import bypass, get_owned, get_public_agent, get_scoped_db, scoped
 from .validation import (
     AUTO_DIRECTION_LANGUAGES,
     DEFAULT_LATENCY_MODE,
@@ -421,7 +421,9 @@ async def list_agents(
 ) -> list[Agent]:
     return [
         agent_response(agent)
-        for agent in db.scalars(scoped(db, ctx, AgentRecord)).all()
+        for agent in db.scalars(
+            scoped(db, ctx, AgentRecord).where(AgentRecord.system.is_(False))
+        ).all()
     ]
 
 
@@ -431,9 +433,7 @@ async def get_agent(
     db: Session = Depends(get_scoped_db),
     ctx: AuthContext = Depends(require("member")),
 ) -> Agent:
-    record = get_owned(
-        db, ctx, AgentRecord, str(agent_id), not_found_detail="agent_not_found"
-    )
+    record = get_public_agent(db, ctx, agent_id)
     return agent_response(record)
 
 
@@ -444,9 +444,7 @@ async def update_agent(
     db: Session = Depends(get_scoped_db),
     ctx: AuthContext = Depends(require("admin")),
 ) -> Agent:
-    record = get_owned(
-        db, ctx, AgentRecord, str(agent_id), not_found_detail="agent_not_found"
-    )
+    record = get_public_agent(db, ctx, agent_id)
 
     changes = provider_ids_for_agent(
         payload.model_dump(exclude_unset=True), db, ctx=ctx
@@ -478,9 +476,7 @@ async def delete_agent(
     db: Session = Depends(get_scoped_db),
     ctx: AuthContext = Depends(require("admin")),
 ) -> None:
-    record = get_owned(
-        db, ctx, AgentRecord, str(agent_id), not_found_detail="agent_not_found"
-    )
+    record = get_public_agent(db, ctx, agent_id)
     record.status = "disabled"
     db.commit()
 

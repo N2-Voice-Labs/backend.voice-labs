@@ -118,7 +118,9 @@ async def create_deployment(
     # Org-scoped lookup: another organisation's agent is indistinguishable from a
     # nonexistent one (both 422 invalid_agent_id).
     agent = db.scalars(
-        scoped(db, ctx, AgentRecord).where(AgentRecord.id == str(payload.agent_id))
+        scoped(db, ctx, AgentRecord).where(
+            AgentRecord.id == str(payload.agent_id), AgentRecord.system.is_(False)
+        )
     ).first()
     if agent is None or agent.status == "disabled":
         raise HTTPException(status_code=422, detail="invalid_agent_id")

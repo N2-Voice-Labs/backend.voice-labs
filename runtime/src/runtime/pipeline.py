@@ -17,6 +17,30 @@ from .speech_providers import (
 )
 
 
+# TTS provider -> the PipelineConfig credential fields it needs.
+_TTS_CREDENTIALS: dict[str, tuple[str, ...]] = {
+    "cartesia": ("cartesia_api_key", "cartesia_voice_id"),
+    "elevenlabs": ("elevenlabs_api_key", "elevenlabs_voice_id"),
+}
+_KNOWN_TTS_FIELDS = frozenset(
+    {"cartesia_api_key", "cartesia_voice_id", "elevenlabs_api_key", "elevenlabs_voice_id"}
+)
+
+
+def register_tts_credentials(name: str, fields: tuple[str, ...] = ()) -> None:
+    """Declare which PipelineConfig fields a TTS provider uses: ``(api_key_field, voice_field)``.
+
+    A registered TTS provider MUST be declared here (session start fails closed otherwise).
+    ``()`` is the explicit declaration that the provider needs no credentials and no default
+    voice; ``tts_api_key`` / ``tts_voice_id`` are then ``""``.
+    """
+
+    fields = tuple(fields)
+    if len(fields) > 2 or not set(fields) <= _KNOWN_TTS_FIELDS:
+        raise ValueError(f"tts credential fields must be up to two of {sorted(_KNOWN_TTS_FIELDS)}")
+    _TTS_CREDENTIALS[name] = fields
+
+
 @dataclass(frozen=True)
 class PipelineConfig:
     livekit_url: str
@@ -48,6 +72,26 @@ class PipelineConfig:
     # Agent + translator (TR-040): {working_language, caller_languages}. None keeps the
     # ordinary agent pipeline.
     translation: dict[str, Any] | None = None
+    # ElevenLabs credentials/default voice (ELEVENLABS_API_KEY / ELEVENLABS_VOICE_ID). Only
+    # required when providers["tts"] == "elevenlabs"; the cartesia_* fields keep their names
+    # and env vars so existing constructors and stored contracts do not change.
+    elevenlabs_api_key: str = ""
+    elevenlabs_voice_id: str = ""
+
+    @property
+    def tts_api_key(self) -> str:
+        """API key of the selected TTS provider (``providers["tts"]``)."""
+
+        # Unmapped / credential-less providers yield "" (never another provider's key).
+        fields = _TTS_CREDENTIALS.get(self.providers.get("tts", "cartesia"), ())
+        return getattr(self, fields[0]) if fields else ""
+
+    @property
+    def tts_voice_id(self) -> str:
+        """Default voice of the selected TTS provider (a session ``voice_id`` already replaced it)."""
+
+        fields = _TTS_CREDENTIALS.get(self.providers.get("tts", "cartesia"), ())
+        return getattr(self, fields[1]) if len(fields) > 1 else ""
 
     @classmethod
     def from_environment(
@@ -62,24 +106,31 @@ class PipelineConfig:
             "openai_api_key": "OPENAI_API_KEY",
             "cartesia_api_key": "CARTESIA_API_KEY",
             "cartesia_voice_id": "CARTESIA_VOICE_ID",
+            "elevenlabs_api_key": "ELEVENLABS_API_KEY",
+            "elevenlabs_voice_id": "ELEVENLABS_VOICE_ID",
         }
         values = {field: os.getenv(name, "") for field, name in names.items()}
         values["room_name"] = session.get("room_name", values["room_name"])
         if session.get("room_name"):
             values["livekit_token"] = session.get("livekit_token", "")
-        values["cartesia_voice_id"] = (
-            session.get("voice_id") or values["cartesia_voice_id"]
-        )
         providers = {
             "stt": "deepgram",
             "llm": "openai-compatible",
             "tts": "cartesia",
         }
         providers.update(session.get("providers", {}))
+        # The session's provider voice id replaces the default voice of the selected TTS
+        # provider only.
         # Fail at session start, not mid-call: every provider must be registered.
         for kind, provider in providers.items():
             if provider not in provider_names(kind):
                 raise RuntimeError(f"unsupported {kind} provider: {provider}")
+        # Fail closed: a TTS provider must declare its credentials (possibly none).
+        if providers["tts"] not in _TTS_CREDENTIALS:
+            raise RuntimeError(f"tts provider has no credential mapping: {providers['tts']}")
+        selected = _TTS_CREDENTIALS[providers["tts"]]
+        if len(selected) > 1:
+            values[selected[1]] = session.get("voice_id") or values[selected[1]]
         provider_settings = session.get("provider_settings") or {}
         if not isinstance(provider_settings, dict):
             raise RuntimeError("provider settings must be an object")
@@ -139,11 +190,14 @@ class PipelineConfig:
             values["livekit_token"] = create_runtime_token(values["room_name"])
         # An engine that speaks with the provider's voice (realtime) needs only LiveKit
         # and OpenAI: no STT/TTS credentials.
-        unused = {"deepgram_api_key", "cartesia_api_key", "cartesia_voice_id"}
+        # Only the selected TTS provider's credentials are required.
+        tts_fields = {"cartesia_api_key", "cartesia_voice_id", "elevenlabs_api_key", "elevenlabs_voice_id"}
+        unused = {"deepgram_api_key"} | tts_fields
         required = {
             field: name
             for field, name in names.items()
             if not (engine is not None and not engine.uses_own_voice and field in unused)
+            and not (field in tts_fields and field not in selected)
         }
         missing = [name for field, name in required.items() if not values[field]]
         if missing:

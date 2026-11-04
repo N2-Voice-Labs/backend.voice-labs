@@ -34,7 +34,7 @@ from .models import (
     VoiceSession,
     utcnow,
 )
-from .tenancy import get_owned, get_scoped_db, scoped
+from .tenancy import get_owned, get_public_agent, get_scoped_db, scoped
 from .validation import validate_e164
 
 router = APIRouter()
@@ -145,12 +145,35 @@ def ready_voice(db: Session, ctx: AuthContext, voice_id: str) -> Voice:
     return voice
 
 
+def assert_voice_matches_tts(
+    db: Session, ctx: AuthContext, voice: Voice, tts_provider: str | None
+) -> None:
+    """409 ``voice_provider_mismatch`` when ``voice`` belongs to another TTS provider.
+
+    When no TTS provider is chosen the Runtime speaks with its default
+    (``health.DEFAULT_PROVIDERS['tts']``), which is what the voice is compared against.
+    Skipped only when the voice has no ``tts_provider_id`` or its provider row cannot be
+    resolved within the organisation.
+    """
+
+    tts_provider = tts_provider or provider_health.DEFAULT_PROVIDERS["tts"]
+    if not voice.tts_provider_id:
+        return
+    owner = db.scalars(
+        scoped(db, ctx, ProviderConfig).where(ProviderConfig.id == voice.tts_provider_id)
+    ).first()
+    if owner is not None and owner.provider != tts_provider:
+        raise HTTPException(status_code=409, detail="voice_provider_mismatch")
+
+
 def participant_entry(
     mode: str | None,
     interpreter: dict[str, Any] | None,
     participant: ParticipantIn,
     db: Session,
     ctx: AuthContext,
+    providers: dict[str, str] | None = None,
+    check_voice_provider: bool = True,
 ) -> dict[str, Any]:
     """Validate a participant against an interpreter and build its contract entry.
 
@@ -169,7 +192,10 @@ def participant_entry(
         raise HTTPException(status_code=422, detail="invalid_participant_language")
     voice_id = None
     if participant.voice_profile_id is not None:
-        voice_id = ready_voice(db, ctx, str(participant.voice_profile_id)).provider_voice_id
+        voice = ready_voice(db, ctx, str(participant.voice_profile_id))
+        if check_voice_provider:
+            assert_voice_matches_tts(db, ctx, voice, (providers or {}).get("tts"))
+        voice_id = voice.provider_voice_id
     display_name = (participant.display_name or "").strip() or None
     return {"language": language, "voice_id": voice_id, "display_name": display_name}
 
@@ -301,6 +327,7 @@ async def open_voice_session(
     agent_id: UUID | str,
     deployment_id: UUID | str | None = None,
     participant: ParticipantIn | None = None,
+    allow_system: bool = False,
 ) -> dict[str, Any]:
     """Validate, persist and hand off a new voice session inside ``ctx.org_id``.
 
@@ -313,9 +340,8 @@ async def open_voice_session(
 
     org_id = ctx.org_id
     limits.check_active_session_cap(db, ctx)
-    agent = get_owned(
-        db, ctx, AgentRecord, str(agent_id), not_found_detail="agent_not_found"
-    )
+    # System-managed (hidden interpreter) agents are only reachable by /translations.
+    agent = get_public_agent(db, ctx, agent_id, allow_system=allow_system)
     if agent.status != "enabled":
         raise HTTPException(status_code=409, detail="agent_not_enabled")
     deployment = None
@@ -330,7 +356,9 @@ async def open_voice_session(
     creator_entry = None
     if participant is not None:
         creator_entry = participant_entry(
-            agent.mode, agent.interpreter, participant, db, ctx
+            agent.mode, agent.interpreter, participant, db, ctx,
+            # Checked below against the agent's resolved providers (or the default).
+            check_voice_provider=False,
         )
     runtime_url = os.getenv("RUNTIME_API_URL")
     runtime_token = os.getenv("PLATFORM_RUNTIME_TOKEN", "")
@@ -366,6 +394,8 @@ async def open_voice_session(
             }
             if settings:
                 provider_settings[kind] = settings
+    for voice in used_voices.values():
+        assert_voice_matches_tts(db, ctx, voice, providers.get("tts"))
 
     if runtime_url:
         # Before any row exists: a down provider must not leave a junk session behind.
@@ -575,7 +605,8 @@ async def add_voice_session_participant(
     if len(participants) >= MAX_SESSION_PARTICIPANTS:
         raise HTTPException(status_code=409, detail="session_full")
     entry = participant_entry(
-        contract.get("mode"), contract.get("interpreter"), payload, db, ctx
+        contract.get("mode"), contract.get("interpreter"), payload, db, ctx,
+        contract.get("providers"),
     )
     if any(existing["language"] == entry["language"] for existing in participants.values()):
         # Two people speaking the same language have nothing to interpret.
@@ -677,7 +708,8 @@ async def add_voice_session_phone_participant(
     if len(participants) >= MAX_SESSION_PARTICIPANTS:
         raise HTTPException(status_code=409, detail="session_full")
     entry = participant_entry(
-        contract.get("mode"), contract.get("interpreter"), payload, db, ctx
+        contract.get("mode"), contract.get("interpreter"), payload, db, ctx,
+        contract.get("providers"),
     )
     if any(existing["language"] == entry["language"] for existing in participants.values()):
         raise HTTPException(status_code=422, detail="participant_languages_must_differ")

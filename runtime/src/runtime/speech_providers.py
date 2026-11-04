@@ -207,10 +207,81 @@ def _openai_llm(config: "PipelineConfig", settings: dict[str, Any]) -> Any:
 def _cartesia_tts(config: "PipelineConfig", settings: dict[str, Any], **extra: Any) -> Any:
     from pipecat.services.cartesia.tts import CartesiaTTSService
 
-    settings["voice"] = config.cartesia_voice_id
+    settings["voice"] = config.tts_voice_id
     return CartesiaTTSService(
         api_key=config.cartesia_api_key,
         settings=CartesiaTTSService.Settings(**settings),
+        **extra,
+    )
+
+
+ELEVENLABS_DEFAULT_MODEL = "eleven_flash_v2_5"
+
+
+_ELEVENLABS_SERVICE: Any = None
+
+
+def _elevenlabs_service_class() -> Any:
+    """Pipecat's ``ElevenLabsTTSService`` plus fast reporting of a rejected API key.
+
+    Observed against the real API (2026-11-05): ElevenLabs accepts the WebSocket handshake
+    for an invalid key and then closes with ``1008 (policy violation) Invalid API key``.
+    Pipecat only logs that close, reconnects, and after three quick failures reports a
+    generic "connection failed 3 times" error without the exception, which Voice Labs would
+    classify as ``other``. Here an auth-classified close is reported immediately, with the
+    exception, as a permanent failure.
+    """
+
+    global _ELEVENLABS_SERVICE
+    if _ELEVENLABS_SERVICE is None:
+        from pipecat.frames.frames import ErrorFrame
+        from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
+
+        from .provider_failures import classify_error
+
+        class VoiceLabsElevenLabsTTSService(ElevenLabsTTSService):
+            async def _maybe_try_reconnect(self, error_message, report_error, error=None):
+                if (
+                    error is not None
+                    and not self._disconnecting
+                    and classify_error(exception=error) == "auth"
+                ):
+                    await report_error(
+                        ErrorFrame(error_message, exception=error),
+                        force_treat_as_permanent=True,
+                    )
+                    return False
+                return await super()._maybe_try_reconnect(error_message, report_error, error)
+
+        _ELEVENLABS_SERVICE = VoiceLabsElevenLabsTTSService
+    return _ELEVENLABS_SERVICE
+
+
+def _elevenlabs_tts(config: "PipelineConfig", settings: dict[str, Any], **extra: Any) -> Any:
+    """ElevenLabs' multi-context WebSocket streaming TTS (Pipecat ``ElevenLabsTTSService``).
+
+    ``extra`` (e.g. ``transport_destination``) goes to the service constructor, which forwards
+    it to ``TTSService``. ``language`` is applied by Pipecat only for models that take a
+    ``language_code`` (flash_v2_5, turbo_v2_5, v3, v3_conversational) and only when the model
+    lists that language; otherwise it is logged and dropped. A voice or language change at
+    runtime (``TTSUpdateSettingsFrame``) reconnects the WebSocket (both are URL fields).
+    """
+
+    from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
+
+    import re
+
+    from .voice_cloning import PROVIDER_VOICE_ID_PATTERN
+
+    settings.setdefault("model", ELEVENLABS_DEFAULT_MODEL)
+    settings["voice"] = config.tts_voice_id
+    # Pipecat interpolates the voice id unescaped into the WebSocket URL path.
+    if not re.fullmatch(PROVIDER_VOICE_ID_PATTERN, settings["voice"] or ""):
+        raise RuntimeError("invalid elevenlabs voice id")
+    service_class = _elevenlabs_service_class()
+    return service_class(
+        api_key=config.tts_api_key,
+        settings=ElevenLabsTTSService.Settings(**settings),
         **extra,
     )
 
@@ -240,4 +311,11 @@ register_tts(
     _cartesia_tts,
     settings={"model": str, "language": str},
     features=("streaming", "voice_clone", "transport_destination"),
+)
+register_tts(
+    "elevenlabs",
+    _elevenlabs_tts,
+    settings={"model": str, "language": str},
+    # No "voice_clone": cloning/deleting ElevenLabs voices is not implemented in the runtime.
+    features=("streaming", "transport_destination"),
 )

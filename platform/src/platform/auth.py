@@ -83,6 +83,10 @@ SESSION_SCOPED_ROUTES: dict[tuple[str, str], SessionScope] = {
     ("POST", "/voice/sessions/{session_id}/phone-participants"): SessionScope(
         "session_id", "session", creator_only=True
     ),
+    ("GET", "/translations/{session_id}"): SessionScope("session_id", "session"),
+    ("POST", "/translations/{session_id}/invite"): SessionScope(
+        "session_id", "session", creator_only=True
+    ),
     ("GET", "/conversations/{conversation_id}"): SessionScope(
         "conversation_id", "conversation"
     ),
