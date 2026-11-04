@@ -270,3 +270,28 @@ def test_session_start_accepts_tools_and_knowledge_flag(
         api._active_sessions.pop(key, None)
         api._session_states.pop(key, None)
         api._session_contracts.pop(key, None)
+
+
+@pytest.mark.parametrize("mode_given", [False, True])
+def test_start_warns_when_the_mode_is_left_to_the_agent_default(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, mode_given: bool
+) -> None:
+    monkeypatch.setenv("RUNTIME_PLATFORM_TOKEN", "test-runtime-token")
+    payload = {
+        "session_id": str(uuid4()),
+        "conversation_id": str(uuid4()),
+        "agent_id": str(uuid4()),
+        "room_name": "voice-test-room",
+        # Rejected right after the check, so no session is ever started.
+        "private_listening": True,
+    }
+    if mode_given:
+        payload["mode"] = "interpreter"
+    with caplog.at_level("WARNING", logger="src.runtime.api"):
+        with TestClient(api.app) as client:
+            response = client.post(
+                "/sessions", json=payload, headers={"X-Runtime-Token": "test-runtime-token"}
+            )
+    assert response.status_code == 422
+    warned = any("without an explicit mode" in record.message for record in caplog.records)
+    assert warned is (not mode_given)

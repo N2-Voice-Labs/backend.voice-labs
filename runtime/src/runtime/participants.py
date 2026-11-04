@@ -36,6 +36,8 @@ from typing import Any
 
 MAX_PARTICIPANTS = 2
 _LANGUAGE = re.compile(r"^[a-z]{2,3}$")
+# Same character set as voice_cloning.PROVIDER_VOICE_ID_PATTERN (fullmatch, so no trailing newline).
+_SAFE_VOICE_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
 TRANSLATION_TRACK_PREFIX = "translation-for-"
 
 
@@ -174,6 +176,10 @@ class ParticipantDirectory:
         if identity not in self._participants and len(self._participants) >= MAX_PARTICIPANTS:
             raise ParticipantError("session_full")
         voice_id = spec.get("voice_id") or None
+        if voice_id is not None and not _SAFE_VOICE_ID.fullmatch(str(voice_id)):
+            # Provider voice ids end up in provider URL paths (ElevenLabs websocket and
+            # REST); a tenant-supplied id such as '../../x' must never reach them.
+            raise ParticipantError("invalid_participant_voice")
         display_name = spec.get("display_name") or None
         participant = Participant(
             identity, language, voice_id, display_name, bool(spec.get("phone_room"))

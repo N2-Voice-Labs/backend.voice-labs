@@ -153,7 +153,7 @@ class CascadedEngine:
             session=context.session,
             initial_tts_language=target,
             participants=directory,
-            default_voice_id=config.cartesia_voice_id,
+            default_voice_id=config.tts_voice_id,
             route_by_listener=directory is not None,
             timeline=context.timeline,
             context_pairs=profile.context_pairs,

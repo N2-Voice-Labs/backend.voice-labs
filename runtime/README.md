@@ -11,7 +11,10 @@ uses `LIVEKIT_ROOM_NAME` and either `RUNTIME_LIVEKIT_TOKEN` or `LIVEKIT_API_KEY`
 `LIVEKIT_API_SECRET` to mint a room-scoped agent token. API-triggered sessions receive
 their room name from Platform and mint that token automatically; `RUNTIME_LIVEKIT_TOKEN`
 is not required for that flow. Both paths also require configured Deepgram,
-OpenAI-compatible, and Cartesia credentials.
+OpenAI-compatible, and TTS credentials: `CARTESIA_API_KEY`/`CARTESIA_VOICE_ID` for the
+default `cartesia` provider, or `ELEVENLABS_API_KEY`/`ELEVENLABS_VOICE_ID` when the
+session selects `elevenlabs` (only the selected TTS provider's credentials are required;
+ElevenLabs voice cloning/deletion is not implemented).
 The factory loads Silero VAD and Pipecat's bundled Smart Turn v3 model, then connects the
 native LiveKit transport to STT, LLM, and TTS. It fails at startup when provider settings
 are missing; it does not substitute fake audio.

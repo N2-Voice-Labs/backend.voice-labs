@@ -19,6 +19,7 @@ f. audit log of B never mentions A, and B's attacks do not leak into A's log
 """
 
 import json
+from urllib.parse import quote
 from uuid import uuid4
 
 import pytest
@@ -102,6 +103,9 @@ PARAM_CASES = [
     ("POST", "/voice/sessions/{session_id}/ensure-running"),
     ("POST", "/voice/sessions/{session_id}/participants"),
     ("POST", "/voice/sessions/{session_id}/phone-participants"),
+    # translations (two-person interpreter sessions)
+    ("GET", "/translations/{session_id}"),
+    ("POST", "/translations/{session_id}/invite"),
     # conversations
     ("GET", "/conversations/{conversation_id}"),
     ("GET", "/conversations/{conversation_id}/messages"),
@@ -124,6 +128,7 @@ COLLECTION_CASES = [
     ("GET", "/deployments"),
     ("GET", "/campaigns"),
     ("GET", "/conversations"),
+    ("GET", "/translations"),
     ("GET", "/analytics/summary"),
     ("GET", "/audit-log"),
     ("GET", "/api-keys"),
@@ -141,6 +146,7 @@ BODY_CASES = [
     ("POST", "/deployments"),
     ("POST", "/campaigns"),
     ("POST", "/voice/sessions"),
+    ("POST", "/translations"),
     ("POST", "/api-keys"),
     ("PATCH", "/organization"),
     ("POST", "/agent-templates/{key}/agents"),
@@ -378,6 +384,7 @@ PARAM_BODIES = {
         "targets": [{"phone_number": phone()}]
     },
     ("POST", "/voice/sessions/{session_id}/participants"): lambda: {"language": "en"},
+    ("POST", "/translations/{session_id}/invite"): lambda: {"language": "en"},
     ("POST", "/voice/sessions/{session_id}/phone-participants"): lambda: {
         "language": "en",
         "phone_number": phone(),
@@ -455,6 +462,7 @@ COLLECTION_QUERIES = {
         "?channel=web",
         "?status=active",
     ],
+    "/translations": ["", "?limit=200"],
     "/analytics/summary": ["", "?agent_id={A.agent}"],
     "/audit-log": [
         "",
@@ -476,6 +484,20 @@ def expand(query: str, a) -> str:
 @pytest.mark.parametrize("method,path", COLLECTION_CASES, ids=lambda v: v if isinstance(v, str) else None)
 def test_collections_never_contain_foreign_ids(client, worlds, method, path):
     a, b = worlds
+    if path == "/translations":
+        # The shared world holds ordinary sessions only: give each org a translation session
+        # so the leak scan has something of its own to find (and something to not leak).
+        for world in (a, b):
+            created = client.post(
+                "/translations",
+                json={"languages": ["en", "ko"], "creator": {"language": "en"}},
+                headers=world.admin,
+            )
+            assert created.status_code == 201, created.text
+            world.ids["translation"] = created.json()["session_id"]
+            world.all_ids.update(
+                {created.json()["session_id"], created.json()["conversation_id"]}
+            )
     own_hits = 0
     for query in COLLECTION_QUERIES[path]:
         url = path + expand(query, a)
@@ -580,6 +602,8 @@ REFERENCE_CASES = [
     ("session-agent", "POST", lambda o: "/voice/sessions", lambda o, r: {"agent_id": r["agent"]}, None, 404, 201),
     ("session-deployment", "POST", lambda o: "/voice/sessions", lambda o, r: {"agent_id": o["agent"], "deployment_id": r["deployment_web"]}, None, 404, 201),
     ("session-participant-voice", "POST", lambda o: "/voice/sessions", lambda o, r: {"agent_id": o["interpreter_agent"], "participant": {"language": "en", "voice_profile_id": r["voice_clone"]}}, None, 409, 201),
+    ("translation-creator-voice", "POST", lambda o: "/translations", lambda o, r: {"languages": ["en", "ko"], "creator": {"language": "en", "voice_profile_id": r["voice_clone"]}}, None, 409, 201),
+    ("translation-tts-provider", "POST", lambda o: "/translations", lambda o, r: {"languages": ["en", "ko"], "creator": {"language": "en"}, "tts_provider_id": r["tts_provider"]}, None, 422, 201),
     ("runtime-event-foreign-conversation", "POST", lambda o: "/runtime/events", lambda o, r: {"event_id": str(uuid4()), "event_type": "TranscriptFinal", "session_id": o["session"], "conversation_id": r["conversation"], "agent_id": o["agent"], "payload": {"role": "user", "content": "x"}}, RUNTIME, 409, 202),
     ("runtime-event-foreign-agent", "POST", lambda o: "/runtime/events", lambda o, r: {"event_id": str(uuid4()), "event_type": "TranscriptFinal", "session_id": o["session"], "conversation_id": o["conversation"], "agent_id": r["agent"], "payload": {"role": "user", "content": "x"}}, RUNTIME, 409, 202),
     ("runtime-event-foreign-session", "POST", lambda o: "/runtime/events", lambda o, r: {"event_id": str(uuid4()), "event_type": "TranscriptFinal", "session_id": r["session"], "conversation_id": o["conversation"], "agent_id": o["agent"], "payload": {"role": "user", "content": "x"}}, RUNTIME, 409, 202),
@@ -594,7 +618,7 @@ EXISTENCE_ORACLE_CASES = {
     "agent-llm", "agent-stt", "agent-tts", "agent-voice-profile", "agent-patch-llm",
     "agent-patch-tts", "agent-patch-voice-profile", "agent-link-document",
     "agent-link-tool", "deployment-agent", "campaign-agent", "campaign-deployment",
-    "campaign-both",
+    "campaign-both", "translation-tts-provider",
 }
 
 
@@ -644,6 +668,7 @@ MASS_ASSIGNMENT = [
     ("POST", "/deployments", lambda w: {"agent_id": w["agent"], "name": n(), "channel": "web"}, "/deployments"),
     ("POST", "/campaigns", lambda w: {"name": n(), "agent_id": w["agent"], "deployment_id": w["deployment"]}, "/campaigns"),
     ("POST", "/voice/sessions", lambda w: {"agent_id": w["agent"]}, "/conversations"),
+    ("POST", "/translations", lambda w: {"languages": ["en", "ko"], "creator": {"language": "en"}}, "/conversations"),
 ]
 
 
@@ -826,7 +851,7 @@ def test_audit_log_is_per_org(client, worlds):
         assert audit_items(client, b, f"?resource_id={a[kind]}") == []
     # Pagination cursor from A's log is meaningless to B.
     cursor = a_log[-1]["created_at"]
-    paged = audit_items(client, b, f"?limit=200&before={cursor}")
+    paged = audit_items(client, b, f"?limit=200&before={quote(cursor, safe='')}")
     assert not any(m in json.dumps(paged) for m in a.leak_markers)
 
     # Members cannot read the audit log at all.
