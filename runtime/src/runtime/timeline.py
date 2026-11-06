@@ -61,7 +61,10 @@ Telemetry must never break the media pipeline: public tracker methods swallow er
 from __future__ import annotations
 
 import functools
+import json
 import logging
+import os
+import sys
 import time
 from array import array
 from collections import deque
@@ -74,6 +77,34 @@ from .turn_ids import turn_state
 _logger = logging.getLogger(__name__)
 
 METRIC = "utterance_timeline"
+DIAG_ENV = "RUNTIME_TIMELINE_DIAG"
+
+
+def diag_enabled() -> bool:
+    return os.getenv(DIAG_ENV) == "1"
+
+
+def diag(message: str) -> None:
+    """Diagnostic line on stderr, only when ``RUNTIME_TIMELINE_DIAG=1`` (benchmarks).
+
+    Off by default: a diagnostic line can carry what was said (``partial_probe``), which is
+    user speech and must not reach production logs.
+    """
+
+    if diag_enabled():
+        sys.stderr.write(message + "\n")
+        sys.stderr.flush()
+
+
+def probe_line(
+    key: str, t_partial: float | None, t_vad_stop: float, t_final: float, partial: str | None, final: str
+) -> str:
+    """One ``partial_probe`` line: the last partial before the VAD stop against the first final."""
+
+    return "partial_probe " + json.dumps(
+        {"key": key, "t_partial": t_partial, "t_vad_stop": t_vad_stop, "t_final": t_final, "partial": partial, "final": final},
+        ensure_ascii=False,
+    )
 # The API streams audio continuously, silence included. Chunks whose peak stays below this
 # PCM16 amplitude are not audible speech.
 VOICED_PEAK_THRESHOLD = 500
@@ -87,6 +118,12 @@ MAX_QUEUED = 8
 MARK_ORDER = (
     "vad",
     "first_transcript",
+    # Fine-grained marks for the time between the end of speech and the translation. They are
+    # observations on the server's monotonic clock, in the order they happen:
+    "speech_end",  # estimated: vad_stop minus the VAD's stop_secs (the last voiced audio)
+    "vad_stop",  # the VAD reported the silence
+    "final_transcript",  # the first finalized transcript of the turn reached the translator
+    "turn_end",  # the turn-stop strategy ended the turn (pause timer and transcript both done)
     "translation_start",
     "translation_first_token",
     "translation_first_chunk",
@@ -212,10 +249,31 @@ class TimelineTracker:
             self.mark(timeline, "first_transcript")
 
     @_safe
+    def vad_stopped(self, key: str = "", stop_secs: float = 0.0) -> None:
+        """The VAD reported the end of speech: ``vad_stop`` now, ``speech_end`` ``stop_secs`` earlier.
+
+        Pipecat stamps its frames with the wall clock, which can jump; the
+        marks are taken here, on the tracker's monotonic clock, and the frame's stamp is not used.
+        """
+
+        timeline = self._pending.get(key)
+        if timeline is not None and not timeline.emitted:
+            now = self._clock()
+            timeline.marks["vad_stop"] = now
+            timeline.marks["speech_end"] = now - max(0.0, stop_secs or 0.0)
+
+    @_safe
+    def final_transcript(self, key: str = "") -> None:
+        """A finalized transcript arrived; only the first of the turn is recorded."""
+
+        self.mark(self._pending.get(key), "final_transcript")
+
+    @_safe
     def turn_stopped(self, key: str = "") -> None:
         timeline = self._pending.get(key)
         if timeline is not None:
             timeline.turn_stopped = True
+            self.mark(timeline, "turn_end")
         if not key:
             state = turn_state(self._session)
             if state is not None:
@@ -427,6 +485,14 @@ class TimelineTracker:
         if timeline.listener:
             payload["listener"] = timeline.listener
         payload["marks_ms"] = marks_ms
+        # The anchor of the marks on this host's monotonic clock (CLOCK_MONOTONIC is shared by
+        # all processes of one Linux host), so a client on the same host can line its own
+        # monotonic timestamps up with them. Meaningless across machines.
+        payload["t0_monotonic_s"] = round(timeline.t0, 6)
+        diag(
+            f"utterance_timeline turn={timeline.turn_id} engine={timeline.engine} "
+            f"t0_monotonic_s={timeline.t0:.6f} marks_ms={json.dumps(marks_ms)}"
+        )
         session = self._session
         if session is None or not getattr(session, "event_client", None):
             return
