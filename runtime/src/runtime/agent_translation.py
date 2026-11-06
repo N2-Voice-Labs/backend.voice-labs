@@ -473,7 +473,11 @@ class InboundTranslator(FrameProcessor):
                 type(exc).__name__,
             )
             report_provider_exception(
-                self._session, "translation", self._provider, exc, stage="inbound_translation"
+                self._session,
+                "translation",
+                getattr(exc, "translator_provider", None) or self._provider,
+                exc,
+                stage="inbound_translation",
             )  # PR-30
             return text
         if not translated:
@@ -683,7 +687,12 @@ class OutboundTranslator(FrameProcessor):
                 if released
                 else "speaking the sentence untranslated",
             )
-            report_provider_exception(self._session, "translation", self._provider, exc)  # PR-30
+            report_provider_exception(
+                self._session,
+                "translation",
+                getattr(exc, "translator_provider", None) or self._provider,
+                exc,
+            )  # PR-30
             if not released:
                 await say(sentence)
             return

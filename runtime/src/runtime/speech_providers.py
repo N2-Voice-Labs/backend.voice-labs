@@ -280,7 +280,9 @@ def build_translator(config: "PipelineConfig", *, setting: str = "model", defaul
             backup = OpenAITranslator(
                 api_key=config.gemini_api_key, model=backup_model, base_url=gemini_base_url()
             )
-            translator = FallbackTranslator(translator, backup)
+            translator = FallbackTranslator(
+                translator, backup, primary_name=GOOGLE_TRANSLATE, secondary_name="gemini"
+            )
         return translator, translator.model
     model = resolve_translation_model(config, setting=setting, default=default)
     key, url = translation_endpoint(config)

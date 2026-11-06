@@ -25,6 +25,8 @@ contract is the registry key.
 
 from __future__ import annotations
 
+import asyncio
+
 import logging
 import os
 from dataclasses import dataclass
@@ -74,6 +76,19 @@ class TranslationEngine(Protocol):
 
 
 _ENGINES: dict[str, TranslationEngine] = {}
+
+
+def dropped_utterance_hook(session):
+    """Tell the speaker their last sentence was lost (translation failed, the call goes on)."""
+
+    def notify(speaker_identity):
+        play = getattr(session, "play_apology", None)
+        if play is None or not speaker_identity:
+            return
+        task = asyncio.ensure_future(play(speaker_identity=speaker_identity))
+        task.add_done_callback(lambda t: t.cancelled() or t.exception())
+
+    return notify
 
 
 def register_engine(engine: TranslationEngine) -> TranslationEngine:
@@ -161,6 +176,7 @@ class CascadedEngine:
             context_pairs=profile.context_pairs,
             clause_min_chars=profile.clause_min_chars,
             on_empty_translation=translation_empty_hook(context.session, "interpreter"),
+            on_dropped=dropped_utterance_hook(context.session),
         )
 
         def make_vad():
