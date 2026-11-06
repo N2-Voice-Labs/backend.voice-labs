@@ -88,7 +88,7 @@ placeholders.
 | `DEEPGRAM_API_KEY` | Runtime | Speech-to-text (default provider; not needed when the session selects `elevenlabs` STT) |
 | `OPENAI_API_KEY` | Runtime | Translation (default provider; not needed when the session selects `gemini`) |
 | `GEMINI_API_KEY` | Runtime | Translation through Gemini's OpenAI-compatible endpoint, when the session selects the `gemini` llm provider. Set the llm record's `model` or `GEMINI_TRANSLATION_MODEL` (no model is built in); `GEMINI_BASE_URL` optionally overrides the endpoint |
-| `GOOGLE_TRANSLATE_API_KEY` | Runtime | Google Cloud Translation (key restricted to the Cloud Translation API), when the session selects the `google-translate` llm provider. Translation sessions only, not agent mode. Sent as the `x-goog-api-key` header. Measured ~0.15-0.5 s per sentence, whole sentence at once (no streaming), no conversation context or glossary |
+| `GOOGLE_TRANSLATE_API_KEY` | Runtime | Google Cloud Translation (key restricted to the Cloud Translation API), when the session selects the `google-translate` llm provider. Translation sessions only, not agent mode. Sent as the `x-goog-api-key` header. Measured ~0.15-0.5 s per sentence, whole sentence at once (no streaming), no conversation context or glossary. `GOOGLE_TRANSLATE_TIMEOUT_S` (default 2) is the per-sentence deadline after which the Gemini backup answers; `GOOGLE_TRANSLATE_BASE_URL` redirects it for failure tests |
 | `CARTESIA_API_KEY`, `CARTESIA_VOICE_ID` | Runtime | Needed for Part A (and Part B's baseline); `CARTESIA_VOICE_ID` is the default voice for a participant without a voice profile |
 | `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID` | Runtime | Needed for Part B; required when a session selects the `elevenlabs` TTS provider, and `ELEVENLABS_API_KEY` also when it selects `elevenlabs` for STT (`stt_provider_id`). `ELEVENLABS_API_KEY_FILE` is read only by `scripts/elevenlabs_smoke.py`, not by the Runtime |
 
@@ -448,3 +448,26 @@ Status. A concurrency probe (not in the repository): release about 12 threads wi
 `POST /translations` for the same new configuration, then count hidden agents and sessions (expect 1 and 12);
 send one request with an unknown `voice_profile_id` and confirm no new agent or session appears.
 
+
+## Latency benchmark (translation call)
+
+`runtime/scripts/translation_benchmark.py` replays the same recorded sentences (200, alternating
+ko/en, about 35% with digits, source speech from the free `edge-tts` voices) through a live
+Platform + Runtime + LiveKit session and writes one line per utterance to `raw.jsonl`
+(monotonic timestamps, server-side stage timings, recognised text, translation). Latency is
+measured from the **last spoken sound** (the clips end with silence, so the file end would
+overstate it by ~0.9 s) to the first translated audio. `report` prints P50/P90/P95/P99 per
+stage, premature turn splits, number preservation, silent drops and fallback activations.
+It is billable (about 22 ElevenLabs characters per utterance, ~4.4k per 200-utterance run).
+
+```bash
+cd runtime
+python scripts/translation_benchmark.py prepare --out bench/samples
+python scripts/translation_benchmark.py run --samples bench/samples --profile balanced --out bench/balanced --runtime-log <runtime.log> --confirm-billable
+python scripts/translation_benchmark.py run --samples bench/samples --profile instant  --out bench/instant  --runtime-log <runtime.log> --confirm-billable
+python scripts/translation_benchmark.py report bench/balanced bench/instant
+```
+
+Normal benchmarks run against the real Google endpoint (leave `GOOGLE_TRANSLATE_BASE_URL` unset).
+Fault injection is a separate configuration: start `scripts/fake_google.py`, point the Runtime at
+it with `GOOGLE_TRANSLATE_BASE_URL`, and pass `--fake-google http://localhost:9000 --google-mode slow1000`.
