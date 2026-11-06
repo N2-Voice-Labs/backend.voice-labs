@@ -239,3 +239,15 @@ def test_diagnostics_report_whether_a_request_opened_a_connection(monkeypatch, c
     monkeypatch.setenv("RUNTIME_TIMELINE_DIAG", "1")
     assert asyncio.run(call()) == "hi"
     assert capsys.readouterr().err.startswith("google_request new_connection=False ms=")
+
+
+def _keepalive_of(translator) -> float:
+    return translator._client._transport._pool._keepalive_expiry
+
+
+def test_keepalive_defaults_to_thirty_seconds_and_can_be_changed(monkeypatch) -> None:
+    monkeypatch.delenv("GOOGLE_TRANSLATE_KEEPALIVE_S", raising=False)
+    assert _keepalive_of(GoogleTranslateTranslator(api_key="k")) == 30.0
+    assert _keepalive_of(GoogleTranslateTranslator(api_key="k", keepalive_s=5.0)) == 5.0
+    monkeypatch.setenv("GOOGLE_TRANSLATE_KEEPALIVE_S", "12")
+    assert _keepalive_of(GoogleTranslateTranslator(api_key="k")) == 12.0

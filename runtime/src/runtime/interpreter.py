@@ -420,6 +420,11 @@ class GoogleTranslateTranslator:
     # Total deadline for one sentence. A request that outlives it counts as a failure, so
     # the LLM fallback takes over instead of the speaker waiting on a hung connection.
     DEFAULT_TIMEOUT_S = 2.0
+    # How long an idle connection stays open for the next sentence. httpx's own default is 5 s,
+    # shorter than the gap between sentences, so every sentence paid a new TCP+TLS handshake
+    # (measured: median 455 ms with 5 s, 223 ms with 30 s; scripts/keepalive_comparison.py).
+    # GOOGLE_TRANSLATE_KEEPALIVE_S=5 restores the old behaviour. No periodic requests are sent.
+    DEFAULT_KEEPALIVE_S = 30.0
 
     def __init__(
         self,
@@ -428,6 +433,7 @@ class GoogleTranslateTranslator:
         client: Any | None = None,
         timeout: float | None = None,
         url: str | None = None,
+        keepalive_s: float | None = None,
     ) -> None:
         self.model = "google-translate"
         self.URL = (url or os.getenv("GOOGLE_TRANSLATE_BASE_URL") or self.URL).rstrip("/")
@@ -439,7 +445,10 @@ class GoogleTranslateTranslator:
         if client is None:
             import httpx
 
-            client = httpx.AsyncClient(timeout=10.0)
+            keepalive = keepalive_s if keepalive_s is not None else float(
+                os.getenv("GOOGLE_TRANSLATE_KEEPALIVE_S") or self.DEFAULT_KEEPALIVE_S
+            )
+            client = httpx.AsyncClient(timeout=10.0, limits=httpx.Limits(keepalive_expiry=keepalive))
         self._client = client
 
     async def warm_up(self) -> None:

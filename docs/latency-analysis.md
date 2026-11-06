@@ -261,3 +261,14 @@ Long-idle test (keep-alive expiry 120 s, gaps 30/55/90 s): no errors in 12 reque
 1. Keep the Google connection warm: raise keepalive_expiry to about 30 s, or send a cheap periodic request. Expected saving 85-125 ms per sentence (measured cold/warm gap; live confirmation pending).
 2. Deploy the Runtime in a LiveKit-adjacent Asian region: the effect depends on where the Runtime goes; hypothesis.
 3. Transport floor: no feasible change; paced writes and smaller chunks do not help.
+
+### 10a. Keep-alive comparison (measured, `runtime/scripts/keepalive_comparison.py`)
+
+The Runtime's own `GoogleTranslateTranslator`, identical request, seeded 6-8 s gap before each one, 10 alternating blocks of 10 per configuration (n=100 each), no ElevenLabs credits:
+
+| keepalive_expiry | P50 | P95 | P99 | new TCP+TLS | errors |
+|---|---|---|---|---|---|
+| 5 s (httpx default) | 455 ms | 727 | 878 | 100/100 | 0 |
+| 30 s | 223 ms | 385 | 1295 | 0/100 | 0 |
+
+The reuse hypothesis is confirmed: with 5 s every request opened a connection; with 30 s none did. P50 saving 232 ms (both halves of the run agree: 438 to 212 ms, 465 to 224 ms). The 30 s P99 comes from two requests of about 1.3 s on a reused connection (no error, under the 2 s deadline); with n=100, P99 is the second-worst sample, so it is not a stable estimate. The absolute numbers are larger than the earlier 250 ms cold figure (network conditions differ); the live translation step measured 257 ms. Implemented as `GOOGLE_TRANSLATE_KEEPALIVE_S` (default 30; 5 restores the old behaviour). No periodic requests.
