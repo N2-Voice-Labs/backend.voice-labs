@@ -754,3 +754,52 @@ def test_translation_processor_probes_the_partial_current_at_the_vad_stop(monkey
     assert probe["partial"] == "Hello there" and probe["final"] == "Hello there."
     assert probe["t_vad_stop"] - probe["t_partial"] == pytest.approx(0.2, abs=0.01)
     assert probe["t_final"] - probe["t_vad_stop"] == pytest.approx(0.26, abs=0.01)
+
+
+def test_output_marks_follow_tts_frame_to_livekit_submit(monkeypatch) -> None:
+    monkeypatch.setenv("RUNTIME_TIMELINE_DIAG", "1")
+    tracker, clock, session = make()
+    timeline = tracker.speech_started("", 0.2)
+    clock.advance(0.1)
+    tracker.take("")
+    tracker.enqueue_audio(timeline)
+    tracker.chunk_pushed(timeline)
+    tracker.speech_done(timeline)
+    clock.advance(0.05)
+    tracker.on_audio(pcm(20, amplitude=10), RATE)  # a silent first frame still counts as the TTS frame
+    clock.advance(0.03)
+    assert tracker.output_submitting(pcm(40, amplitude=10)) is None  # silence is not submitted-voice
+    clock.advance(0.02)
+    submitting = tracker.output_submitting(pcm(40))
+    assert submitting is timeline
+    clock.advance(0.004)
+    tracker.output_submitted(submitting)
+    assert tracker.output_submitting(pcm(40)) is None  # only the first voiced chunk
+    marks = timeline.marks
+    assert marks["tts_first_frame"] < marks["livekit_submit"] < marks["livekit_submitted"]
+    assert marks["livekit_submitted"] - marks["livekit_submit"] == pytest.approx(0.004)
+
+
+def test_voiced_input_keeps_the_last_frame_before_the_vad_stop() -> None:
+    tracker, clock, session = make()
+    tracker.speech_started("", 0.2)
+    for _ in range(3):
+        clock.advance(0.01)
+        tracker.voiced_input("")
+    last = clock.now
+    clock.advance(0.2)
+    tracker.vad_stopped("", 0.2)
+    clock.advance(0.01)
+    tracker.voiced_input("")  # after the stop: ignored
+    assert tracker.pending("").marks["audio_in_last_voiced"] == pytest.approx(last)
+
+
+def test_output_marks_are_absent_without_diagnostics(monkeypatch) -> None:
+    monkeypatch.delenv("RUNTIME_TIMELINE_DIAG", raising=False)
+    tracker, clock, session = make()
+    timeline = tracker.speech_started("", 0.2)
+    tracker.take("")
+    tracker.enqueue_audio(timeline)
+    tracker.on_audio(pcm(20), RATE)
+    assert tracker.output_submitting(pcm(40)) is None
+    assert "tts_first_frame" not in timeline.marks and "livekit_submit" not in timeline.marks

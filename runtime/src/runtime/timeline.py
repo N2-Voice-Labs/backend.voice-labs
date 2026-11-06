@@ -118,6 +118,7 @@ MAX_QUEUED = 8
 MARK_ORDER = (
     "vad",
     "first_transcript",
+    "audio_in_last_voiced",  # diagnostics only: last voiced input frame seen before the VAD stop
     # Fine-grained marks for the time between the end of speech and the translation. They are
     # observations on the server's monotonic clock, in the order they happen:
     "speech_end",  # estimated: vad_stop minus the VAD's stop_secs (the last voiced audio)
@@ -128,7 +129,10 @@ MARK_ORDER = (
     "translation_first_token",
     "translation_first_chunk",
     "tts_request",
+    "tts_first_frame",  # first audio frame from the TTS (voiced or not) reached the output side
     "first_audio",
+    "livekit_submit",  # first voiced output chunk handed to the LiveKit audio source
+    "livekit_submitted",  # ... and capture_frame returned (queue back-pressure shows here)
     "stable",
 )
 
@@ -247,6 +251,31 @@ class TimelineTracker:
             self._early_transcript.setdefault(key, deque(maxlen=4)).append(self._clock())
         else:
             self.mark(timeline, "first_transcript")
+
+    @_safe
+    def voiced_input(self, key: str = "") -> None:
+        """A voiced input frame reached the translator (diagnostics): remember the latest."""
+
+        timeline = self._pending.get(key)
+        if timeline is not None and not timeline.emitted and "vad_stop" not in timeline.marks:
+            timeline.marks["audio_in_last_voiced"] = self._clock()
+
+    @_safe
+    def output_submitting(self, audio: bytes) -> UtteranceTimeline | None:
+        """Just before a chunk goes to LiveKit: mark the first voiced one of the head utterance."""
+
+        if not diag_enabled():
+            return None
+        timeline = self._head()
+        if timeline is None or "livekit_submit" in timeline.marks or not is_voiced(audio):
+            return None
+        timeline.marks["livekit_submit"] = self._clock()
+        return timeline
+
+    @_safe
+    def output_submitted(self, timeline: UtteranceTimeline | None) -> None:
+        if timeline is not None:
+            timeline.marks.setdefault("livekit_submitted", self._clock())
 
     @_safe
     def vad_stopped(self, key: str = "", stop_secs: float = 0.0) -> None:
@@ -376,6 +405,10 @@ class TimelineTracker:
         duration = len(audio) / 2 / max(1, channels) / sample_rate
         start = now if self._playhead is None else max(now, self._playhead)
         self._playhead = start + duration
+        if diag_enabled():
+            head = self._head()
+            if head is not None and not head.emitted:
+                head.marks.setdefault("tts_first_frame", now)
         if not is_voiced(audio):
             return
         timeline = self._head()

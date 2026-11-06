@@ -469,6 +469,17 @@ def attach_probes(rows: list[dict], log_lines: list[str]) -> None:
         })
 
 
+# Sub-steps of the two transport steps, available when the Runtime ran with RUNTIME_TIMELINE_DIAG=1.
+TRANSPORT_STEPS = (
+    ("up: client -> Runtime input", "client_end_speech", "audio_in_last_voiced", "network + client send queue + LiveKit + Runtime input buffering"),
+    ("up: input -> VAD estimate", "audio_in_last_voiced", "speech_end", "VAD window/threshold bias (the speech_end error)"),
+    ("down: TTS request -> first TTS frame", "tts_request", "tts_first_frame", "ElevenLabs"),
+    ("down: TTS frame -> submit to LiveKit", "tts_first_frame", "livekit_submit", "Runtime buffering: voiced test, 40 ms chunking, playout clock"),
+    ("down: capture_frame call", "livekit_submit", "livekit_submitted", "LiveKit audio source queue (back-pressure)"),
+    ("down: LiveKit -> client hears it", "livekit_submitted", "client_first_audio", "encode + network + SFU + jitter buffer + client"),
+)
+
+
 def attach_fine_timeline(rows: list[dict], log_lines: list[str]) -> None:
     """Line the Runtime's monotonic marks (from its log) up with the client's own timestamps.
 
@@ -496,7 +507,7 @@ def attach_fine_timeline(rows: list[dict], log_lines: list[str]) -> None:
         points["client_first_audio"] = row.get("mono_first_audio")
         row["fine_steps"] = {
             name: round((points[b] - points[a]) * 1000, 1)
-            for name, a, b, _ in FINE_STEPS
+            for name, a, b, _ in (*FINE_STEPS, *TRANSPORT_STEPS)
             if points.get(a) is not None and points.get(b) is not None
         }
 
@@ -704,7 +715,7 @@ def cmd_report(args) -> None:
         fine = [r for r in rows if r.get("fine_steps") and not r["split"]]
         if fine:
             print(f"fine timeline, unsplit sentences with Runtime marks (n={len(fine)}), ms:")
-            for name, _, _, note in FINE_STEPS:
+            for name, _, _, note in (*FINE_STEPS, *TRANSPORT_STEPS):
                 values = [r["fine_steps"][name] for r in fine if name in r["fine_steps"]]
                 if values:
                     print(f"  {name:14}", describe(values), f" [{note}]")

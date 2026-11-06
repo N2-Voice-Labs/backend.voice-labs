@@ -1,0 +1,118 @@
+{
+ "livekit_host": "<livekit-host>",
+ "rtt_ms_reported": null,
+ "results": [
+  {
+   "config": "runtime-like (24k, 40ms chunks, 1000ms queue, burst)",
+   "rate": 24000,
+   "chunk_ms": 40,
+   "queue_ms": 1000,
+   "paced": false,
+   "idle_s": 1.5,
+   "dtx": null,
+   "rounds": 8,
+   "heard": 8,
+   "latency_ms": [
+    98.6,
+    105.2,
+    102.1,
+    100.2,
+    97.8,
+    104.6,
+    102.5,
+    100.4
+   ],
+   "capture_returns_ms": [
+    7.2,
+    7.8,
+    7.7,
+    5.2,
+    5.7,
+    9.1,
+    7.9,
+    2.3
+   ],
+   "direction": "A to B"
+  },
+  {
+   "config": "8 s idle before the tone",
+   "rate": 24000,
+   "chunk_ms": 40,
+   "queue_ms": 1000,
+   "paced": false,
+   "idle_s": 8.0,
+   "dtx": null,
+   "rounds": 4,
+   "heard": 4,
+   "latency_ms": [
+    234.1,
+    241.5,
+    307.5,
+    285.4
+   ],
+   "capture_returns_ms": [
+    7.9,
+    6.6,
+    5.0,
+    8.9
+   ],
+   "direction": "A to B"
+  },
+  {
+   "config": "runtime-like (24k, 40ms chunks, 1000ms queue, burst)",
+   "rate": 24000,
+   "chunk_ms": 40,
+   "queue_ms": 1000,
+   "paced": false,
+   "idle_s": 1.5,
+   "dtx": null,
+   "rounds": 8,
+   "heard": 8,
+   "latency_ms": [
+    147.4,
+    154.3,
+    153.3,
+    159.7,
+    158.3,
+    126.0,
+    112.8,
+    120.0
+   ],
+   "capture_returns_ms": [
+    3.6,
+    6.1,
+    10.3,
+    6.4,
+    8.5,
+    6.3,
+    5.9,
+    6.0
+   ],
+   "direction": "B to A"
+  },
+  {
+   "config": "8 s idle before the tone",
+   "rate": 24000,
+   "chunk_ms": 40,
+   "queue_ms": 1000,
+   "paced": false,
+   "idle_s": 8.0,
+   "dtx": null,
+   "rounds": 4,
+   "heard": 4,
+   "latency_ms": [
+    101.5,
+    99.2,
+    96.2,
+    95.9
+   ],
+   "capture_returns_ms": [
+    8.1,
+    3.9,
+    6.2,
+    7.9
+   ],
+   "direction": "B to A"
+  }
+ ]
+}

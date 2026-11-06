@@ -78,6 +78,7 @@ from pipecat.frames.frames import (
     CancelFrame,
     EndFrame,
     Frame,
+    InputAudioRawFrame,
     InterimTranscriptionFrame,
     StartFrame,
     TranscriptionFrame,
@@ -103,7 +104,7 @@ from .participants import MAX_PARTICIPANTS, ParticipantDirectory, normalize_lang
 from .provider_failures import report_provider_exception
 from .stall_watchdog import guard_first_token
 from .guard_events import current_turn_id
-from .timeline import TimelineTracker, UtteranceTimeline, diag, diag_enabled, probe_line
+from .timeline import TimelineTracker, UtteranceTimeline, diag, diag_enabled, is_voiced, probe_line
 
 _logger = logging.getLogger(__name__)
 
@@ -454,14 +455,30 @@ class GoogleTranslateTranslator:
         if match is None:
             raise RuntimeError("google translate: no language pair in the translation prompt")
         source, target = match.groups()
+        extensions: dict[str, Any] | None = None
+        events: list[str] = []
+        if diag_enabled():  # diagnostics: did this request have to open a connection?
+
+            async def trace(name: str, _info: Any) -> None:
+                events.append(name)
+
+            extensions = {"trace": trace}
+        started = time.monotonic()
         response = await asyncio.wait_for(
             self._client.post(
                 self.URL,
                 headers=self._headers,
                 json={"q": messages[-1]["content"], "source": source, "target": target, "format": "text"},
+                extensions=extensions,
             ),
             self._timeout,
         )
+        if extensions is not None:
+            diag(
+                "google_request new_connection="
+                f"{any(e.startswith('connection.connect_tcp.started') for e in events)} "
+                f"ms={(time.monotonic() - started) * 1000:.1f}"
+            )
         response.raise_for_status()
         return html.unescape(response.json()["data"]["translations"][0]["translatedText"])
 
@@ -685,6 +702,7 @@ class TranslationProcessor(FrameProcessor):
         self._turns: dict[str, _TurnState] = {}
         # Diagnostics only (RUNTIME_TIMELINE_DIAG): latest partial per speaker, and the partial
         # that was current at the VAD stop, waiting for the first final transcript.
+        self._diag = diag_enabled()
         self._partials: dict[str, tuple[str, float]] = {}
         self._probes: dict[str, tuple[float, tuple[str, float] | None]] = {}
         self._queue: asyncio.Queue[_Utterance] = asyncio.Queue()
@@ -754,6 +772,10 @@ class TranslationProcessor(FrameProcessor):
                 self._timeline.transcript(self._key(frame.user_id))
                 if diag_enabled():
                     self._partials[self._key(frame.user_id)] = (frame.text, self._timeline.now())
+            await self.push_frame(frame, direction)
+        elif isinstance(frame, InputAudioRawFrame):
+            if self._diag and self._timeline is not None and is_voiced(frame.audio):
+                self._timeline.voiced_input(self._key(getattr(frame, "user_id", None)))
             await self.push_frame(frame, direction)
         elif isinstance(frame, VADUserStartedSpeakingFrame):
             self._on_vad_started(frame)

@@ -224,3 +224,40 @@ trip: add one mark when the last voiced input frame arrives at the Runtime and o
 the output pacing and chunk sizes, the LiveKit region and the Runtime's location, and the client's jitter buffer. Realistic saving: 60 to 150 ms. Caveats: the benchmark
 client adds its own buffering (`capture_frame`, 10 ms framing, the energy test), so part of the 310 ms is a property of the test, and a browser client will differ.
 Speculative translation (0 of 11 matches), a shorter pause or a different turn rule are all worse choices on this evidence.
+
+## 10. Audio transport and buffering
+
+Everything marked **measured** comes from free probes (`runtime/scripts/transport_probe.py`, `idle_connection_probe.py`, raw data in `runtime/bench/transport*/`). **Hypothesis** means not yet confirmed. The new marks (`audio_in_last_voiced`, `tts_first_frame`, `livekit_submit`, `livekit_submitted`) are only recorded with `RUNTIME_TIMELINE_DIAG=1` and have not yet been run on a live call.
+
+### Sources of transport latency
+
+| Source | Result | Status |
+|---|---|---|
+| LiveKit SDK one-way floor (publisher `capture_frame` to subscriber first loud frame, no speech providers) | about 100-110 ms | measured |
+| Network round trip to LiveKit Cloud | about 52 ms (about 26 ms one way) | measured |
+| Rest of each 150-160 ms leg (the call's uplink 161, downlink 149) | LiveKit media stack, about 45-55 ms of Runtime, VAD and client effects | hypothesis |
+| Paced writes (sleep one chunk between frames) | +30-60 ms; the current burst write is right | measured |
+| Chunk size, queue size, DTX | within noise | measured |
+| 8 s idle before the first frame | +150-180 ms in one direction only; not seen in the call | measured, unexplained |
+
+The 310 ms of uplink+downlink is therefore not avoidable overhead: about 200-220 ms is the transport floor.
+
+### LiveKit audio pipeline (code inspection)
+
+`rtc.AudioSource(24000 Hz, 1 channel, queue_size_ms=1000)`, 40 ms chunks, per-listener tracks (`ListenerAudioRouter`). Pacing comes from `capture_frame` back-pressure; there are no sleeps before the first chunk, so no artificial output delay.
+
+### Regions
+
+The LiveKit project is restricted to Asia/Middle East regions (nearest oosaka1a 872 km, otokyo1a 1202 km). The Runtime ran locally (timezone Asia/Seoul). TCP connect about 52 ms, TLS about 108 ms. Cross-region cost cannot be judged for a deployed Runtime: it does not exist yet. Deploy it in the nearest of those regions.
+
+### Google Translation connection lifecycle
+
+One persistent `httpx.AsyncClient` per translator, with default limits (keep-alive expiry 5 s). `warm_up()` runs once at call setup. Between sentences (about 6.5 s apart) the connection has expired, so each sentence pays a new TCP+TLS handshake: measured about 250 ms cold against 122-127 ms warm, which matches the live 257 ms translation step.
+
+Long-idle test (keep-alive expiry 120 s, gaps 30/55/90 s): no errors in 12 requests. Latencies were 259, 164, 147, 484, 261 (30 s), 192, 370, 749, 191 (55 s), 214, 213, 239 (90 s). The server may close idle connections silently, and httpx then reconnects, which would explain latencies above the 125 ms warm figure; these samples are too few and too noisy to say that 60 s works, and I did not trace connection opens in that test. **A 60 s keep-alive is safe in the sense of no errors, but its benefit beyond about 30 s is unproven.** Production settings are unchanged.
+
+### Feasible optimizations (estimates, none applied)
+
+1. Keep the Google connection warm: raise keepalive_expiry to about 30 s, or send a cheap periodic request. Expected saving 85-125 ms per sentence (measured cold/warm gap; live confirmation pending).
+2. Deploy the Runtime in a LiveKit-adjacent Asian region: the effect depends on where the Runtime goes; hypothesis.
+3. Transport floor: no feasible change; paced writes and smaller chunks do not help.
