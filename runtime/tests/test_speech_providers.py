@@ -203,8 +203,8 @@ def test_llm_registry_has_openai_and_openai_compatible() -> None:
 
 
 def test_unknown_llm_provider_fails_with_a_clear_error() -> None:
-    config = _config(providers={"stt": "deepgram", "llm": "gemini", "tts": "cartesia"})
-    with pytest.raises(RuntimeError, match="unsupported llm provider: gemini"):
+    config = _config(providers={"stt": "deepgram", "llm": "mistral", "tts": "cartesia"})
+    with pytest.raises(RuntimeError, match="unsupported llm provider: mistral"):
         build_llm(config)
 
 
@@ -244,8 +244,8 @@ def _session_env(monkeypatch) -> None:
 
 def test_session_start_rejects_unknown_llm_provider(monkeypatch) -> None:
     _session_env(monkeypatch)
-    with pytest.raises(RuntimeError, match="unsupported llm provider: gemini"):
-        PipelineConfig.from_environment({"providers": {"llm": "gemini"}})
+    with pytest.raises(RuntimeError, match="unsupported llm provider: mistral"):
+        PipelineConfig.from_environment({"providers": {"llm": "mistral"}})
     with pytest.raises(RuntimeError, match="unsupported voice provider: x"):
         PipelineConfig.from_environment({"providers": {"voice": "x"}})
 
@@ -552,3 +552,151 @@ def test_two_participant_interpreter_ignores_agent_system_prompt(
 
     assert llm_calls == []
     _assert_prompt_unused(fake_providers, worker, seen)
+
+
+# -- ElevenLabs STT + Gemini translation (no model is locked in code) -----------------
+
+
+_ELEVEN_STACK = {"stt": "elevenlabs", "llm": "gemini", "tts": "elevenlabs"}
+_ELEVEN_ENV = {
+    "LIVEKIT_URL": "ws://localhost:7880",
+    "RUNTIME_LIVEKIT_TOKEN": "token",
+    "LIVEKIT_ROOM_NAME": "room",
+    "ELEVENLABS_API_KEY": "el-key",
+    "ELEVENLABS_VOICE_ID": "voice123",
+    "GEMINI_API_KEY": "gm-key",
+}
+
+
+def _stack_env(monkeypatch, **extra) -> None:
+    for name in (
+        "DEEPGRAM_API_KEY", "OPENAI_API_KEY", "CARTESIA_API_KEY", "CARTESIA_VOICE_ID",
+        "GEMINI_MODEL", "GEMINI_TRANSLATION_MODEL", "GEMINI_BASE_URL", "OPENAI_BASE_URL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in {**_ELEVEN_ENV, **extra}.items():
+        monkeypatch.setenv(name, value)
+
+
+def test_elevenlabs_and_gemini_are_registered() -> None:
+    assert "elevenlabs" in stt_names()
+    assert "gemini" in llm_names()
+    assert provider_capabilities("stt", "elevenlabs").supports("keyterms")
+    assert not provider_capabilities("stt", "elevenlabs").supports("multi_language")
+
+
+def test_elevenlabs_stt_factory_uses_the_key_and_leaves_the_model_to_the_sdk(monkeypatch) -> None:
+    from pipecat.services.elevenlabs import stt
+
+    monkeypatch.setattr(stt, "ElevenLabsRealtimeSTTService", Recorder)
+    monkeypatch.setattr(speech_providers, "_ELEVENLABS_STT_SERVICE", None)
+    config = _config(
+        elevenlabs_api_key="el-key", providers={"stt": "elevenlabs", "llm": "openai", "tts": "cartesia"}
+    )
+
+    service = build_stt(config, "ko")
+
+    assert service.kwargs["api_key"] == "el-key"
+    assert service.kwargs["settings"] == {"language": "ko"}  # no model chosen by Voice Labs
+
+
+def test_elevenlabs_stt_maps_multi_to_auto_detection_and_passes_keyterms(monkeypatch) -> None:
+    from pipecat.services.elevenlabs import stt
+
+    monkeypatch.setattr(stt, "ElevenLabsRealtimeSTTService", Recorder)
+    monkeypatch.setattr(speech_providers, "_ELEVENLABS_STT_SERVICE", None)
+    config = _config(
+        elevenlabs_api_key="el-key",
+        providers={"stt": "elevenlabs", "llm": "openai", "tts": "cartesia"},
+        provider_settings={"stt": {"model": "custom-model"}},
+    )
+
+    service = build_stt(config, "multi", ["Voice Labs"])
+
+    assert service.kwargs["settings"] == {
+        "model": "custom-model",
+        "language": None,
+        "keyterms": ["Voice Labs"],
+    }
+
+
+def test_elevenlabs_stack_needs_only_elevenlabs_and_gemini_keys(monkeypatch) -> None:
+    _stack_env(monkeypatch)
+    config = PipelineConfig.from_environment({"providers": _ELEVEN_STACK})
+    assert (config.stt_api_key, config.llm_api_key, config.tts_api_key) == (
+        "el-key", "gm-key", "el-key",
+    )
+    assert config.deepgram_api_key == "" and config.openai_api_key == ""
+
+
+@pytest.mark.parametrize("missing", ["ELEVENLABS_API_KEY", "GEMINI_API_KEY"])
+def test_elevenlabs_stack_reports_a_missing_key(monkeypatch, missing) -> None:
+    _stack_env(monkeypatch)
+    monkeypatch.delenv(missing)
+    with pytest.raises(RuntimeError, match=missing):
+        PipelineConfig.from_environment({"providers": _ELEVEN_STACK})
+
+
+def test_default_stack_still_requires_deepgram_and_openai(monkeypatch) -> None:
+    _stack_env(monkeypatch, CARTESIA_API_KEY="c", CARTESIA_VOICE_ID="v")
+    with pytest.raises(RuntimeError, match="DEEPGRAM_API_KEY.*OPENAI_API_KEY|OPENAI_API_KEY.*DEEPGRAM_API_KEY"):
+        PipelineConfig.from_environment({})
+
+
+def test_stt_and_llm_providers_without_credential_mapping_fail_closed(
+    monkeypatch, restore_registries
+) -> None:
+    _stack_env(monkeypatch)
+    register_stt("orphan", lambda config, settings: None)
+    with pytest.raises(RuntimeError, match="stt provider has no credential mapping: orphan"):
+        PipelineConfig.from_environment({"providers": {**_ELEVEN_STACK, "stt": "orphan"}})
+    register_llm("orphan", lambda config, settings: None)
+    with pytest.raises(RuntimeError, match="llm provider has no credential mapping: orphan"):
+        PipelineConfig.from_environment({"providers": {**_ELEVEN_STACK, "llm": "orphan"}})
+
+
+def test_gemini_translation_has_no_built_in_model(monkeypatch) -> None:
+    _stack_env(monkeypatch)
+    config = PipelineConfig.from_environment({"providers": _ELEVEN_STACK})
+    with pytest.raises(RuntimeError, match="gemini translation needs a model"):
+        speech_providers.resolve_translation_model(config, default="gpt-4.1-mini")
+    # The record's setting, then the environment, supply it; the OpenAI default is ignored.
+    monkeypatch.setenv("GEMINI_TRANSLATION_MODEL", "env-model")
+    assert speech_providers.resolve_translation_model(config, default="gpt-4.1-mini") == "env-model"
+    with_setting = PipelineConfig.from_environment(
+        {"providers": _ELEVEN_STACK, "provider_settings": {"llm": {"model": "rec-model"}}}
+    )
+    assert speech_providers.resolve_translation_model(with_setting, default="x") == "rec-model"
+
+
+def test_gemini_translator_uses_its_own_endpoint_not_openai_base_url(monkeypatch) -> None:
+    _stack_env(monkeypatch, OPENAI_BASE_URL="https://openai.example/v1")
+    config = PipelineConfig.from_environment({"providers": _ELEVEN_STACK})
+    assert speech_providers.translation_endpoint(config) == (
+        "gm-key", speech_providers.GEMINI_DEFAULT_BASE_URL,
+    )
+    monkeypatch.setenv("GEMINI_BASE_URL", "https://proxy.example/openai/")
+    assert speech_providers.translation_endpoint(config)[1] == "https://proxy.example/openai/"
+    openai_config = _config(providers={"stt": "deepgram", "llm": "openai-compatible", "tts": "cartesia"})
+    assert speech_providers.translation_endpoint(openai_config) == ("oa-key", "https://openai.example/v1")
+
+
+def test_openai_translation_keeps_its_profile_default(monkeypatch) -> None:
+    config = _config(providers={"stt": "deepgram", "llm": "openai-compatible", "tts": "cartesia"})
+    assert speech_providers.resolve_translation_model(config, default="profile-model") == "profile-model"
+    with_setting = _config(provider_settings={"llm": {"model": "mine"}})
+    assert speech_providers.resolve_translation_model(with_setting, default="profile-model") == "mine"
+
+
+def test_translation_failures_are_reported_under_the_real_provider() -> None:
+    assert speech_providers.translation_provider(_config(providers=_ELEVEN_STACK)) == "gemini"
+    assert speech_providers.translation_provider(_config()) == "openai"
+
+
+def test_gemini_without_a_model_fails_at_session_start_for_translation(monkeypatch) -> None:
+    _stack_env(monkeypatch)
+    interpreter = {"mode": "interpreter", "interpreter": {"languages": ["en", "ko"], "direction": "one_way"}}
+    with pytest.raises(RuntimeError, match="gemini translation needs a model"):
+        PipelineConfig.from_environment({"providers": _ELEVEN_STACK, **interpreter})
+    monkeypatch.setenv("GEMINI_TRANSLATION_MODEL", "env-model")
+    assert PipelineConfig.from_environment({"providers": _ELEVEN_STACK, **interpreter}).providers == _ELEVEN_STACK

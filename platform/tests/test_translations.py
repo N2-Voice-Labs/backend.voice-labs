@@ -81,15 +81,15 @@ def test_invalid_pair_is_rejected() -> None:
             assert response.status_code == 422, languages
 
 
-def test_invite_seats_the_second_person_and_blocks_a_third(runtime) -> None:
+def test_invite_seats_the_second_person_and_never_displaces_them_silently(runtime) -> None:
     with TestClient(app) as client:
         session_id = start(client).json()["session_id"]
         invited = client.post(f"/translations/{session_id}/invite", json={"language": "en"})
         assert invited.status_code == 200, invited.text
         assert invited.json()["participant_identity"].startswith("guest-")
-        same = client.post(f"/translations/{session_id}/invite", json={"language": "en"})
-        assert same.status_code == 409
-        assert same.json()["detail"] == "session_full"
+        again = client.post(f"/translations/{session_id}/invite", json={"language": "en"})
+        assert again.status_code == 409
+        assert again.json()["detail"]["code"] == "guest_already_invited"
     languages = {p["language"] for p in contract_for(session_id)["participants"].values()}
     assert languages == {"ko", "en"}
 

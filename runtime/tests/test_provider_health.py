@@ -117,8 +117,10 @@ def test_openai_probe_uses_configured_base_url_and_model(monkeypatch):
 
 def test_elevenlabs_exhausted_characters_is_quota(monkeypatch):
     body = {"character_count": 10000, "character_limit": 10000}
-    (got,) = probe(monkeypatch, ["ELEVENLABS_API_KEY"], lambda r: httpx.Response(200, json=body))
-    assert (got.status, got.category) == ("down", "quota")
+    got = probe(monkeypatch, ["ELEVENLABS_API_KEY"], lambda r: httpx.Response(200, json=body))
+    # One key serves TTS and STT, so the same result is reported under both kinds.
+    assert sorted((g.kind, g.name) for g in got) == [("stt", "elevenlabs"), ("tts", "elevenlabs")]
+    assert {(g.status, g.category) for g in got} == {("down", "quota")}
 
 
 def test_no_configured_providers_means_no_requests():

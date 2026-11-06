@@ -85,10 +85,12 @@ placeholders.
 | `RUNTIME_PLATFORM_URL` | Runtime | e.g. `http://localhost:8000`, where events are posted |
 | `PLATFORM_DATABASE_URL` | Platform | PostgreSQL URL; without it Platform falls back to a local SQLite file |
 | `PLATFORM_API_KEYS` | Platform | Leave empty for local use (authentication off). If you set it, send `Authorization: Bearer <key>` (the curl set below does this through `AUTH`) |
-| `DEEPGRAM_API_KEY` | Runtime | Speech-to-text |
-| `OPENAI_API_KEY` | Runtime | Translation |
+| `DEEPGRAM_API_KEY` | Runtime | Speech-to-text (default provider; not needed when the session selects `elevenlabs` STT) |
+| `OPENAI_API_KEY` | Runtime | Translation (default provider; not needed when the session selects `gemini`) |
+| `GEMINI_API_KEY` | Runtime | Translation through Gemini's OpenAI-compatible endpoint, when the session selects the `gemini` llm provider. Set the llm record's `model` or `GEMINI_TRANSLATION_MODEL` (no model is built in); `GEMINI_BASE_URL` optionally overrides the endpoint |
+| `GOOGLE_TRANSLATE_API_KEY` | Runtime | Google Cloud Translation (key restricted to the Cloud Translation API), when the session selects the `google-translate` llm provider. Translation sessions only, not agent mode. Sent as the `x-goog-api-key` header. Measured ~0.15-0.5 s per sentence, whole sentence at once (no streaming), no conversation context or glossary |
 | `CARTESIA_API_KEY`, `CARTESIA_VOICE_ID` | Runtime | Needed for Part A (and Part B's baseline); `CARTESIA_VOICE_ID` is the default voice for a participant without a voice profile |
-| `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID` | Runtime | Needed for Part B; only required when a session selects the `elevenlabs` TTS provider. `ELEVENLABS_API_KEY_FILE` is read only by `scripts/elevenlabs_smoke.py`, not by the Runtime |
+| `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID` | Runtime | Needed for Part B; required when a session selects the `elevenlabs` TTS provider, and `ELEVENLABS_API_KEY` also when it selects `elevenlabs` for STT (`stt_provider_id`). `ELEVENLABS_API_KEY_FILE` is read only by `scripts/elevenlabs_smoke.py`, not by the Runtime |
 
 `stack.voice-labs/.env.example` does not yet list `ELEVENLABS_*`; add them to your untracked
 `.env` (see [Stale stack docs](stale-stack-docs.md#envexample-patch)).

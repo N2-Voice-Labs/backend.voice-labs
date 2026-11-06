@@ -9,22 +9,25 @@ answers questions, it only translates.
 
 import hashlib
 import json
+import os
 from datetime import timedelta
 from typing import Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, status
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from . import health as provider_health
 from . import limits
 from .agents import InterpreterConfig, _load_in_org
 from .context import AuthContext, require
 from .models import Agent as AgentRecord
 from .models import Conversation, ProviderConfig, VoiceSession, utcnow
 from .sessions import (
+    GuestInviteIn,
     ParticipantIn,
     add_voice_session_participant,
     member_or_session,
@@ -46,7 +49,10 @@ class TranslationIn(BaseModel):
     latency_mode: str = DEFAULT_LATENCY_MODE
     hear_original: bool = False
     glossary: list[dict[str, Any]] | None = None
-    # Optional TTS provider (e.g. ElevenLabs); omitted = Runtime's default provider.
+    # Optional provider records per slot (e.g. ElevenLabs STT, Gemini translation, ElevenLabs
+    # voice); an omitted slot uses Runtime's default provider for it.
+    stt_provider_id: UUID | None = None
+    llm_provider_id: UUID | None = None
     tts_provider_id: UUID | None = None
 
     @field_validator("latency_mode")
@@ -102,6 +108,9 @@ def system_agent_for(
     ctx: AuthContext,
     interpreter: dict[str, Any],
     tts_provider_id: str | None = None,
+    *,
+    stt_provider_id: str | None = None,
+    llm_provider_id: str | None = None,
 ) -> AgentRecord:
     """The org's hidden interpreter agent for this exact config (created on first use).
 
@@ -119,9 +128,14 @@ def system_agent_for(
         canonical["glossary"] = sorted(
             canonical["glossary"], key=lambda entry: json.dumps(entry, sort_keys=True)
         )
-    if tts_provider_id:
-        # Only when set: an omitted provider hashes exactly as before this field existed.
-        canonical["tts_provider_id"] = tts_provider_id
+    # Only when set: an omitted provider hashes exactly as before these fields existed.
+    for field, value in (
+        ("stt_provider_id", stt_provider_id),
+        ("llm_provider_id", llm_provider_id),
+        ("tts_provider_id", tts_provider_id),
+    ):
+        if value:
+            canonical[field] = value
     digest = hashlib.sha256(
         json.dumps(canonical, sort_keys=True).encode()
     ).hexdigest()[:32]
@@ -158,6 +172,8 @@ def system_agent_for(
         enabled_languages=list(interpreter["languages"]),
         mode="interpreter",
         interpreter=interpreter,
+        stt_provider_id=stt_provider_id,
+        llm_provider_id=llm_provider_id,
         tts_provider_id=tts_provider_id,
         system=True,
         system_key=key,
@@ -231,26 +247,52 @@ async def create_translation(
     # Refuse before creating anything, and only flush the hidden agent: it commits together
     # with the session in open_voice_session. Any refusal raises, and get_db closes the
     # session, rolling the uncommitted agent back (no orphan rows).
-    tts_provider_id = None
-    if payload.tts_provider_id is not None:
-        provider = _load_in_org(db, ctx, ProviderConfig, str(payload.tts_provider_id))
-        if provider is None or provider.kind != "tts" or not provider.enabled:
-            # Same answer for a foreign, missing, non-tts or disabled id.
-            raise HTTPException(status_code=422, detail="invalid_tts_provider_id")
-        tts_provider_id = str(payload.tts_provider_id)
+    provider_ids: dict[str, str] = {}
+    provider_names: dict[str, str] = {}
+    for kind in ("stt", "llm", "tts"):
+        requested = getattr(payload, f"{kind}_provider_id")
+        if requested is None:
+            continue
+        provider = _load_in_org(db, ctx, ProviderConfig, str(requested))
+        if provider is None or provider.kind != kind or not provider.enabled:
+            # Same answer for a foreign, missing, wrong-kind or disabled id.
+            raise HTTPException(status_code=422, detail=f"invalid_{kind}_provider_id")
+        provider_ids[kind] = str(requested)
+        provider_names[kind] = provider.provider
     limits.check_active_session_cap(db, ctx)
-    agent = system_agent_for(db, ctx, interpreter, tts_provider_id)
+    # Provider preflight is a network call: run it before system_agent_for takes the
+    # write lock on the hidden agent row, so concurrent requests are not stalled behind it.
+    if os.getenv("RUNTIME_API_URL"):
+        await provider_health.preflight_providers(
+            provider_health.required_providers(
+                "interpreter", interpreter, provider_names or None
+            )
+        )
+    agent = system_agent_for(
+        db,
+        ctx,
+        interpreter,
+        provider_ids.get("tts"),
+        stt_provider_id=provider_ids.get("stt"),
+        llm_provider_id=provider_ids.get("llm"),
+    )
     return await open_voice_session(
-        db, ctx, agent_id=agent.id, participant=payload.creator, allow_system=True
+        db,
+        ctx,
+        agent_id=agent.id,
+        participant=payload.creator,
+        allow_system=True,
+        preflighted=True,
     )
 
 
 @router.post("/translations/{session_id}/invite")
 async def invite_to_translation(
     session_id: UUID,
-    guest: ParticipantIn,
+    guest: GuestInviteIn,
     ctx: AuthContext = Depends(member_or_session),
     db: Session = Depends(get_scoped_db),
+    idempotency_key: str | None = Header(default=None, min_length=8, max_length=128),
 ) -> dict[str, Any]:
     """Seat the second person (a browser guest); same rules as ``/voice/sessions/{id}/participants``.
 
@@ -259,7 +301,9 @@ async def invite_to_translation(
 
     if _translation_session(db, ctx, session_id) is None:
         raise HTTPException(status_code=404, detail="translation_not_found")
-    return await add_voice_session_participant(session_id, guest, ctx, db)
+    return await add_voice_session_participant(
+        session_id, guest, ctx, db, idempotency_key
+    )
 
 
 @router.get("/translations")

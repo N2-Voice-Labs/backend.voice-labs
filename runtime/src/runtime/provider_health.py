@@ -177,11 +177,31 @@ async def _probe_elevenlabs(client: httpx.AsyncClient, key: str) -> _Outcome:
     )
 
 
+async def _probe_gemini(client: httpx.AsyncClient, key: str) -> _Outcome:
+    from .speech_providers import gemini_base_url
+
+    return await _get(
+        client, f"{gemini_base_url().rstrip('/')}/models", {"Authorization": f"Bearer {key}"}
+    )
+
+
+async def _probe_google_translate(client: httpx.AsyncClient, key: str) -> _Outcome:
+    return await _get(
+        client,
+        "https://translation.googleapis.com/language/translate/v2/languages",
+        {"x-goog-api-key": key},
+        params={"target": "en"},
+    )
+
+
 _PROBES: tuple[_Probe, ...] = (
     _Probe("stt", "deepgram", "DEEPGRAM_API_KEY", _probe_deepgram),
     _Probe("llm", "openai", "OPENAI_API_KEY", _probe_openai, mirror_kinds=("realtime",)),
     _Probe("tts", "cartesia", "CARTESIA_API_KEY", _probe_cartesia),
-    _Probe("tts", "elevenlabs", "ELEVENLABS_API_KEY", _probe_elevenlabs),
+    # One ElevenLabs key serves TTS and STT: the same result is reported under both kinds.
+    _Probe("tts", "elevenlabs", "ELEVENLABS_API_KEY", _probe_elevenlabs, mirror_kinds=("stt",)),
+    _Probe("llm", "gemini", "GEMINI_API_KEY", _probe_gemini),
+    _Probe("llm", "google-translate", "GOOGLE_TRANSLATE_API_KEY", _probe_google_translate),
 )
 
 

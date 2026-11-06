@@ -61,7 +61,9 @@ utterance is still translated and reported, but nothing is spoken.
 from __future__ import annotations
 
 import asyncio
+import html
 import inspect
+import re
 import logging
 import math
 import os
@@ -88,7 +90,7 @@ from pipecat.frames.frames import (
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.services.settings import TTSSettings
 
-from .glossary import Glossary, GlossaryEntry, glossary_prompt, parse_glossary
+from .glossary import Glossary, GlossaryEntry, glossary_prompt, parse_glossary, prompt_has_glossary
 from .latency_modes import (
     DEFAULT_LATENCY_MODE,
     LATENCY_MODES,
@@ -400,6 +402,90 @@ class OpenAITranslator:
             await _close_stream(stream)
 
 
+_LANGS_IN_PROMPT = re.compile(r"from .*?\(([\w-]+)\) to .*?\(([\w-]+)\)")
+
+
+class GoogleTranslateTranslator:
+    """Translate with Google Cloud Translation (the classic machine-translation API).
+
+    Much faster than an LLM (a dedicated model, one short request) but not streamed and
+    blind to context: the whole sentence arrives at once, and the conversation history and
+    the glossary in the prompt are not used. The language pair is read from the prompt
+    :func:`build_translation_messages` builds.
+    """
+
+    URL = "https://translation.googleapis.com/language/translate/v2"
+
+    def __init__(self, *, api_key: str, client: Any | None = None) -> None:
+        self.model = "google-translate"
+        # A header, not ?key=: URLs end up in error messages and logs.
+        self._headers = {"x-goog-api-key": api_key}
+        if client is None:
+            import httpx
+
+            client = httpx.AsyncClient(timeout=10.0)
+        self._client = client
+
+    async def warm_up(self) -> None:
+        try:  # lists languages: opens the connection, translates (and bills) nothing
+            await self._client.get(
+                self.URL + "/languages", params={"target": "en"}, headers=self._headers
+            )
+        except Exception:
+            _logger.debug("Translator warm-up failed", exc_info=True)
+
+    async def __call__(self, messages: list[dict[str, str]]) -> str:
+        match = _LANGS_IN_PROMPT.search(messages[0]["content"]) if messages else None
+        if match is None:
+            raise RuntimeError("google translate: no language pair in the translation prompt")
+        source, target = match.groups()
+        response = await self._client.post(
+            self.URL,
+            headers=self._headers,
+            json={"q": messages[-1]["content"], "source": source, "target": target, "format": "text"},
+        )
+        response.raise_for_status()
+        return html.unescape(response.json()["data"]["translations"][0]["translatedText"])
+
+
+class FallbackTranslator:
+    """Fast machine translation first, the LLM when it cannot do the job.
+
+    The LLM (``secondary``) takes over when the sentence needs the glossary (machine
+    translation cannot apply it) and when ``primary`` fails or returns nothing. After a
+    failure ``primary`` is skipped for ``cooldown`` seconds so each sentence of an outage
+    does not wait for its timeout first.
+    """
+
+    def __init__(self, primary: Any, secondary: Any, *, cooldown: float = 30.0) -> None:
+        self.model = f"{primary.model}+{secondary.model}"
+        self._primary, self._secondary = primary, secondary
+        self._cooldown = cooldown
+        self._skip_until = 0.0
+
+    async def warm_up(self) -> None:
+        await asyncio.gather(self._primary.warm_up(), self._secondary.warm_up())
+
+    async def __call__(self, messages: list[dict[str, str]]) -> AsyncIterator[str]:
+        needs_llm = bool(messages) and prompt_has_glossary(messages[0]["content"])
+        if not needs_llm and time.monotonic() >= self._skip_until:
+            try:
+                text = await self._primary(messages)
+                if text and text.strip():
+                    yield text
+                    return
+                _logger.warning("Primary translator returned nothing; using the fallback")
+            except Exception as error:
+                self._skip_until = time.monotonic() + self._cooldown
+                _logger.warning("Primary translator failed (%s); using the fallback", type(error).__name__)
+        stream = self._secondary(messages)
+        try:
+            async for delta in stream:
+                yield delta
+        finally:
+            await _close_stream(stream)
+
+
 _SENTENCE_END = ".!?\u2026\u3002\uff1f\uff01"  # . ! ? … 。 ？ ！
 _CJK_SENTENCE_END = "\u3002\uff1f\uff01"  # need no following space
 _CLOSERS = "\"')]}\u201d\u2019\u300d\u300f\uff09"  # quotes/brackets that trail a sentence end
@@ -520,9 +606,11 @@ class TranslationProcessor(FrameProcessor):
         context_pairs: int = MAX_CONTEXT_PAIRS,
         clause_min_chars: int | None = CLAUSE_MIN_CHARS,
         on_empty_translation: EmptyTranslationHook | None = None,
+        provider: str = "openai",
     ) -> None:
         super().__init__()
         self._settings = settings
+        self._provider = provider
         self._on_empty_translation = on_empty_translation
         self._timeline = timeline
         self._context_pairs = context_pairs
@@ -717,7 +805,7 @@ class TranslationProcessor(FrameProcessor):
                 # ST-10a: a dropped utterance is never silent. ``other`` is emitted and the
                 # call goes on; repeated ones end it (see provider_failures).
                 report_provider_exception(
-                    self._session, "translation", "openai", exc, stage="process_utterance"
+                    self._session, "translation", self._provider, exc, stage="process_utterance"
                 )
             finally:
                 self._queue.task_done()
@@ -877,7 +965,7 @@ class TranslationProcessor(FrameProcessor):
                 "stopped after %d spoken chunk(s)" % len(spoken) if spoken else "skipping utterance",
             )
             # PR-30: rejected key or no credit must end the call, not silently skip every turn.
-            report_provider_exception(self._session, "translation", "openai", exc)
+            report_provider_exception(self._session, "translation", self._provider, exc)
             if spoken:
                 # Report what the listener actually heard; keep it out of the context.
                 self._emit_assistant_transcript(

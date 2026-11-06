@@ -455,3 +455,86 @@ def test_provider_configs_count_toward_the_bound(client, org, monkeypatch) -> No
     assert post(client, org).status_code == 201
     r = post(client, org, tts_provider_id=eleven["id"])
     assert (r.status_code, r.json()["detail"]["code"]) == (429, "too_many_translation_configs")
+
+
+# ---------------------------------------------- ElevenLabs STT + Gemini translation + voice
+
+
+def record(client, kind: str, name: str, headers=None, **kw) -> dict:
+    response = client.post(
+        "/providers", json={"kind": kind, "provider": name, **kw}, headers=headers or {}
+    )
+    assert response.status_code == 201, response.text
+    return response.json()
+
+
+def test_stt_llm_and_tts_providers_are_sent_to_runtime(runtime) -> None:
+    requests, _ = runtime
+    with TestClient(app) as client:
+        stt = record(client, "stt", "elevenlabs", configuration={"language": "ko"})
+        llm = record(client, "llm", "gemini", configuration={"model": "my-model"})
+        tts = record(client, "tts", "elevenlabs")
+        r = client.post("/translations", json={
+            **BODY, "stt_provider_id": stt["id"], "llm_provider_id": llm["id"],
+            "tts_provider_id": tts["id"],
+        })
+        assert r.status_code == 201, r.text
+        sent = requests[0]["json"]
+        assert sent["providers"] == {"stt": "elevenlabs", "llm": "gemini", "tts": "elevenlabs"}
+        assert sent["provider_settings"]["llm"] == {"model": "my-model"}
+        assert sent["provider_settings"]["stt"] == {"language": "ko"}
+
+
+def test_each_provider_slot_gets_its_own_hidden_agent_and_old_keys_are_stable(client, org) -> None:
+    stt = record(client, "stt", "elevenlabs", org.owner)
+    llm = record(client, "llm", "gemini", org.owner)
+    assert post(client, org).status_code == 201
+    assert post(client, org, stt_provider_id=stt["id"]).status_code == 201
+    assert post(client, org, llm_provider_id=llm["id"]).status_code == 201
+    assert post(client, org, stt_provider_id=stt["id"], llm_provider_id=llm["id"]).status_code == 201
+    assert post(client, org, stt_provider_id=stt["id"], llm_provider_id=llm["id"]).status_code == 201
+    assert row_counts(org.org_id)[0] == 4  # none, stt, llm, stt+llm (the repeat reused one)
+
+
+@pytest.mark.parametrize("kind", ["stt", "llm"])
+def test_invalid_stt_and_llm_provider_ids_are_indistinguishable(client, org, kind) -> None:
+    other = make_org_with_keys(client, f"x{kind}")
+    foreign = record(client, kind, "elevenlabs" if kind == "stt" else "gemini", other.owner)
+    wrong_kind = record(client, "tts", "elevenlabs", org.owner)
+    disabled = record(client, kind, "elevenlabs" if kind == "stt" else "gemini", org.owner)
+    from src.platform.models import ProviderConfig
+
+    with SessionLocal() as db, bypass(db):
+        db.get(ProviderConfig, disabled["id"]).enabled = False
+        db.commit()
+    before = row_counts(org.org_id)
+    answers = set()
+    for pid in (foreign["id"], str(uuid4()), wrong_kind["id"], disabled["id"]):
+        r = post(client, org, **{f"{kind}_provider_id": pid})
+        answers.add((r.status_code, r.text))
+    assert answers == {(422, f'{{"detail":"invalid_{kind}_provider_id"}}')}
+    assert row_counts(org.org_id) == before
+
+
+def test_preflight_checks_the_selected_stt_and_llm_providers(client, org, monkeypatch) -> None:
+    seen = []
+
+    async def fake_preflight(required):
+        seen.append(required)
+
+    monkeypatch.setenv("RUNTIME_API_URL", "http://runtime.test")
+    monkeypatch.setenv("PLATFORM_RUNTIME_TOKEN", "t")
+    monkeypatch.setattr("src.platform.health.preflight_providers", fake_preflight)
+
+    class Boom(Exception):
+        pass
+
+    async def stop(*args, **kwargs):
+        raise Boom
+
+    monkeypatch.setattr("src.platform.translations.open_voice_session", stop)
+    stt = record(client, "stt", "elevenlabs", org.owner)
+    llm = record(client, "llm", "gemini", org.owner)
+    with pytest.raises(Boom):
+        post(client, org, stt_provider_id=stt["id"], llm_provider_id=llm["id"])
+    assert seen == [[("stt", "elevenlabs"), ("llm", "gemini"), ("tts", "cartesia")]]

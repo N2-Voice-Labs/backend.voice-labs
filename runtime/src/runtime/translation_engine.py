@@ -30,7 +30,12 @@ import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
-from .speech_providers import build_stt, build_tts
+from .speech_providers import (
+    build_stt,
+    build_tts,
+    build_translator,
+    translation_provider,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -125,7 +130,7 @@ class CascadedEngine:
 
         from .glossary import glossary_keyterms
         from .guard_events import translation_empty_hook
-        from .interpreter import OpenAITranslator, TranslationProcessor
+        from .interpreter import TranslationProcessor
         from .language_capabilities import stt_language_for
         from .participants import MAX_PARTICIPANTS, translation_destination
 
@@ -141,15 +146,12 @@ class CascadedEngine:
             extra = {"transport_destination": destination} if destination else {}
             return build_tts(config, language, **extra)
 
-        model = config.provider_settings.get("llm", {}).get("model") or profile.translation_model
+        translator, model = build_translator(config, default=profile.translation_model)
         translation = TranslationProcessor(
             settings=settings,
-            translate=OpenAITranslator(
-                api_key=config.openai_api_key,
-                model=model,
-                base_url=os.getenv("OPENAI_BASE_URL") or None,
-            ),
+            translate=translator,
             model=model,
+            provider=translation_provider(config),
             session=context.session,
             initial_tts_language=target,
             participants=directory,

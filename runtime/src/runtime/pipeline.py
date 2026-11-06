@@ -11,10 +11,39 @@ from .turn_debug import watch_turn_debug
 from .speech_providers import (
     build_llm,
     build_stt,
+    build_translator,
     build_tts,
     provider_names,
     provider_setting_types,
+    resolve_translation_model,
+    translation_endpoint,
+    translation_provider,
 )
+
+
+# STT / LLM provider -> the PipelineConfig credential fields it needs (fail closed when absent).
+_STT_CREDENTIALS: dict[str, tuple[str, ...]] = {
+    "deepgram": ("deepgram_api_key",),
+    "elevenlabs": ("elevenlabs_api_key",),
+}
+_LLM_CREDENTIALS: dict[str, tuple[str, ...]] = {
+    "openai": ("openai_api_key",),
+    "openai-compatible": ("openai_api_key",),
+    "gemini": ("gemini_api_key",),
+    "google-translate": ("google_translate_api_key",),
+}
+
+
+def register_stt_credentials(name: str, fields: tuple[str, ...] = ()) -> None:
+    """Declare the PipelineConfig fields an STT provider needs (``()``: none)."""
+
+    _STT_CREDENTIALS[name] = tuple(fields)
+
+
+def register_llm_credentials(name: str, fields: tuple[str, ...] = ()) -> None:
+    """Declare the PipelineConfig fields an LLM provider needs (``()``: none)."""
+
+    _LLM_CREDENTIALS[name] = tuple(fields)
 
 
 # TTS provider -> the PipelineConfig credential fields it needs.
@@ -77,6 +106,24 @@ class PipelineConfig:
     # and env vars so existing constructors and stored contracts do not change.
     elevenlabs_api_key: str = ""
     elevenlabs_voice_id: str = ""
+    # Gemini (GEMINI_API_KEY): only required when providers["llm"] == "gemini".
+    gemini_api_key: str = ""
+    # Google Cloud Translation (GOOGLE_TRANSLATE_API_KEY): only when providers["llm"] == "google-translate".
+    google_translate_api_key: str = ""
+
+    @property
+    def stt_api_key(self) -> str:
+        """API key of the selected STT provider (``providers["stt"]``)."""
+
+        fields = _STT_CREDENTIALS.get(self.providers.get("stt", "deepgram"), ())
+        return getattr(self, fields[0]) if fields else ""
+
+    @property
+    def llm_api_key(self) -> str:
+        """API key of the selected LLM provider (``providers["llm"]``)."""
+
+        fields = _LLM_CREDENTIALS.get(self.providers.get("llm", "openai-compatible"), ())
+        return getattr(self, fields[0]) if fields else ""
 
     @property
     def tts_api_key(self) -> str:
@@ -108,6 +155,8 @@ class PipelineConfig:
             "cartesia_voice_id": "CARTESIA_VOICE_ID",
             "elevenlabs_api_key": "ELEVENLABS_API_KEY",
             "elevenlabs_voice_id": "ELEVENLABS_VOICE_ID",
+            "gemini_api_key": "GEMINI_API_KEY",
+            "google_translate_api_key": "GOOGLE_TRANSLATE_API_KEY",
         }
         values = {field: os.getenv(name, "") for field, name in names.items()}
         values["room_name"] = session.get("room_name", values["room_name"])
@@ -125,7 +174,11 @@ class PipelineConfig:
         for kind, provider in providers.items():
             if provider not in provider_names(kind):
                 raise RuntimeError(f"unsupported {kind} provider: {provider}")
-        # Fail closed: a TTS provider must declare its credentials (possibly none).
+        # Fail closed: STT, LLM and TTS providers must declare their credentials.
+        if providers["stt"] not in _STT_CREDENTIALS:
+            raise RuntimeError(f"stt provider has no credential mapping: {providers['stt']}")
+        if providers["llm"] not in _LLM_CREDENTIALS:
+            raise RuntimeError(f"llm provider has no credential mapping: {providers['llm']}")
         if providers["tts"] not in _TTS_CREDENTIALS:
             raise RuntimeError(f"tts provider has no credential mapping: {providers['tts']}")
         selected = _TTS_CREDENTIALS[providers["tts"]]
@@ -188,23 +241,23 @@ class PipelineConfig:
             translation = dict(translation)
         if not values["livekit_token"]:
             values["livekit_token"] = create_runtime_token(values["room_name"])
-        # An engine that speaks with the provider's voice (realtime) needs only LiveKit
-        # and OpenAI: no STT/TTS credentials.
-        # Only the selected TTS provider's credentials are required.
-        tts_fields = {"cartesia_api_key", "cartesia_voice_id", "elevenlabs_api_key", "elevenlabs_voice_id"}
-        unused = {"deepgram_api_key"} | tts_fields
-        required = {
-            field: name
-            for field, name in names.items()
-            if not (engine is not None and not engine.uses_own_voice and field in unused)
-            and not (field in tts_fields and field not in selected)
-        }
+        # An engine that speaks with the provider's voice (realtime) needs only LiveKit and
+        # OpenAI: no STT/TTS credentials. Otherwise only the selected STT, LLM and TTS
+        # providers' credentials are required.
+        needed = {"livekit_url", "livekit_token", "room_name"}
+        if engine is not None and not engine.uses_own_voice:
+            needed.add("openai_api_key")
+        else:
+            needed |= set(_STT_CREDENTIALS[providers["stt"]])
+            needed |= set(_LLM_CREDENTIALS[providers["llm"]])
+            needed |= set(selected)
+        required = {field: name for field, name in names.items() if field in needed}
         missing = [name for field, name in required.items() if not values[field]]
         if missing:
             raise RuntimeError(
                 f"runtime provider configuration is missing: {', '.join(missing)}"
             )
-        return cls(
+        config = cls(
             **values,
             system_instruction=session.get(
                 "system_prompt",
@@ -220,6 +273,13 @@ class PipelineConfig:
             private_listening=private_listening,
             translation=translation,
         )
+        # Gemini has no built-in model: fail at session start, not on the first utterance.
+        if providers["llm"] == "gemini":
+            if translation is not None:
+                resolve_translation_model(config, setting="translation_model", default="")
+            elif engine is not None and engine.uses_own_voice:
+                resolve_translation_model(config)
+        return config
 
 
 def create_runtime_token(room_name: str) -> str:
@@ -464,15 +524,10 @@ def agent_translation_processors(
     from .frame_events import RuntimeEventProcessor
     from .agent_translation import AGENT_TRANSLATION_MODEL
     from .guard_events import translation_empty_hook
-    from .interpreter import OpenAITranslator
-
     # A small fast model keeps the two extra round trips short; the LLM's own model is
     # deliberately not reused. Override with provider_settings.llm.translation_model.
-    model = config.provider_settings.get("llm", {}).get("translation_model") or AGENT_TRANSLATION_MODEL
-    translator = OpenAITranslator(
-        api_key=config.openai_api_key,
-        model=model,
-        base_url=os.getenv("OPENAI_BASE_URL") or None,
+    translator, model = build_translator(
+        config, setting="translation_model", default=AGENT_TRANSLATION_MODEL
     )
     from .timeline import TimelineTracker
 
@@ -494,6 +549,7 @@ def agent_translation_processors(
             session=session,
             warm_up=translator.warm_up,
             on_empty_translation=translation_empty_hook(session, "inbound"),
+            provider=translation_provider(config),
         ),
         llm,
         OutboundTranslator(
@@ -502,6 +558,7 @@ def agent_translation_processors(
             model=model,
             session=session,
             on_empty_translation=translation_empty_hook(session, "outbound"),
+            provider=translation_provider(config),
         ),
         # The outbound translator's spoken output is in the caller's current language.
         answer_guard(session, lambda: state.language),
