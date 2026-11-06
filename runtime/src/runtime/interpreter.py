@@ -86,6 +86,7 @@ from pipecat.frames.frames import (
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
     VADUserStartedSpeakingFrame,
+    VADUserStoppedSpeakingFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.services.settings import TTSSettings
@@ -102,7 +103,7 @@ from .participants import MAX_PARTICIPANTS, ParticipantDirectory, normalize_lang
 from .provider_failures import report_provider_exception
 from .stall_watchdog import guard_first_token
 from .guard_events import current_turn_id
-from .timeline import TimelineTracker, UtteranceTimeline
+from .timeline import TimelineTracker, UtteranceTimeline, diag, diag_enabled, probe_line
 
 _logger = logging.getLogger(__name__)
 
@@ -682,6 +683,10 @@ class TranslationProcessor(FrameProcessor):
         self._history: deque[tuple[str, str, str, str]] = deque(maxlen=max(1, context_pairs))
         # Per-speaker turn state; a single-participant session uses the key "".
         self._turns: dict[str, _TurnState] = {}
+        # Diagnostics only (RUNTIME_TIMELINE_DIAG): latest partial per speaker, and the partial
+        # that was current at the VAD stop, waiting for the first final transcript.
+        self._partials: dict[str, tuple[str, float]] = {}
+        self._probes: dict[str, tuple[float, tuple[str, float] | None]] = {}
         self._queue: asyncio.Queue[_Utterance] = asyncio.Queue()
         self._worker: asyncio.Task | None = None
 
@@ -724,6 +729,15 @@ class TranslationProcessor(FrameProcessor):
                 key = self._key(frame.user_id)
                 if self._timeline is not None:
                     self._timeline.transcript(key)
+                    if frame.finalized:
+                        self._timeline.final_transcript(key)
+                        probe = self._probes.pop(key, None)
+                        if probe is not None and diag_enabled():
+                            partial = probe[1]
+                            diag(probe_line(
+                                key, partial[1] if partial else None, probe[0],
+                                self._timeline.now(), partial[0] if partial else None, frame.text,
+                            ))
                 turn = self._turn(key)
                 turn.segments.append(frame)
                 if turn.turn_ended:
@@ -738,9 +752,21 @@ class TranslationProcessor(FrameProcessor):
         elif isinstance(frame, InterimTranscriptionFrame):
             if self._timeline is not None and frame.text and frame.text.strip():
                 self._timeline.transcript(self._key(frame.user_id))
+                if diag_enabled():
+                    self._partials[self._key(frame.user_id)] = (frame.text, self._timeline.now())
             await self.push_frame(frame, direction)
         elif isinstance(frame, VADUserStartedSpeakingFrame):
             self._on_vad_started(frame)
+            await self.push_frame(frame, direction)
+        elif isinstance(frame, VADUserStoppedSpeakingFrame):
+            if self._timeline is not None:
+                if self._participants is None:
+                    self._timeline.vad_stopped("", frame.stop_secs)
+                elif frame.metadata.get("user_id"):
+                    self._timeline.vad_stopped(frame.metadata["user_id"], frame.stop_secs)
+                if diag_enabled():
+                    for key in self._frame_keys(frame):
+                        self._probes[key] = (self._timeline.now(), self._partials.get(key))
             await self.push_frame(frame, direction)
         elif isinstance(frame, UserStartedSpeakingFrame):
             # Late segments still pending belong to the previous turn.
@@ -760,6 +786,10 @@ class TranslationProcessor(FrameProcessor):
 
     def _on_vad_started(self, frame: VADUserStartedSpeakingFrame) -> None:
         """T0/T1 of an utterance (RM-003); two-person lanes tag the speaker's identity."""
+
+        if diag_enabled():  # a partial of the previous utterance must not be mistaken for this one
+            for key in self._frame_keys(frame):
+                self._partials.pop(key, None)
 
         if self._timeline is None:
             return
