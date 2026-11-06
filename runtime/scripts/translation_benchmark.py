@@ -303,7 +303,12 @@ async def run_session(args) -> None:
     import httpx
     import numpy as np
 
-    corpus = json.loads((Path(args.samples) / "corpus.json").read_text())["items"][: args.utterances]
+    corpus = json.loads((Path(args.samples) / "corpus.json").read_text())["items"]
+    if args.ids:  # an explicit selection, in the order given
+        by_id = {item["id"]: item for item in corpus}
+        corpus = [by_id[i] for i in args.ids.split(",")]
+    else:
+        corpus = corpus[: args.utterances]
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     api = args.platform.rstrip("/")
@@ -357,6 +362,10 @@ async def run_session(args) -> None:
                 **item, "profile": args.profile, "llm": args.llm, "google_mode": args.google_mode if args.fake_google else "real",
                 "timeout_s": os.getenv("GOOGLE_TRANSLATE_TIMEOUT_S") or "default",
                 "wall_start": wall.isoformat(),
+                # absolute monotonic stamps (shared by all processes of this host) so the Runtime's
+                # own monotonic marks can be lined up with what the client did
+                "mono_start": round(started, 6), "mono_end_speech": round(ended, 6),
+                "mono_first_audio": None if first is None else round(first, 6),
                 "t_start": round(started - t0, 3), "t_file_end": round(file_end - t0, 3),
                 "trailing_silence_s": round(trailing, 3), "t_end_speech": round(ended - t0, 3),
                 "t_first_audio": None if first is None else round(first - t0, 3),
@@ -387,6 +396,8 @@ async def run_session(args) -> None:
         with log_path.open("rb") as handle:
             handle.seek(log_offset)
             log_lines = handle.read().decode(errors="replace").splitlines()
+    attach_fine_timeline(rows, log_lines)
+    attach_probes(rows, log_lines)
     summary = {
         "profile": args.profile, "llm": args.llm, "utterances": len(rows), "session_id": a["session_id"], "conversation_id": cid,
         "engine": (config.get("interpreter") or {}).get("engine"), "latency_mode": (config.get("interpreter") or {}).get("latency_mode"),
@@ -406,6 +417,88 @@ async def run_session(args) -> None:
     (out / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=1))
     (out / "server_turns.json").write_text(json.dumps({"messages": messages, "turns": debug.get("turns", [])}, ensure_ascii=False))
     print(json.dumps(summary, ensure_ascii=False, indent=1))
+
+
+FINE_LOG = re.compile(r"utterance_timeline turn=\S+ engine=\S+ t0_monotonic_s=([\d.]+) marks_ms=(\{.*\})")
+# Steps between two points of the fine timeline, in the order they happen. A point is a client
+# time (``client_*``, from the benchmark) or a Runtime mark. Network-dependent steps are tagged.
+FINE_STEPS = (
+    ("uplink+detect", "client_end_speech", "speech_end", "network: client, LiveKit, jitter buffer, VAD frames"),
+    ("vad_silence", "speech_end", "vad_stop", "fixed: VAD stop_secs"),
+    ("stt", "vad_stop", "final_transcript", "network: ElevenLabs STT"),
+    ("pause_wait", "final_transcript", "turn_end", "overlaps the STT wait: 0 when STT is slower than the pause"),
+    ("hop", "turn_end", "translation_start", "in process"),
+    ("translation", "translation_start", "translation_first_chunk", "network: Google Translation"),
+    ("tts", "tts_request", "first_audio", "network: ElevenLabs TTS"),
+    ("downlink", "first_audio", "client_first_audio", "network: LiveKit, jitter buffer, client"),
+)
+
+
+PROBE_LOG = re.compile(r"^partial_probe (\{.*\})\s*$")
+
+
+def normalise(text: str | None) -> str:
+    """Conservative: case, punctuation and spacing only. No words are changed or dropped."""
+
+    return " ".join(re.sub(r"[^\w\s]", " ", (text or "").casefold()).split())
+
+
+def attach_probes(rows: list[dict], log_lines: list[str]) -> None:
+    """Compare the partial that was current at the VAD stop with the first final transcript.
+
+    A probe belongs to the last row that had started speaking by the VAD stop (monotonic clock,
+    same host). ``probes`` lists one entry per STT segment of the utterance; a split sentence has several.
+    """
+
+    for line in log_lines:
+        match = PROBE_LOG.match(line.strip())
+        if not match:
+            continue
+        probe = json.loads(match.group(1))
+        owners = [r for r in rows if r.get("mono_start") is not None and r["mono_start"] <= probe["t_vad_stop"]]
+        if not owners:
+            continue
+        partial, final = probe["partial"], probe["final"]
+        owners[-1].setdefault("probes", []).append({
+            "partial": partial, "final": final,
+            "partial_age_ms": None if probe["t_partial"] is None else round((probe["t_vad_stop"] - probe["t_partial"]) * 1000, 1),
+            "final_after_vad_stop_ms": round((probe["t_final"] - probe["t_vad_stop"]) * 1000, 1),
+            "exact": partial == final,
+            "normalised": bool(partial) and normalise(partial) == normalise(final),
+            "prefix": bool(partial) and normalise(final).startswith(normalise(partial)) and normalise(partial) != normalise(final),
+        })
+
+
+def attach_fine_timeline(rows: list[dict], log_lines: list[str]) -> None:
+    """Line the Runtime's monotonic marks (from its log) up with the client's own timestamps.
+
+    Valid only when the client and the Runtime run on one host (CLOCK_MONOTONIC is shared).
+    Each row gets ``fine``: the points in seconds on that clock, and ``fine_steps``: ms per step.
+    A sentence the STT split in two has several timelines; the last one is the one the client's
+    end-to-end time refers to.
+    """
+
+    entries = []
+    for line in log_lines:
+        match = FINE_LOG.search(line)
+        if match:
+            entries.append((float(match.group(1)), json.loads(match.group(2).replace("'", '"'))))
+    for t0, marks in entries:
+        owners = [r for r in rows if r.get("mono_start") is not None and r["mono_start"] <= t0 + 0.05]
+        if not owners:
+            continue
+        row = owners[-1]
+        if row.get("fine_t0", -1) > t0:
+            continue
+        row["fine_t0"] = t0
+        points = {name: t0 + value / 1000 for name, value in marks.items()}
+        points["client_end_speech"] = row.get("mono_end_speech")
+        points["client_first_audio"] = row.get("mono_first_audio")
+        row["fine_steps"] = {
+            name: round((points[b] - points[a]) * 1000, 1)
+            for name, a, b, _ in FINE_STEPS
+            if points.get(a) is not None and points.get(b) is not None
+        }
 
 
 # (from mark, to mark) of the pipeline's utterance timeline. The marks are measured from the
@@ -608,6 +701,22 @@ def cmd_report(args) -> None:
               "(end-of-speech detection, final transcript, turn pause, transport):")
         for name in (*DERIVED, "d_other"):
             print(f"  {name:28}", describe([r[name] for r in rows if r.get(name) is not None]))
+        fine = [r for r in rows if r.get("fine_steps") and not r["split"]]
+        if fine:
+            print(f"fine timeline, unsplit sentences with Runtime marks (n={len(fine)}), ms:")
+            for name, _, _, note in FINE_STEPS:
+                values = [r["fine_steps"][name] for r in fine if name in r["fine_steps"]]
+                if values:
+                    print(f"  {name:14}", describe(values), f" [{note}]")
+        probes = [p for r in rows for p in r.get("probes", [])]
+        if probes:
+            n = len(probes)
+            print(f"partial STT text at the VAD stop vs the first final transcript (n={n} segments, exploratory):")
+            print(f"  no partial yet: {sum(not p['partial'] for p in probes)}   exact: {sum(p['exact'] for p in probes)}   "
+                  f"equal after case/punctuation/space normalisation: {sum(p['normalised'] for p in probes)}   "
+                  f"partial is only the start of the final: {sum(p['prefix'] for p in probes)}")
+            print("  age of that partial before the VAD stop (ms):", describe([p["partial_age_ms"] for p in probes if p["partial_age_ms"] is not None]))
+            print("  final transcript after the VAD stop (ms)   :", describe([p["final_after_vad_stop_ms"] for p in probes]))
         translation = [r["translation_ms"] for r in rows if r.get("translation_ms") is not None]
         if translation:
             print("  translation over a deadline:", ", ".join(
@@ -656,6 +765,7 @@ def main() -> int:
     r.add_argument("--samples", required=True); r.add_argument("--out", required=True)
     r.add_argument("--profile", choices=("instant", "balanced", "accurate"), default="balanced")
     r.add_argument("--utterances", type=int, default=200)
+    r.add_argument("--ids", help="comma-separated corpus ids to replay, in this order (overrides --utterances)")
     r.add_argument("--llm", default="google-translate", help="llm provider record to use; google-translate is the benchmark default")
     r.add_argument("--platform", default="http://localhost:8000")
     r.add_argument("--runtime-log", help="Runtime log file, to count fallback activations during the run")
