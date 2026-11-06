@@ -28,3 +28,6 @@ dist/
 .DS_Store
 .idea/
 .vscode/
+
+# Benchmark source audio (regenerate with scripts/translation_benchmark.py prepare); results stay visible
+runtime/bench/samples/

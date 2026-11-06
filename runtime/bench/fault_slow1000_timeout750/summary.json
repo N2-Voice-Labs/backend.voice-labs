@@ -1,0 +1,22 @@
+{
+ "profile": "balanced",
+ "llm": "google-translate",
+ "utterances": 5,
+ "session_id": "e94ac15e-f326-42cf-a989-90ae757b9257",
+ "conversation_id": "75c38a93-571c-43cb-bf8f-c473693015c6",
+ "engine": "cascaded",
+ "latency_mode": "balanced",
+ "providers": {
+  "stt": "elevenlabs",
+  "llm": "google-translate",
+  "tts": "elevenlabs"
+ },
+ "primary_failures_logged": 2,
+ "primary_empty_logged": 0,
+ "fallback_failures_logged": 0,
+ "translation_failures_logged": 0,
+ "elevenlabs_characters_used": 145,
+ "elevenlabs_characters_before": 9028,
+ "google_timeout_s": "0.75",
+ "google_mode": "slow1000"
+}
