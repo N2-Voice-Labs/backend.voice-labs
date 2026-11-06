@@ -653,6 +653,8 @@ POST /translations
   "latency_mode": "balanced",
   "hear_original": false,
   "glossary": null,
+  "stt_provider_id": null,
+  "llm_provider_id": null,
   "tts_provider_id": null
 }
 ```
@@ -672,6 +674,7 @@ session token (`vls_`). Member+ credential required.
 | `creator.language` is one of the pair | `422 invalid_participant_language` |
 | `creator.voice_profile_id` is a `ready` voice of the caller's organization with a `provider_voice_id` | `409 selected_voice_unavailable` |
 | `tts_provider_id` is not an enabled `tts` provider record of the caller's organization (foreign, missing, wrong kind or disabled: one identical answer) | `422 invalid_tts_provider_id` |
+| `stt_provider_id` / `llm_provider_id` likewise (an enabled `stt` / `llm` record of the organization) | `422 invalid_stt_provider_id` / `422 invalid_llm_provider_id` |
 | The creator's voice belongs to a different TTS provider than the selected one | `409 voice_provider_mismatch` |
 | More than `PLATFORM_MAX_TRANSLATION_CONFIGS` (default 50, `0` disables) NEW configurations created by the organization in the last 24 h | `429` `too_many_translation_configs` (object body) |
 | Organization already has `PLATFORM_MAX_ACTIVE_SESSIONS_PER_ORG` active sessions | `429` `too_many_active_sessions` (object body, see [Authentication](#authentication)) |
@@ -697,9 +700,34 @@ PostgreSQL 16.2 (a refused request left 0 new hidden agents and 0 new sessions).
 - A creator without `voice_profile_id` is spoken for with the Runtime's default voice of the
   selected TTS provider (`CARTESIA_VOICE_ID` or `ELEVENLABS_VOICE_ID`).
 
-#### Choosing the TTS provider
+#### Choosing the providers (STT, translation, voice)
 
-With `tts_provider_id` set, Platform stores it on the hidden agent and the normal session path
+`stt_provider_id`, `llm_provider_id` and `tts_provider_id` each select an organization's enabled
+provider record for that slot; an omitted slot uses Runtime's default (`deepgram`,
+`openai-compatible`, `cartesia`). The supported non-default stack is **ElevenLabs STT
+(`elevenlabs`), Gemini translation (`gemini`) and ElevenLabs voice (`elevenlabs`)**:
+
+- Runtime needs only `ELEVENLABS_API_KEY` (one key for STT and voice) and `GEMINI_API_KEY`;
+  `DEEPGRAM_API_KEY` and `OPENAI_API_KEY` are not required for such a session. Each selected
+  provider's credentials are required, and a provider without a credential mapping is refused at
+  session start.
+- Gemini is called through its OpenAI-compatible endpoint
+  (`GEMINI_BASE_URL`, default `https://generativelanguage.googleapis.com/v1beta/openai/`);
+  `OPENAI_BASE_URL` is not used for it.
+- **No model is built in for Gemini.** Set the `llm` record's `model` setting or
+  `GEMINI_TRANSLATION_MODEL`; without one the session fails to start. ElevenLabs STT uses
+  Pipecat's own default model unless the `stt` record sets `model`. Latency modes keep setting turn
+  pause and chunking only.
+- ElevenLabs STT has no code-switching language: each person's lane uses their declared
+  language, which is what `/translations` already does.
+- Provider health reports `stt/elevenlabs` (same result as `tts/elevenlabs`, one key) and
+  `llm/gemini`; the preflight checks the selected providers.
+- Mock-tested only; not run against the real ElevenLabs STT or Gemini services.
+
+Each id is part of the hidden agent's key (only when set), so different providers are different
+hidden agents.
+
+**TTS.** With `tts_provider_id` set, Platform stores it on the hidden agent and the normal session path
 sends `providers.tts` (for example `elevenlabs`) plus the record's `model` and `language`
 settings in `provider_settings.tts`, so **`/translations` can run on ElevenLabs**. Without it
 no `providers` block is sent and Runtime defaults to `deepgram`, `openai-compatible`,
@@ -724,10 +752,11 @@ The number of NEW hidden configurations an organization may create in a rolling 
 by `PLATFORM_MAX_TRANSLATION_CONFIGS` (default 50, `0` disables); one more gives
 `429` `{"code": "too_many_translation_configs", ...}`. Reusing an existing configuration always
 works, and rows older than 24 h do not count. The count and the insert are not atomic, so
-concurrent creators can overshoot the bound. The flushed hidden-agent row stays locked until
-`open_voice_session` commits, which first awaits the provider preflight (HTTP timeout up to about
-5 s), so concurrent creators of the same new configuration can block on PostgreSQL (the blocking time was
-not measured; the 2026-11-05 PostgreSQL run had no provider preflight).
+concurrent creators can overshoot the bound. The provider preflight (a network call) runs before
+the hidden agent is flushed, so no row lock is held while it waits. The flushed row stays
+uncommitted until `open_voice_session` commits, with no await in between. Checked on PostgreSQL
+16.2 (`tests/test_postgres_translations.py`): eight simultaneous creates produce one hidden
+configuration, and a one-second provider check leaves `/health` responsive.
 The glossary is hashed in a canonical (sorted) order, so a reordered glossary reuses the same
 hidden agent while the stored and sent config keeps the caller's order. Two concurrent first uses
 of one configuration are resolved by the unique `(organization_id, system_key)` constraint: the
@@ -774,15 +803,34 @@ interpreter pipeline before any agent-prompt code, and the translation prompt is
 POST /translations/{id}/invite
 ```
 
-Body: `{"language": "en", "voice_profile_id": null, "display_name": null}`. Seats the second
-person as a browser guest and returns `participant_identity`, `connection` and a guest
-`session_token`. It calls the same function as `POST /voice/sessions/{id}/participants`:
+Body: `{"language": "en", "voice_profile_id": null, "display_name": null, "replace": false}`.
+Seats the second person as a browser guest and returns `participant_identity`, `connection`, a
+guest `session_token` and `replaced_participant_identity` (null unless `replace` was used). It
+calls the same function as `POST /voice/sessions/{id}/participants`.
+
+**Retry safety.** Send an `Idempotency-Key` header (8 to 128 characters, generated once per
+invite attempt by the client). The seat is stored before the Runtime is told, so a lost response,
+a double-click or a Runtime error leaves exactly one guest seat. A retry with the same key and
+language returns the same `participant_identity` with fresh LiveKit tokens and a new
+`session_token`; every credential issued earlier stays valid. The same key with another language
+is `409 idempotency_key_conflict`.
+
+**No silent replacement.** Once a guest holds the seat, an invite without the matching key is
+`409 guest_already_invited` and changes nothing. `replace: true` is the deliberate way to swap
+the guest: it revokes the previous guest's session tokens, frees their Runtime slot, removes
+them from the LiveKit session and listen rooms (best effort; their LiveKit token otherwise
+expires after 10 minutes) and seats a new identity.
+
+| Condition | Error |
+| --- | --- |
+| Guest already seated, key missing or different, no `replace` | `409 guest_already_invited` |
+| `Idempotency-Key` reused with another language | `409 idempotency_key_conflict` |
 
 | Condition | Error |
 | --- | --- |
 | Session is not a translation (an ordinary voice session, a foreign organization's, unknown) | `404 translation_not_found` |
 | Session not `created`/`running` | `409 session_not_active` |
-| Two people already seated | `409 session_full` (maximum is 2) |
+| Two people already seated and the second seat is not a browser guest (e.g. a phone) | `409 session_full` (maximum is 2) |
 | Same language as the first person | `422 participant_languages_must_differ` |
 | Language not in the pair | `422 invalid_participant_language` |
 | Voice not ready | `409 selected_voice_unavailable` |

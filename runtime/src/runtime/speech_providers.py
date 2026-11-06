@@ -215,6 +215,164 @@ def _cartesia_tts(config: "PipelineConfig", settings: dict[str, Any], **extra: A
     )
 
 
+GEMINI_DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+
+
+def gemini_base_url() -> str:
+    """Gemini's OpenAI-compatible endpoint (``GEMINI_BASE_URL`` overrides it)."""
+
+    return os.getenv("GEMINI_BASE_URL") or GEMINI_DEFAULT_BASE_URL
+
+
+def _gemini_llm(config: "PipelineConfig", settings: dict[str, Any]) -> Any:
+    """Gemini through its OpenAI-compatible endpoint (agent mode).
+
+    No model is chosen here: it comes from the provider record's ``model`` setting or
+    ``GEMINI_MODEL``; without one the session fails to start instead of guessing.
+    """
+
+    from pipecat.services.openai.llm import OpenAILLMService
+
+    if not settings.get("model"):
+        model = os.getenv("GEMINI_MODEL")
+        if not model:
+            raise RuntimeError(
+                "gemini llm needs a model: set the provider record's model or GEMINI_MODEL"
+            )
+        settings["model"] = model
+    return OpenAILLMService(
+        api_key=config.gemini_api_key,
+        base_url=gemini_base_url(),
+        settings=OpenAILLMService.Settings(**settings),
+    )
+
+
+def translation_endpoint(config: "PipelineConfig") -> tuple[str, str | None]:
+    """``(api_key, base_url)`` of the text translator for ``config.providers["llm"]``."""
+
+    if config.providers.get("llm") == "gemini":
+        return config.gemini_api_key, gemini_base_url()
+    return config.openai_api_key, os.getenv("OPENAI_BASE_URL") or None
+
+
+GOOGLE_TRANSLATE = "google-translate"
+
+
+def _google_translate_llm(config: "PipelineConfig", settings: dict[str, Any]) -> Any:
+    raise RuntimeError(
+        "google-translate only translates text: use it for translation sessions, "
+        "not as an agent LLM"
+    )
+
+
+def build_translator(config: "PipelineConfig", *, setting: str = "model", default: str | None = None):
+    """``(translator, model name)`` for ``config.providers["llm"]``."""
+
+    from .interpreter import FallbackTranslator, GoogleTranslateTranslator, OpenAITranslator
+
+    if config.providers.get("llm") == GOOGLE_TRANSLATE:
+        translator = GoogleTranslateTranslator(api_key=config.google_translate_api_key)
+        # LLM backup (glossary sentences, outages): Gemini when its key and a model are set.
+        backup_model = config.provider_settings.get("llm", {}).get(
+            "translation_model"
+        ) or os.getenv("GEMINI_TRANSLATION_MODEL")
+        if config.gemini_api_key and backup_model:
+            backup = OpenAITranslator(
+                api_key=config.gemini_api_key, model=backup_model, base_url=gemini_base_url()
+            )
+            translator = FallbackTranslator(translator, backup)
+        return translator, translator.model
+    model = resolve_translation_model(config, setting=setting, default=default)
+    key, url = translation_endpoint(config)
+    return OpenAITranslator(api_key=key, model=model, base_url=url), model
+
+
+def resolve_translation_model(
+    config: "PipelineConfig", *, setting: str = "model", default: str | None = None
+) -> str:
+    """The translation model: the provider setting, else ``default`` (OpenAI only).
+
+    Gemini has no built-in default on purpose (model choice is not locked in code): its
+    model is the provider record's ``setting`` or ``GEMINI_TRANSLATION_MODEL``.
+    """
+
+    configured = config.provider_settings.get("llm", {}).get(setting)
+    if configured:
+        return configured
+    if config.providers.get("llm") == "gemini":
+        model = os.getenv("GEMINI_TRANSLATION_MODEL")
+        if not model:
+            raise RuntimeError(
+                f"gemini translation needs a model: set the llm provider's {setting} "
+                "or GEMINI_TRANSLATION_MODEL"
+            )
+        return model
+    if default is None:
+        raise RuntimeError("no translation model configured")
+    return default
+
+
+def translation_provider(config: "PipelineConfig") -> str:
+    """Name translation failures are reported under (``openai-compatible`` is ``openai``)."""
+
+    name = config.providers.get("llm") or "openai"
+    return "openai" if name == "openai-compatible" else name
+
+
+def _elevenlabs_stt_service_class() -> Any:
+    """Pipecat's realtime ElevenLabs STT plus fast reporting of a rejected API key."""
+
+    global _ELEVENLABS_STT_SERVICE
+    if _ELEVENLABS_STT_SERVICE is None:
+        from pipecat.frames.frames import ErrorFrame
+        from pipecat.services.elevenlabs.stt import ElevenLabsRealtimeSTTService
+
+        from .provider_failures import classify_error
+
+        class VoiceLabsElevenLabsSTTService(ElevenLabsRealtimeSTTService):
+            async def _maybe_try_reconnect(self, error_message, report_error, error=None):
+                if (
+                    error is not None
+                    and not self._disconnecting
+                    and classify_error(exception=error) == "auth"
+                ):
+                    await report_error(
+                        ErrorFrame(error_message, exception=error),
+                        force_treat_as_permanent=True,
+                    )
+                    return False
+                return await super()._maybe_try_reconnect(error_message, report_error, error)
+
+        _ELEVENLABS_STT_SERVICE = VoiceLabsElevenLabsSTTService
+    return _ELEVENLABS_STT_SERVICE
+
+
+_ELEVENLABS_STT_SERVICE: Any = None
+
+
+def _elevenlabs_stt(
+    config: "PipelineConfig", settings: dict[str, Any], keyterms: list[str] | None = None
+) -> Any:
+    """ElevenLabs realtime speech-to-text (Pipecat ``ElevenLabsRealtimeSTTService``).
+
+    The default manual commit strategy is kept: Pipecat's VAD commits each utterance, so
+    transcriptions arrive ``finalized`` like the interpreter expects. Without a ``model``
+    setting Pipecat's own default applies. ``multi`` (Deepgram's code-switching value)
+    means automatic language detection here, i.e. no language.
+    """
+
+    from pipecat.services.elevenlabs.stt import ElevenLabsRealtimeSTTService
+
+    if settings.get("language") == "multi":
+        settings["language"] = None
+    if keyterms and "keyterms" not in settings:
+        settings["keyterms"] = keyterms
+    return _elevenlabs_stt_service_class()(
+        api_key=config.elevenlabs_api_key,
+        settings=ElevenLabsRealtimeSTTService.Settings(**settings),
+    )
+
+
 ELEVENLABS_DEFAULT_MODEL = "eleven_flash_v2_5"
 
 
@@ -292,6 +450,12 @@ register_stt(
     settings={"model": str, "language": str, "interim_results": bool, "smart_format": bool},
     features=("streaming", "keyterms", "multi_language"),
 )
+register_stt(
+    "elevenlabs",
+    _elevenlabs_stt,
+    settings={"model": str, "language": str},
+    features=("streaming", "keyterms"),
+)
 for _name in ("openai", "openai-compatible"):
     register_llm(
         _name,
@@ -306,6 +470,19 @@ for _name in ("openai", "openai-compatible"):
         },
         features=("streaming", "tools"),
     )
+register_llm(
+    "gemini",
+    _gemini_llm,
+    settings={
+        "model": str,
+        "temperature": (int, float),
+        "max_tokens": int,
+        "top_p": (int, float),
+        "translation_model": str,
+    },
+    features=("streaming", "tools"),
+)
+register_llm(GOOGLE_TRANSLATE, _google_translate_llm, settings={"translation_model": str}, features=("translation",))
 register_tts(
     "cartesia",
     _cartesia_tts,

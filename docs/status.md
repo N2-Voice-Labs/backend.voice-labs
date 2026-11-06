@@ -375,3 +375,66 @@ in a browser and an English speaker on a phone, talking to each other live.
 | Voice output and cloning | Cartesia sonic-3.6 (cloning); ElevenLabs via Pipecat (voice output only; service layer verified 2026-11-05) |
 | API and data | FastAPI, SQLAlchemy, Alembic, PostgreSQL, Pydantic |
 | Docs | Zensical (MkDocs-compatible), built with `--strict` |
+
+## Two-person browser workflow: release readiness (2026-11-05)
+
+- **Invite recovery:** idempotent by `Idempotency-Key`; an invite never displaces a seated guest
+  unless `replace: true` is sent. Covered by Platform tests (SQLite).
+- **Private listening** is on by default; with `PLATFORM_PRIVATE_LISTENING=0` a session that hides
+  the original microphones (`hear_original=false`) is refused (`409 private_listening_required`).
+- **PostgreSQL:** concurrent `POST /translations` create one hidden configuration; a slow provider
+  check no longer blocks the API (`tests/test_postgres_translations.py`).
+- **Browser audio: BLOCKED.** This repository has no web client and nothing here joins
+  `connection.listen`. The Korean to English and English to Korean call in two browsers with real
+  providers (zero original/self audio on join and rejoin, both translations audible) has not been run.
+  Until it passes, do not claim the workflow is verified end to end. Note that a client which ignores
+  `connection.listen` gets a session that starts but plays no translation.
+- **SIP is out of the release scope.** The phone path (`/voice/sessions/{id}/phone-participants`) still
+  tells the Runtime before dialling and withdraws best-effort on a failed dial; a failed withdraw can
+  leave Platform and Runtime disagreeing. Tracked separately; make no SIP claims for this release.
+
+## Provider stack: ElevenLabs STT + Gemini translation + ElevenLabs voice (2026-11-06)
+
+- **Added:** `elevenlabs` STT provider (Pipecat `ElevenLabsRealtimeSTTService`, fast auth failure),
+  `gemini` llm provider and translator (OpenAI-compatible endpoint, own base URL), `stt_provider_id`
+  and `llm_provider_id` on `POST /translations`, per-provider credential requirements, provider
+  health for `stt/elevenlabs` and `llm/gemini`. Deepgram, OpenAI and Cartesia remain the defaults.
+- **No model is locked in code.** Gemini needs a configured model; ElevenLabs uses the SDK default
+  unless the record sets one.
+- **Verified:** Runtime and Platform tests with mocks only (see contracts for the list).
+  Checked offline against the real Pipecat class: the language codes map correctly
+  (`ko` to `kor`, `en` to `eng`, `multi` to automatic detection).
+  **Live checks, 2026-11-06 (free ElevenLabs account, one Gemini key):** the ElevenLabs realtime STT
+  WebSocket accepted the key and committed correct Korean and English transcripts of speech
+  synthesized by ElevenLabs TTS (about 0.25 s from commit to final text); Gemini streamed
+  Korean to English translations through the OpenAI-compatible endpoint with `max_tokens` honoured,
+  using `gemini-3.5-flash-lite` (`gemini-2.5-flash-lite` is no longer available to new accounts,
+  which is why no model is built in). These ran the Gemini translator class directly and the
+  ElevenLabs endpoints with a raw WebSocket, not the full Runtime pipeline. Not verified: the
+  pipeline with these providers inside a LiveKit session, translation quality and end-to-end
+  timing in a real call, and anything with the web app. Waiting on LiveKit and the web app.
+- **Repeatable check:** `cd runtime && python scripts/stack_smoke.py --confirm-billable` runs
+  Korean to English and English to Korean through ElevenLabs STT, the Runtime's Gemini translator and
+  ElevenLabs voice, with timings per stage (no LiveKit needed; reads `.env` and never prints keys).
+  First run 2026-11-06: both directions returned correct text at every stage.
+  Gemini time to first text (a 14-token Korean translation, from the dev machine, one key that
+  appears to be on a free tier): `gemini-3.5-flash-lite` typically 0.8 s to 1.6 s (median about 1 s),
+  the same through the OpenAI-compatible endpoint and Google's native API, with no thinking tokens
+  reported; occasional spikes of 10 s to 12 s and some 429/503 answers. `gemini-3.1-flash-lite`
+  about 2.9 s; `gemini-3.5-flash` 10 s to 13 s because it spends about 60 thinking tokens first.
+  `reasoning_effort="none"` is rejected (400) by the compatible endpoint. About 6 requests per
+  model, so treat these as rough; a paid tier or another translation model may behave differently.
+
+## Google Cloud Translation option
+
+`llm` provider `google-translate` (key `GOOGLE_TRANSLATE_API_KEY`) swaps the LLM translator for the
+classic machine-translation API. Live check (Korean and English sentences, 3 repeats each): about 0.15 to
+0.5 s per sentence against about 1 s to first text for Gemini lite, with usable quality. Trade-offs: the
+whole sentence arrives at once (no clause-by-clause speech start), and conversation history and glossary
+are not used. Translation sessions only; selecting it for an agent LLM fails at session start. Not yet
+measured inside a real call (waiting for LiveKit).
+
+Backup: when `GEMINI_API_KEY` and a model (`provider_settings.llm.translation_model` or
+`GEMINI_TRANSLATION_MODEL`) are set, `google-translate` is wrapped in a `FallbackTranslator`. The LLM
+translates sentences that need the glossary, and any sentence where Google fails or returns nothing; after
+a failure Google is skipped for 30 s. Without a model nothing is guessed and Google runs alone.

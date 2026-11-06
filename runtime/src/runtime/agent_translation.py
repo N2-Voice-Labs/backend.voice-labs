@@ -346,8 +346,10 @@ class InboundTranslator(FrameProcessor):
         session: Any | None = None,
         warm_up: Callable[[], Awaitable[None]] | None = None,
         on_empty_translation: EmptyTranslationHook | None = None,
+        provider: str = "openai",
     ) -> None:
         super().__init__()
+        self._provider = provider
         self._state = state
         self._translate = as_streaming_translator(translate)
         self._model = model
@@ -454,7 +456,7 @@ class InboundTranslator(FrameProcessor):
                 if category not in TRANSIENT_REASONS:
                     raise
                 report_provider_retry(
-                    self._session, "translation", "openai", category, stage="inbound_translation"
+                    self._session, "translation", self._provider, category, stage="inbound_translation"
                 )
                 _logger.warning(
                     "Inbound translation failed (%s); retrying once", type(first).__name__
@@ -471,7 +473,7 @@ class InboundTranslator(FrameProcessor):
                 type(exc).__name__,
             )
             report_provider_exception(
-                self._session, "translation", "openai", exc, stage="inbound_translation"
+                self._session, "translation", self._provider, exc, stage="inbound_translation"
             )  # PR-30
             return text
         if not translated:
@@ -515,8 +517,10 @@ class OutboundTranslator(FrameProcessor):
         model: str,
         session: Any | None = None,
         on_empty_translation: EmptyTranslationHook | None = None,
+        provider: str = "openai",
     ) -> None:
         super().__init__()
+        self._provider = provider
         self._state = state
         self._translate = as_streaming_translator(translate)
         self._model = model
@@ -679,7 +683,7 @@ class OutboundTranslator(FrameProcessor):
                 if released
                 else "speaking the sentence untranslated",
             )
-            report_provider_exception(self._session, "translation", "openai", exc)  # PR-30
+            report_provider_exception(self._session, "translation", self._provider, exc)  # PR-30
             if not released:
                 await say(sentence)
             return
