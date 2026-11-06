@@ -235,6 +235,8 @@ class ListenerRoutedLiveKitOutput(LiveKitOutputTransport):
     def __init__(self, *args, router: ListenerAudioRouter, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._router = router
+        # Set by the pipeline builder; marks when the first voiced chunk is handed to LiveKit.
+        self.timeline = None
 
     async def setup(self, setup) -> None:
         await super().setup(setup)  # connects to the room and publishes the default track
@@ -261,9 +263,15 @@ class ListenerRoutedLiveKitOutput(LiveKitOutputTransport):
         destination = frame.transport_destination
         if destination is None:
             return await super().write_audio_frame(frame)
-        return await self._router.write(
-            destination, self._convert_pipecat_audio_to_livekit(frame.audio)
-        )
+        tracker = self.timeline
+        submitting = tracker.output_submitting(frame.audio) if tracker is not None else None
+        try:
+            return await self._router.write(
+                destination, self._convert_pipecat_audio_to_livekit(frame.audio)
+            )
+        finally:
+            if tracker is not None:
+                tracker.output_submitted(submitting)
 
     async def stop(self, frame) -> None:
         await super().stop(frame)  # drains queued audio, then leaves the room

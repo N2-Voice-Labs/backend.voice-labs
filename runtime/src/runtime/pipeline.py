@@ -664,7 +664,10 @@ def build_interpreter_pipeline(config: PipelineConfig, session=None):
     timeline = TimelineTracker(session, engine.name) if session is not None else None
     context = EngineContext(config=config, session=session, directory=directory, timeline=timeline)
     processors = [transport.input(), *engine.build_processors(settings, context)]
-    processors.append(transport.output())
+    output = transport.output()
+    if hasattr(output, "timeline"):  # the routed output marks the hand-over to LiveKit
+        output.timeline = timeline
+    processors.append(output)
     worker = PipelineWorker(
         Pipeline(processors),
         params=PipelineParams(enable_metrics=True, enable_usage_metrics=True),

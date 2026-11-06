@@ -219,3 +219,23 @@ def test_a_lost_utterance_gets_a_notice_for_the_speaker_only() -> None:
     assert plans[0].clip.language == "ko"
     assert speaker_plans(object(), directory, "nobody") == []
     assert speaker_plans(object(), None, "a") == []  # no private output to speak on
+
+
+def test_diagnostics_report_whether_a_request_opened_a_connection(monkeypatch, capsys):
+    from src.runtime.interpreter import GoogleTranslateTranslator
+
+    def handler(request):
+        return httpx.Response(200, json={"data": {"translations": [{"translatedText": "hi"}]}})
+
+    messages = [{"role": "system", "content": "Translate from Korean (ko) to English (en)."}, {"role": "user", "content": "안녕"}]
+
+    async def call():
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        return await GoogleTranslateTranslator(api_key="k", client=client)(messages)
+
+    monkeypatch.delenv("RUNTIME_TIMELINE_DIAG", raising=False)
+    assert asyncio.run(call()) == "hi"
+    assert capsys.readouterr().err == ""
+    monkeypatch.setenv("RUNTIME_TIMELINE_DIAG", "1")
+    assert asyncio.run(call()) == "hi"
+    assert capsys.readouterr().err.startswith("google_request new_connection=False ms=")
