@@ -57,29 +57,33 @@ def wilson(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
 
 def timeline(bench: Path) -> None:
     print("\n== 1. Where the time goes before the translation (unsplit sentences)\n")
-    print("   pipeline order, every step waits for the one before it:")
-    print("   last voiced sample -> VAD stop (0.2 s) -> STT final -> turn end -> translation -> TTS -> audio out\n")
-    print(f"{'profile':10}{'n':>4}{'e2e P50':>9}{'= before':>10}{'+ transl.':>10}{'+ TTS':>7}{'| STT':>7}{'VAD+STT':>9}{'unexplained':>12}")
-    for profile in ("balanced", "instant"):
+    print("   Pipecat's stt_ttfb is measured from the VAD's estimate of the last spoken sound (VAD stop minus stop_secs),")
+    print("   so it ALREADY contains the 200 ms VAD silence. It is not added to it.\n")
+    print(f"{'profile':10}{'n':>4}{'e2e P50':>9}{'= before':>10}{'+ transl.':>10}{'+ TTS':>7}  |{'STT ttfb':>9}{'after it':>10}{'(code: turn ends at':>20}")
+    for profile, pause in (("balanced", 300), ("instant", 200)):
         data = [
             r for r in rows(bench / profile / "raw.jsonl")
             if not r["split"] and r["turns"] == 2 and r.get("d_translation") and r.get("d_tts") and r.get("stt_ttfb")
         ]
         before = [r["e2e_s"] * 1000 - r["d_translation"] - r["d_tts"] for r in data]
         stt = [r["stt_ttfb"] for r in data]
-        residual = [b - VAD_STOP_S * 1000 - s for b, s in zip(before, stt)]
+        after = [b - s for b, s in zip(before, stt)]
+        turn_end = [max(s, VAD_STOP_S * 1000 + pause) for s in stt]
         print(
             f"{profile:10}{len(data):>4}{stats.median(r['e2e_s'] * 1000 for r in data):>9.0f}"
             f"{stats.median(before):>10.0f}{stats.median(r['d_translation'] for r in data):>10.0f}"
-            f"{stats.median(r['d_tts'] for r in data):>7.0f}{stats.median(stt):>7.0f}"
-            f"{VAD_STOP_S * 1000 + stats.median(stt):>9.0f}{stats.median(residual):>12.0f}"
+            f"{stats.median(r['d_tts'] for r in data):>7.0f}  |{stats.median(stt):>9.0f}{stats.median(after):>10.0f}"
+            f"{stats.median(turn_end):>16.0f} ms)"
         )
     print(
-        "\n   The turn pause (0.3 s Balanced, 0.2 s Instant) runs at the same time as the STT wait, and the turn\n"
-        "   ends only when BOTH are done. STT takes ~460 ms, longer than either pause, so the pause adds nothing:\n"
-        "   'before' is the same in both profiles. 'unexplained' (~180 ms) is whatever the marks do not cover:\n"
-        "   audio in over LiveKit, VAD frame analysis, the hop from the STT frame to the translator, audio out to\n"
-        "   the listener. It needs a new mark to split further."
+        "\n   Per Pipecat's SpeechTimeoutUserTurnStopStrategy the turn ends when BOTH the pause timer (started at the VAD\n"
+        "   stop: 200 ms + pause after the last sound) and the first final transcript are done. With STT at ~460 ms the\n"
+        "   Balanced pause (200 + 300 = 500 ms) is the later of the two for nearly every sentence, by ~40 ms; Instant's\n"
+        "   (400 ms) never is. The recorded data cannot show a difference that small (Balanced vs Instant 'after it':\n"
+        "   see the numbers above, spread ~40 ms, n=17 and 29), so this is the code's prediction, not a measurement.\n"
+        "   'after it' (~370-390 ms) is NOT explained by any mark: the uplink of the last audio, the rest of the pause,\n"
+        "   the hop to the translator. The marks added in the latest change (speech_end, vad_stop, final_transcript,\n"
+        "   turn_end) split it on the next run."
     )
 
 
@@ -124,8 +128,8 @@ def splits(bench: Path) -> None:
             f"{min(split):.2f} s, median {stats.median(split):.2f} s | not split max {max(whole):.2f} s, median {stats.median(whole):.2f} s"
         )
     print("\n   Every Balanced split is also an Instant split, so the cause is in the audio, not chance.")
-    print("   A pause g inside a sentence splits it when g + VAD start (0.2 s) is longer than VAD stop (0.2 s) + turn pause,")
-    print("   i.e. roughly when g > the turn pause: ~0.3 s Balanced, ~0.2 s Instant.\n")
+    print("   A pause g inside a sentence splits it when the speech coming back (g + VAD start 0.2 s) is later than the turn end")
+    print("   (VAD stop 0.2 s + turn pause), i.e. roughly when g > the turn pause: ~0.3 s Balanced, ~0.2 s Instant.\n")
     print(f"{'id':7}{'lang':>5}{'gap s':>7}  {'Bal':>4}{'Ins':>4}  classification (Instant run)")
     harmful = {"balanced": 0, "instant": 0}
     for i, r in sorted(by["instant"].items(), key=lambda kv: -gaps[kv[0]]):
