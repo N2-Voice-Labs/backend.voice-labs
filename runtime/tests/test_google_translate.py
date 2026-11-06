@@ -251,3 +251,36 @@ def test_keepalive_defaults_to_thirty_seconds_and_can_be_changed(monkeypatch) ->
     assert _keepalive_of(GoogleTranslateTranslator(api_key="k", keepalive_s=5.0)) == 5.0
     monkeypatch.setenv("GOOGLE_TRANSLATE_KEEPALIVE_S", "12")
     assert _keepalive_of(GoogleTranslateTranslator(api_key="k")) == 12.0
+
+
+def test_closing_a_translator_closes_only_clients_it_created() -> None:
+    from src.runtime.interpreter import close_translator
+
+    owned = GoogleTranslateTranslator(api_key="k")
+    asyncio.run(close_translator(owned))
+    assert owned._client.is_closed
+    asyncio.run(close_translator(owned))  # twice is fine
+
+    injected = httpx.AsyncClient()
+    asyncio.run(close_translator(GoogleTranslateTranslator(api_key="k", client=injected)))
+    assert not injected.is_closed
+    asyncio.run(injected.aclose())
+
+    async def plain(messages):  # a bare function has nothing to close
+        return ""
+
+    asyncio.run(close_translator(plain))
+
+
+def test_a_fallback_translator_closes_both_of_its_translators() -> None:
+    from src.runtime.interpreter import close_translator
+
+    class Closable(Fake):
+        closed = False
+
+        async def aclose(self):
+            self.closed = True
+
+    primary, backup = Closable("mt", "x"), Closable("llm", "y")
+    asyncio.run(close_translator(FallbackTranslator(primary, backup)))
+    assert primary.closed and backup.closed

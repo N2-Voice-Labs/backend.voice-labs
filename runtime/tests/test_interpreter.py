@@ -994,3 +994,22 @@ def test_translation_works_without_a_timeline_tracker() -> None:
     processor = make_processor()
     down, _ = run(processor, utterance("Hello", "en"))
     assert spoken(down) == ["T:Hello"]
+
+
+def test_call_lifecycle_warms_the_translator_at_start_and_closes_it_at_the_end() -> None:
+    events: list[str] = []
+
+    class Translator:
+        async def warm_up(self):
+            events.append("warm_up")
+
+        async def aclose(self):
+            events.append("aclose")
+
+        async def __call__(self, messages):
+            return "T:" + messages[-1]["content"]
+
+    processor = make_processor(translate=Translator())
+    down, _ = run(processor, utterance("hello"))
+    assert spoken(down) == ["T:hello"]
+    assert events == ["warm_up", "aclose"]  # once each, warm-up first
