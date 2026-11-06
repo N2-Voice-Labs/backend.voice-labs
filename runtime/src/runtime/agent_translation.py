@@ -78,6 +78,7 @@ from .interpreter import (
     SentenceChunker,
     TranslateFn,
     _close_stream,
+    close_translator,
     as_streaming_translator,
     build_translation_messages,
     _script_votes,
@@ -351,12 +352,17 @@ class InboundTranslator(FrameProcessor):
         super().__init__()
         self._provider = provider
         self._state = state
+        self._translator = translate
         self._translate = as_streaming_translator(translate)
         self._model = model
         self._session = session
         self._warm_up = warm_up
         self._on_empty_translation = on_empty_translation
         self._done: deque[Any] = deque(maxlen=self._DONE_LIMIT)
+
+    async def cleanup(self) -> None:
+        await super().cleanup()
+        await close_translator(self._translator)  # shared with OutboundTranslator; closing twice is harmless
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
@@ -526,6 +532,7 @@ class OutboundTranslator(FrameProcessor):
         super().__init__()
         self._provider = provider
         self._state = state
+        self._translator = translate
         self._translate = as_streaming_translator(translate)
         self._model = model
         self._session = session
@@ -534,6 +541,10 @@ class OutboundTranslator(FrameProcessor):
         self._response: _Response | None = None
 
     # -- frame handling ----------------------------------------------------------
+
+    async def cleanup(self) -> None:
+        await super().cleanup()
+        await close_translator(self._translator)
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)

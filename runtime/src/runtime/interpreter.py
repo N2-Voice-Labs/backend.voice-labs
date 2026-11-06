@@ -326,6 +326,22 @@ async def _close_stream(stream: Any) -> None:
         return
 
 
+async def close_translator(translator: Any) -> None:
+    """Release a translator's HTTP connections at the end of a call; never raises.
+
+    Translators without ``aclose`` (plain functions in tests) are left alone. Safe to call
+    twice.
+    """
+
+    closer = getattr(translator, "aclose", None)
+    if closer is None:
+        return
+    try:
+        await closer()
+    except Exception:  # pragma: no cover - cleanup only
+        _logger.debug("Closing translator failed", exc_info=True)
+
+
 def as_streaming_translator(translate: TranslateFn) -> StreamingTranslateFn:
     """Wrap ``translate`` so it always yields text deltas.
 
@@ -364,6 +380,7 @@ class OpenAITranslator:
         client: Any | None = None,
     ) -> None:
         self.model = model
+        self._owns_client = client is None
         if client is None:
             from openai import AsyncOpenAI
 
@@ -374,6 +391,12 @@ class OpenAITranslator:
                 max_retries=1,
             )
         self._client = client
+
+    async def aclose(self) -> None:
+        """Close the client this translator created (an injected one belongs to the caller)."""
+
+        if self._owns_client:
+            await self._client.close()
 
     async def warm_up(self) -> None:
         """Open the HTTPS connection before the first translation (best effort, free)."""
@@ -442,6 +465,7 @@ class GoogleTranslateTranslator:
         )
         # A header, not ?key=: URLs end up in error messages and logs.
         self._headers = {"x-goog-api-key": api_key}
+        self._owns_client = client is None
         if client is None:
             import httpx
 
@@ -450,6 +474,10 @@ class GoogleTranslateTranslator:
             )
             client = httpx.AsyncClient(timeout=10.0, limits=httpx.Limits(keepalive_expiry=keepalive))
         self._client = client
+
+    async def aclose(self) -> None:
+        if self._owns_client:
+            await self._client.aclose()
 
     async def warm_up(self) -> None:
         try:  # lists languages: opens the connection, translates (and bills) nothing
@@ -518,6 +546,9 @@ class FallbackTranslator:
 
     async def warm_up(self) -> None:
         await asyncio.gather(self._primary.warm_up(), self._secondary.warm_up())
+
+    async def aclose(self) -> None:
+        await asyncio.gather(close_translator(self._primary), close_translator(self._secondary))
 
     async def __call__(self, messages: list[dict[str, str]]) -> AsyncIterator[str]:
         needs_llm = bool(messages) and prompt_has_glossary(messages[0]["content"])
@@ -689,6 +720,7 @@ class TranslationProcessor(FrameProcessor):
         self._timeline = timeline
         self._context_pairs = context_pairs
         self._clause_min_chars = clause_min_chars
+        self._translator = translate
         self._translate = as_streaming_translator(translate)
         self._model = model
         self._session = session
@@ -742,6 +774,9 @@ class TranslationProcessor(FrameProcessor):
         if isinstance(frame, StartFrame):
             await self.push_frame(frame, direction)
             self._ensure_worker()
+            warm_up = getattr(self._translator, "warm_up", None)
+            if warm_up is not None:  # open the connection now, so the first sentence reuses it
+                self.create_task(warm_up(), "translator-warm-up")
         elif isinstance(frame, EndFrame):
             await self._drain()
             await self.push_frame(frame, direction)
@@ -934,6 +969,10 @@ class TranslationProcessor(FrameProcessor):
         worker, self._worker = self._worker, None
         if worker is not None and not worker.done():
             await self.cancel_task(worker)
+
+    async def cleanup(self) -> None:
+        await super().cleanup()
+        await close_translator(self._translator)  # the call is over: release its connections
 
     async def process_utterance(self, utterance: _Utterance) -> None:
         """Translate one utterance and push the TTS frames. Never raises on provider errors."""
