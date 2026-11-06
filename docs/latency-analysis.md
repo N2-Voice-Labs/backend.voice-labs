@@ -272,3 +272,21 @@ The Runtime's own `GoogleTranslateTranslator`, identical request, seeded 6-8 s g
 | 30 s | 223 ms | 385 | 1295 | 0/100 | 0 |
 
 The reuse hypothesis is confirmed: with 5 s every request opened a connection; with 30 s none did. P50 saving 232 ms (both halves of the run agree: 438 to 212 ms, 465 to 224 ms). The 30 s P99 comes from two requests of about 1.3 s on a reused connection (no error, under the 2 s deadline); with n=100, P99 is the second-worst sample, so it is not a stable estimate. The absolute numbers are larger than the earlier 250 ms cold figure (network conditions differ); the live translation step measured 257 ms. Implemented as `GOOGLE_TRANSLATE_KEEPALIVE_S` (default 30; 5 restores the old behaviour). No periodic requests.
+
+### 10b. Larger keep-alive comparison (measured, n=500 per configuration)
+
+Same method as 10a, 4 parallel lanes of alternating blocks of 25, seeded 6-8 s gaps, the translator's 10 s test timeout (not the production 2 s). Raw rows, with connection age, idle time and phase times, are in `runtime/bench/keepalive/keepalive_500.json`.
+
+| keepalive_expiry | P50 | P90 | P95 | P99 | max | new TCP+TLS | errors |
+|---|---|---|---|---|---|---|---|
+| 5 s | 463 | 649 | 741 | 1402 | 2397 | 500/500 | 0 |
+| 30 s | 205 | 303 | 363 | 454 | 653 | 0/500 | 0 |
+
+- P50 saving 258 ms; the tail improves too (P99 1402 to 454 ms).
+- The two ~1.3 s requests on reused connections in 10a did not reproduce: none of 500 reused-connection requests exceeded 653 ms. They were an isolated spike, most likely on Google's side.
+- Connection age does not predict latency (correlation with latency 0.03; age 0-30 s P50 216, 30-60 s 202, 60-120 s 204, 120-400 s 204 ms; connections lived up to 176 s). Idle time (6-8 s) also does not (0.05). A reused request spends about 3 ms before sending and about 200 ms waiting for Google.
+- The slow 5 s requests are slow in connecting (`to_send_ms` up to 1.9 s for TCP+TLS) or in the first response (up to 1.5 s). One 5 s request took 2.4 s, longer than the production 2 s deadline: with the old behaviour such a handshake spike would have sent that sentence to the Gemini backup.
+
+### 10c. One translator per call
+
+`build_translator` runs once per pipeline (`translation_engine.py`, `pipeline.py`), so a call has one `GoogleTranslateTranslator` and one HTTP client shared by all participants; a new call opens a new connection. The call's `warm_up()` opens that connection at setup, so the first sentence reuses it if it arrives within the keep-alive window (30 s now; with 5 s it was almost always cold). The client is never closed explicitly; it is released with the pipeline. A pause longer than the keep-alive between two sentences costs one reconnect.
