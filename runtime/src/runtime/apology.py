@@ -184,6 +184,28 @@ def apology_plans(
     return plans
 
 
+def speaker_plans(
+    config: Any,
+    participants: ParticipantDirectory | None,
+    speaker_identity: str | None,
+    *,
+    directory: Path | None = None,
+) -> list[ApologyPlan]:
+    """The clip for one speaker whose utterance was lost, on their own output only.
+
+    Only a two-person session has a private output per speaker; elsewhere nothing is
+    returned (the one-way output belongs to the listener).
+    """
+
+    if participants is None or not len(participants) or not speaker_identity:
+        return []
+    for context in participants.contexts():
+        if context.identity == speaker_identity:
+            clip = load_apology(context.source_language, directory=directory)
+            return [ApologyPlan(context.output_destination, clip)] if clip is not None else []
+    return []
+
+
 def _targets(
     config: Any,
     participants: ParticipantDirectory | None,

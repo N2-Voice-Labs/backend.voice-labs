@@ -415,9 +415,23 @@ class GoogleTranslateTranslator:
     """
 
     URL = "https://translation.googleapis.com/language/translate/v2"
+    # Total deadline for one sentence. A request that outlives it counts as a failure, so
+    # the LLM fallback takes over instead of the speaker waiting on a hung connection.
+    DEFAULT_TIMEOUT_S = 2.0
 
-    def __init__(self, *, api_key: str, client: Any | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        client: Any | None = None,
+        timeout: float | None = None,
+        url: str | None = None,
+    ) -> None:
         self.model = "google-translate"
+        self.URL = (url or os.getenv("GOOGLE_TRANSLATE_BASE_URL") or self.URL).rstrip("/")
+        self._timeout = timeout if timeout is not None else float(
+            os.getenv("GOOGLE_TRANSLATE_TIMEOUT_S") or self.DEFAULT_TIMEOUT_S
+        )
         # A header, not ?key=: URLs end up in error messages and logs.
         self._headers = {"x-goog-api-key": api_key}
         if client is None:
@@ -439,10 +453,13 @@ class GoogleTranslateTranslator:
         if match is None:
             raise RuntimeError("google translate: no language pair in the translation prompt")
         source, target = match.groups()
-        response = await self._client.post(
-            self.URL,
-            headers=self._headers,
-            json={"q": messages[-1]["content"], "source": source, "target": target, "format": "text"},
+        response = await asyncio.wait_for(
+            self._client.post(
+                self.URL,
+                headers=self._headers,
+                json={"q": messages[-1]["content"], "source": source, "target": target, "format": "text"},
+            ),
+            self._timeout,
         )
         response.raise_for_status()
         return html.unescape(response.json()["data"]["translations"][0]["translatedText"])
@@ -457,9 +474,18 @@ class FallbackTranslator:
     does not wait for its timeout first.
     """
 
-    def __init__(self, primary: Any, secondary: Any, *, cooldown: float = 30.0) -> None:
+    def __init__(
+        self,
+        primary: Any,
+        secondary: Any,
+        *,
+        cooldown: float = 30.0,
+        primary_name: str = "primary",
+        secondary_name: str = "fallback",
+    ) -> None:
         self.model = f"{primary.model}+{secondary.model}"
         self._primary, self._secondary = primary, secondary
+        self._primary_name, self._secondary_name = primary_name, secondary_name
         self._cooldown = cooldown
         self._skip_until = 0.0
 
@@ -474,14 +500,33 @@ class FallbackTranslator:
                 if text and text.strip():
                     yield text
                     return
-                _logger.warning("Primary translator returned nothing; using the fallback")
+                _logger.warning(
+                    "Primary translator (%s) returned nothing; using the fallback (%s)",
+                    self._primary_name,
+                    self._secondary_name,
+                )
             except Exception as error:
                 self._skip_until = time.monotonic() + self._cooldown
-                _logger.warning("Primary translator failed (%s); using the fallback", type(error).__name__)
+                _logger.warning(
+                    "Primary translator (%s) failed (%s); using the fallback (%s)",
+                    self._primary_name,
+                    type(error).__name__,
+                    self._secondary_name,
+                )
         stream = self._secondary(messages)
         try:
             async for delta in stream:
                 yield delta
+        except Exception as error:
+            # Which provider broke: the failure report names it, not the session's llm.
+            _logger.warning(
+                "Fallback translator (%s) failed (%s)", self._secondary_name, type(error).__name__
+            )
+            try:
+                error.translator_provider = self._secondary_name  # type: ignore[attr-defined]
+            except Exception:  # pragma: no cover - exotic exception types
+                pass
+            raise
         finally:
             await _close_stream(stream)
 
@@ -607,10 +652,12 @@ class TranslationProcessor(FrameProcessor):
         clause_min_chars: int | None = CLAUSE_MIN_CHARS,
         on_empty_translation: EmptyTranslationHook | None = None,
         provider: str = "openai",
+        on_dropped: Callable[[str | None], None] | None = None,
     ) -> None:
         super().__init__()
         self._settings = settings
         self._provider = provider
+        self._on_dropped = on_dropped
         self._on_empty_translation = on_empty_translation
         self._timeline = timeline
         self._context_pairs = context_pairs
@@ -965,7 +1012,18 @@ class TranslationProcessor(FrameProcessor):
                 "stopped after %d spoken chunk(s)" % len(spoken) if spoken else "skipping utterance",
             )
             # PR-30: rejected key or no credit must end the call, not silently skip every turn.
-            report_provider_exception(self._session, "translation", self._provider, exc)
+            outcome = report_provider_exception(
+                self._session,
+                "translation",
+                getattr(exc, "translator_provider", None) or self._provider,
+                exc,
+            )
+            if not spoken and outcome in ("retry", "noted") and self._on_dropped is not None:
+                # The call goes on, so the speaker must not be left thinking they were heard.
+                try:
+                    self._on_dropped(utterance.user_id)
+                except Exception:
+                    _logger.warning("Could not notify the speaker of a dropped utterance", exc_info=True)
             if spoken:
                 # Report what the listener actually heard; keep it out of the context.
                 self._emit_assistant_transcript(
