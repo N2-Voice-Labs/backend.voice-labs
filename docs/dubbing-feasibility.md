@@ -1,6 +1,6 @@
 # Keeping the original voice under the translation: feasibility study
 
-Status: study only, nothing implemented. Question (from `docs/goal.md`): can each listener hear
+Status: study. A prototype of option B now exists, see [dubbing.md](dubbing.md). Question (from `docs/goal.md`): can each listener hear
 the speaker's real voice quietly under the translated voice (a "cinematic dubbing" feel), without
 adding translation latency, inside the current LiveKit design?
 

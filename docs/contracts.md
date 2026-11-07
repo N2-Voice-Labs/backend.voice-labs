@@ -652,6 +652,7 @@ POST /translations
   "creator": {"language": "ko", "voice_profile_id": null, "display_name": "Min"},
   "latency_mode": "balanced",
   "hear_original": false,
+  "dubbing": null,
   "glossary": null,
   "stt_provider_id": null,
   "llm_provider_id": null,
@@ -662,7 +663,11 @@ POST /translations
 `tts_provider_id` (optional) selects an organization's enabled `tts` provider record (for
 example ElevenLabs); omitted, Runtime uses its default TTS provider (Cartesia). See
 [Choosing the TTS provider](#choosing-the-tts-provider). `latency_mode` is `instant`, `balanced` (default) or `accurate` (otherwise `422` validation
-error); `hear_original` defaults to `false`; `glossary` follows the [glossary](#glossary-interpreterglossary-translationglossary)
+error); `hear_original` defaults to `false`; `dubbing` (optional, default off) keeps the other person's real
+voice quietly under the translation: `true` or a preset name (`subtle`, `balanced`, `present`), see
+[dubbing](dubbing.md); it replaces `hear_original` (both set is `422 invalid_interpreter_config`) and, unlike
+`hear_original`, keeps private listening, because the Runtime mixes the voice in and nobody receives
+the other person's microphone; `glossary` follows the [glossary](#glossary-interpreterglossary-translationglossary)
 rules, but any invalid glossary or other config failure surfaces here as the generic
 `422 invalid_interpreter_config`. The response is the same as `POST /voice/sessions`
 (`session_id`, `conversation_id`, `connection`, `session_token`, ...); the creator's token is a
