@@ -100,7 +100,12 @@ from .latency_modes import (
     default_engine_for,
     profile_for,
 )
-from .participants import MAX_PARTICIPANTS, ParticipantDirectory, normalize_language
+from .participants import (
+    MAX_PARTICIPANTS,
+    ParticipantDirectory,
+    normalize_language,
+    translation_destination,
+)
 from .provider_failures import report_provider_exception
 from .stall_watchdog import guard_first_token
 from .guard_events import current_turn_id
@@ -1065,7 +1070,11 @@ class TranslationProcessor(FrameProcessor):
                 )
                 if timeline is not None:
                     timeline.mark(utterance_timeline, "translation_first_chunk")
-                    timeline.enqueue_audio(utterance_timeline, listener_identity)
+                    timeline.enqueue_audio(
+                        utterance_timeline,
+                        listener_identity,
+                        translation_destination(lane) if lane is not None else None,
+                    )
                 changes: dict[str, str] = {}
                 if lane is not None:
                     current_language, current_voice = self._lane_tts[lane]

@@ -270,7 +270,7 @@ class ListenerRoutedLiveKitOutput(LiveKitOutputTransport):
         if destination is None:
             return await super().write_audio_frame(frame)
         tracker = self.timeline
-        submitting = tracker.output_submitting(frame.audio) if tracker is not None else None
+        submitting = tracker.output_submitting(frame.audio, destination) if tracker is not None else None
         try:
             return await self._router.write(
                 destination, self._convert_pipecat_audio_to_livekit(frame.audio)

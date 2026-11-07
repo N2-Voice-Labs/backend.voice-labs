@@ -46,14 +46,18 @@ chunks (a longer gap restarts the count). T5 is then the playout time that 500 m
 completes. An utterance whose audio ends before that gets T5 = end of its last voiced
 audio ("end of utterance").
 
-Attribution
------------
-Frames after the TTS do not say which utterance they belong to, but the translator speaks
-utterances one after another, so audio goes to the oldest utterance that has asked for
-audio and is not finished (:meth:`TimelineTracker.enqueue_audio`). An utterance finishes
-when all the chunks it handed to TTS reported ``TTSStoppedFrame`` (or, when that count is
-unknown, when the output went idle), or when the owning engine calls
-:meth:`TimelineTracker.finish`.
+Attribution and playout clocks
+------------------------------
+Frames after the TTS do not say which utterance they belong to, but each listener has their
+own TTS and their own output destination (``transport_destination``), and the translator
+speaks one listener's utterances one after another. So every destination has its own queue
+and its own playout clock: audio goes to the oldest utterance *of that destination* that has
+asked for audio and is not finished (:meth:`TimelineTracker.enqueue_audio`). A long
+translation for one listener therefore never delays, or takes the marks of, a translation
+for the other listener (two-person calls); engines with a single output use the destination
+``None`` and behave as before. An utterance finishes when all the chunks it handed to TTS
+reported ``TTSStoppedFrame`` (or, when that count is unknown, when the output went idle), or
+when the owning engine calls :meth:`TimelineTracker.finish`.
 
 Telemetry must never break the media pipeline: public tracker methods swallow errors.
 """
@@ -153,6 +157,8 @@ class UtteranceTimeline:
     t0: float
     speaker: str | None = None
     listener: str | None = None
+    # The output destination that plays this utterance's audio (None: the single output).
+    destination: str | None = None
     turn_id: int | None = None
     marks: dict[str, float] = field(default_factory=dict)
     turn_stopped: bool = False
@@ -205,8 +211,15 @@ class TimelineTracker:
         self._max_gap = max_gap_seconds
         self._pending: dict[str, UtteranceTimeline] = {}
         self._early_transcript: dict[str, deque[float]] = {}
-        self._queue: deque[UtteranceTimeline] = deque()
-        self._playhead: float | None = None
+        # One audio queue and one simulated playout clock per output destination (listener).
+        self._queues: dict[str | None, deque[UtteranceTimeline]] = {}
+        self._playheads: dict[str | None, float] = {}
+
+    @property
+    def _queue(self) -> "deque[UtteranceTimeline]":
+        """The queue of the single (``None``) destination."""
+
+        return self._queues.setdefault(None, deque())
 
     def now(self) -> float:
         return self._clock()
@@ -261,12 +274,15 @@ class TimelineTracker:
             timeline.marks["audio_in_last_voiced"] = self._clock()
 
     @_safe
-    def output_submitting(self, audio: bytes) -> UtteranceTimeline | None:
-        """Just before a chunk goes to LiveKit: mark the first voiced one of the head utterance."""
+    def output_submitting(
+        self, audio: bytes, destination: str | None = None
+    ) -> UtteranceTimeline | None:
+        """Just before a chunk goes to LiveKit: mark the first voiced one of the head utterance
+        of the destination it is written to."""
 
         if not diag_enabled():
             return None
-        timeline = self._head()
+        timeline = self._head(destination)
         if timeline is None or "livekit_submit" in timeline.marks or not is_voiced(audio):
             return None
         timeline.marks["livekit_submit"] = self._clock()
@@ -329,28 +345,37 @@ class TimelineTracker:
 
     @_safe
     def enqueue_audio(
-        self, timeline: UtteranceTimeline | None, listener: str | None = None
+        self,
+        timeline: UtteranceTimeline | None,
+        listener: str | None = None,
+        destination: str | None = None,
     ) -> None:
-        """The utterance is about to receive translated audio (idempotent)."""
+        """The utterance is about to receive translated audio (idempotent).
+
+        ``destination`` is the output the audio will be played on (the listener's track);
+        omit it for an engine with a single output.
+        """
 
         if timeline is None or timeline.queued or timeline.finished:
             return
         if listener:
             timeline.listener = listener
+        timeline.destination = destination
         now = self._clock()
-        self._queue = deque(
+        queue = deque(
             t
-            for t in self._queue
+            for t in self._queues.get(destination, ())
             if not (
                 t.speech_complete
                 and "first_audio" not in t.marks
                 and now - (t.completed_at or now) > STALE_SECONDS
             )
         )
-        while len(self._queue) >= MAX_QUEUED:
-            self._queue.popleft()
+        while len(queue) >= MAX_QUEUED:
+            queue.popleft()
         timeline.queued = True
-        self._queue.append(timeline)
+        queue.append(timeline)
+        self._queues[destination] = queue
 
     @_safe
     def chunk_pushed(self, timeline: UtteranceTimeline | None) -> None:
@@ -387,8 +412,9 @@ class TimelineTracker:
 
         if timeline is None or timeline.finished or "first_audio" in timeline.marks:
             return False
-        if timeline in self._queue:
-            self._queue.remove(timeline)
+        queue = self._queues.get(timeline.destination)
+        if queue is not None and timeline in queue:
+            queue.remove(timeline)
         timeline.queued = False
         timeline.speech_complete = False
         timeline.chunks_pushed = 0
@@ -396,22 +422,29 @@ class TimelineTracker:
         return True
 
     @_safe
-    def on_audio(self, audio: bytes, sample_rate: int, channels: int = 1) -> None:
-        """A chunk of outgoing audio (voiced or not) reached the output."""
+    def on_audio(
+        self, audio: bytes, sample_rate: int, channels: int = 1, destination: str | None = None
+    ) -> None:
+        """A chunk of outgoing audio (voiced or not) reached the output ``destination``.
+
+        Each destination has its own playout clock: audio for one listener never waits for
+        the audio of another.
+        """
 
         if not audio or sample_rate <= 0:
             return
         now = self._clock()
         duration = len(audio) / 2 / max(1, channels) / sample_rate
-        start = now if self._playhead is None else max(now, self._playhead)
-        self._playhead = start + duration
+        playhead = self._playheads.get(destination)
+        start = now if playhead is None else max(now, playhead)
+        self._playheads[destination] = start + duration
         if diag_enabled():
-            head = self._head()
+            head = self._head(destination)
             if head is not None and not head.emitted:
                 head.marks.setdefault("tts_first_frame", now)
         if not is_voiced(audio):
             return
-        timeline = self._head()
+        timeline = self._head(destination)
         if timeline is None:
             return
         end = start + duration
@@ -430,8 +463,8 @@ class TimelineTracker:
             self._emit(timeline)
 
     @_safe
-    def on_tts_stopped(self) -> None:
-        timeline = self._head()
+    def on_tts_stopped(self, destination: str | None = None) -> None:
+        timeline = self._head(destination)
         if timeline is not None:
             timeline.chunks_done += 1
             self._maybe_finish_by_count(timeline)
@@ -440,14 +473,15 @@ class TimelineTracker:
     def on_idle(self) -> None:
         """The output transport went quiet: ends an utterance whose chunk count is unknown."""
 
-        timeline = self._head()
-        if (
-            timeline is not None
-            and timeline.speech_complete
-            and timeline.chunks_pushed is None
-            and "first_audio" in timeline.marks
-        ):
-            self.finish(timeline)
+        for destination in list(self._queues):
+            timeline = self._head(destination)
+            if (
+                timeline is not None
+                and timeline.speech_complete
+                and timeline.chunks_pushed is None
+                and "first_audio" in timeline.marks
+            ):
+                self.finish(timeline)
 
     @_safe
     def finish(self, timeline: UtteranceTimeline | None) -> None:
@@ -458,8 +492,9 @@ class TimelineTracker:
         timeline.finished = True
         if self._pending.get(timeline.speaker or "") is timeline:
             del self._pending[timeline.speaker or ""]
-        if timeline in self._queue:
-            self._queue.remove(timeline)
+        queue = self._queues.get(timeline.destination)
+        if queue is not None and timeline in queue:
+            queue.remove(timeline)
         if timeline.last_voiced_end is not None and "stable" not in timeline.marks:
             timeline.marks["stable"] = timeline.last_voiced_end
         self._emit(timeline)
@@ -481,10 +516,13 @@ class TimelineTracker:
             return state.new_turn()
         return state.begin()  # ``turn_stopped`` closed the previous turn
 
-    def _head(self) -> UtteranceTimeline | None:
-        while self._queue and self._queue[0].finished:
-            self._queue.popleft()
-        return self._queue[0] if self._queue else None
+    def _head(self, destination: str | None = None) -> UtteranceTimeline | None:
+        queue = self._queues.get(destination)
+        if not queue:
+            return None
+        while queue and queue[0].finished:
+            queue.popleft()
+        return queue[0] if queue else None
 
     def _maybe_finish_by_count(self, timeline: UtteranceTimeline) -> None:
         if (
@@ -524,6 +562,7 @@ class TimelineTracker:
         payload["t0_monotonic_s"] = round(timeline.t0, 6)
         diag(
             f"utterance_timeline turn={timeline.turn_id} engine={timeline.engine} "
+            f"speaker={timeline.speaker} listener={timeline.listener} destination={timeline.destination} "
             f"t0_monotonic_s={timeline.t0:.6f} marks_ms={json.dumps(marks_ms)}"
         )
         session = self._session

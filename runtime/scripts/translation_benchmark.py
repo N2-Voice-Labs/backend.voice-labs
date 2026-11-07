@@ -419,7 +419,10 @@ async def run_session(args) -> None:
     print(json.dumps(summary, ensure_ascii=False, indent=1))
 
 
-FINE_LOG = re.compile(r"utterance_timeline turn=\S+ engine=\S+ t0_monotonic_s=([\d.]+) marks_ms=(\{.*\})")
+# ``speaker= listener= destination=`` were added to the line for two-person calls; older logs lack them.
+FINE_LOG = re.compile(
+    r"utterance_timeline turn=\S+ engine=\S+(?: speaker=\S+ listener=\S+ destination=\S+)? t0_monotonic_s=([\d.]+) marks_ms=(\{.*\})"
+)
 # Steps between two points of the fine timeline, in the order they happen. A point is a client
 # time (``client_*``, from the benchmark) or a Runtime mark. Network-dependent steps are tagged.
 FINE_STEPS = (

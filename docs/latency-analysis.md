@@ -296,3 +296,32 @@ Correction to the earlier version of this section: **the `/translations` path ne
 ### 10d. Concurrent calls (audit and test)
 
 Audit of module-level mutable state in the Runtime: the provider registries (`speech_providers`, `translation_engine`) are filled once at import and never written during a call; per-session state in `api.py` is keyed by session id, removed when the session ends, the finished-session history is capped at 1024, and `max_sessions` caps simultaneous calls. Everything else a call touches (translator and its HTTP client, the Google-to-Gemini fallback cooldown, history, timeline) lives on objects built per call. `test_concurrent_calls_do_not_share_translator_state` runs eight calls at once with interleaved timing, odd-numbered ones with a failing primary: each call speaks only its own translation (a primary outage and its cooldown stay inside that call) and each closes exactly its own translator once. Not tested: real load (many live LiveKit rooms); the per-call cost is one HTTP client and, with the 30 s keep-alive, at most one idle connection per call.
+
+## 11. Two-listener calls: `first_audio` used one playout clock for both listeners (found 2026-11-07, fixed in the working tree)
+
+**Symptom.** In the first real two-phone call, one turn (turn 11, Korean "이게 뭐야?" for the Korean listener) reported
+`first_audio = 3053 ms` against `tts_first_frame = 974 ms`; the turn before it (turn 9, an English translation for the other
+listener) had `first_audio = tts_first_frame = 1180 ms`.
+
+**Cause (code, not a log).** `TimelineTracker` kept one `_queue` and one `_playhead` for the whole pipeline, and
+`first_audio` is `max(arrival, playhead)` on that simulated clock, not a measurement. In a two-person call each
+listener has their own TTS, output destination and LiveKit track, so one listener's long translation moved the other listener's
+simulated playhead. Rebuilt from the recorded marks, turn 11's `first_audio` fell exactly 2.650 s after turn 9's, the plausible length of
+turn 9's English audio (the log with the audio lengths was lost, so this is consistent, not proven). The `livekit_submit < tts_first_frame` order
+of the same turn comes from the same lack of ownership: `_head()` was the front of one queue, so a chunk written to one listener's track could mark
+the other listener's utterance. Whether that is the whole explanation of 781 < 974 ms is not established.
+
+**Change.** The tracker now has one queue and one playout clock per output destination
+(`transport_destination`, the listener's track). TTS frames, `TTSStoppedFrame` and the hand-over to LiveKit are matched by the destination
+they carry, and the interpreter registers each utterance with its listener's destination. Single-output engines use the destination `None` and are
+unchanged. The diagnostic line now names `speaker`, `listener` and `destination`.
+
+**Tests** (`runtime/tests/test_timeline.py`): a 2.65 s translation for one listener does not move the other's first audio (the old result was
++2.65 s); the same listener still waits for their own earlier audio; one destination's stop frame never ends the other's utterance; a chunk
+written to one track never becomes the other's `livekit_submit`; frames carry their destination through `RuntimeEventProcessor`; single-output behavior is
+unchanged; the diagnostic line carries the identities.
+
+**Not yet measured.** The corrected number for the call above (about 974 ms server-side) is an estimate from the fixed arithmetic, not a new
+measurement; nothing was measured in the browser. For the next real call, `scripts/live_call_stack.sh` keeps every log under
+`runtime/bench/live/<timestamp>/` and `summary` prints each turn with speaker, listener and destination; a browser-side
+first-audible timestamp for each phone is still to be added, and is what would confirm the corrected number.
