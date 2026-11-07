@@ -1,85 +1,168 @@
-Our next objective is to determine whether cinematic dubbing actually improves the experience of real-time translated conversations.
+# Goal: Enable Real Human-to-Human Translated Calls Through Shareable Links
 
-The technical prototype is complete. Now we need to establish whether it delivers the intended product value.
+We are moving from infrastructure development to real-world product testing.
 
-### Primary goal
+Our immediate objective is to make our existing real-time translation system usable by two real people through a simple browser-based voice call.
 
-Make translated calls feel like natural communication between two real humans rather than interaction with an AI-generated voice.
+This is a prototyping and validation platform, not our final distribution channel. We may eventually integrate carrier calls, messengers, or native applications, but those are out of scope for now.
 
-We want to preserve the original speaker's identity, emotion, and human presence while ensuring the listener clearly understands the translation.
+## Primary objective
 
-The critical question is whether keeping the original voice audible improves trust and naturalness without making conversations confusing, distracting, or slower.
+Two people who speak different languages should be able to establish a real-time translated voice call without installing an application or creating accounts.
 
-### What I want to achieve
+The experience should be approximately as simple as joining a Google Meet call.
 
-Create realistic audio demonstrations of different listening experiences using our existing dubbing system.
+### Intended user experience
 
-Compare:
+**Person A:**
+1. Opens our website.
+2. Selects their language and the other participant's language.
+3. Clicks Start Call.
+4. Receives a shareable invitation link.
+5. Sends the link through KakaoTalk, WhatsApp, SMS, or another messenger.
 
-**AI-only translation:** The listener hears only the translated voice.
+**Person B:**
+1. Opens the invitation link.
+2. Confirms their language.
+3. Grants microphone access.
+4. Joins the existing call.
+5. Immediately begins communicating through our translation system.
 
-**Current cinematic dubbing:** The original speaker is heard with a slight delay, and their volume is dynamically reduced when translation begins.
+Both participants should hear translations in their respective languages.
 
-**Alternative cinematic dubbing:** Explore whether replaying a delayed portion of the original speech underneath the translation creates a more natural documentary-style experience.
+## Technical objectives
 
-The third option is exploratory. Do not implement a new production architecture unless the listening results justify it.
+### 1. Reuse existing infrastructure
 
-### Key considerations
+We already have:
 
-Our current implementation has an important limitation: during isolated sentences, the original voice finishes before the translation starts, so there is no meaningful overlap.
+- LiveKit.
+- Bidirectional real-time translation.
+- ElevenLabs STT/TTS.
+- Google Cloud Translation with Gemini fallback.
+- Per-call session isolation.
+- Audio routing.
+- Optional cinematic dubbing.
+- Latency instrumentation.
 
-Investigate whether this actually matters for perceived naturalness.
+Audit the existing application before implementing anything.
 
-Avoid sacrificing the existing low translation latency merely to create synchronized audio.
+Reuse existing components and avoid unnecessary architectural changes.
 
-Pay particular attention to:
+### 2. Implement browser-based calls
 
-- How natural the transitions between original and translated voices sound.
-- Whether the original voice makes the call feel more human.
-- Whether simultaneous languages interfere with comprehension.
-- Whether the original voice should be heard continuously or only briefly.
-- How the experience behaves during interruptions and overlapping conversation.
-- Whether users might mistake the translated voice for an AI caller rather than a real person using translation.
+Build the minimum frontend and backend functionality required to:
 
-### Validation approach
+- Create a call.
+- Generate a secure invitation link.
+- Join an existing call.
+- Connect both participants to the same translation session.
+- Display connection status.
+- Mute/unmute the microphone.
+- Hang up.
+- End and clean up abandoned sessions.
 
-Use existing recordings or synthetic audio to generate realistic listening examples.
+Support desktop and mobile browsers.
 
-Include short utterances, longer sentences, continuous speech, natural pauses, and interruptions.
+### 3. Make the experience simple
 
-Make the examples easy for a human listener to compare.
+Prioritize a minimal, functional interface.
 
-Preserve the same source content and translation across versions so the comparison isolates the audio presentation.
+Avoid unnecessary onboarding, registration, complex settings, or additional features.
 
-Recommend an objective listening evaluation that measures trust, intelligibility, naturalness, and preference.
+The recipient should be able to join with as few interactions as possible.
 
-Do not claim that the experience is better based solely on audio metrics. Human listening is required.
+Handle microphone permissions, audio playback restrictions, connection failures, and reconnections clearly.
 
-### Technical constraints
+### 4. Translation and dubbing
 
-Keep production dubbing disabled by default.
+Both participants must receive the correct translations.
 
-Do not modify the existing translation architecture, STT, TTS, fallback, or latency settings.
+For testing, support two audio experiences:
 
-Do not consume additional ElevenLabs credits.
+- AI translation only.
+- Live original voice with cinematic ducking.
 
-Use existing audio and offline processing wherever possible.
+Use the existing dubbing implementation.
 
-Investigate echo risk and resource consumption, but prioritize evaluating the actual listening experience over further engineering optimization.
+Make the original voice quieter when the AI translation starts. Start by testing approximately −24 dB during translated playback.
 
-### Definition of success
+Allow the experience to be selected for testing, but preserve existing production defaults.
 
-We should finish with realistic, directly comparable audio examples and a clear understanding of what remains to be validated by human listeners.
+Do not introduce additional translation latency.
 
-The final deliverable should include:
+### 5. Security and reliability
 
-1. Playable audio comparisons of the different approaches.
-2. An explanation of how each approach changes the listening experience.
-3. A recommended configuration for an initial human listening test.
-4. A simple evaluation protocol with measurable criteria.
-5. Technical limitations that could affect real phone calls.
-6. A recommendation on which experience should become our default if listener testing supports it.
+Even though this is a prototype, implement basic safeguards:
 
-Do not prematurely declare cinematic dubbing better than AI-only translation.
+- Unpredictable invitation links.
+- Expiring invitations.
+- Short-lived LiveKit access tokens.
+- Maximum two human participants per room.
+- No API credentials exposed to browsers.
+- Session cleanup after calls.
+- Protection against unauthorized joins.
+- Basic limits against resource abuse.
 
-The goal is to discover the best human-to-human communication experience, not simply demonstrate that our mixer works.
+### 6. Real-world testing
+
+The application should allow us to test:
+
+- Korean ↔ English translation.
+- End-to-end conversational latency.
+- Translation accuracy.
+- Sentence splitting.
+- Interruptions and overlapping speech.
+- AI-only versus cinematic dubbing.
+- Audio echo with headphones and speakers.
+- Mobile versus desktop behavior.
+- Connection stability.
+
+Keep existing instrumentation available for debugging.
+
+### Constraints
+
+- Do not implement SIP, carrier calling, or messenger voice-call integrations.
+- Do not build native mobile applications.
+- Do not introduce unnecessary infrastructure.
+- Preserve existing translation architecture.
+- Do not consume ElevenLabs credits or paid calling resources without authorization.
+- Keep the implementation modular enough to support additional calling platforms later.
+
+## Definition of success
+
+I can open our website on one device, create a translated call, copy its invitation link, open it on another device, and establish a real bidirectional conversation.
+
+One person speaks Korean.
+
+The other speaks English.
+
+Both hear accurate translations through our existing Runtime.
+
+The call works on desktop and mobile browsers, and both participants can disconnect normally.
+
+## Development instructions
+
+You have discretion over the technical implementation.
+
+First inspect the repository and determine what already exists.
+
+Implement the smallest maintainable solution that meets the objectives.
+
+Write appropriate automated tests and run the relevant test suites.
+
+Do not claim that browser compatibility or real-call performance has been verified until actual device testing has occurred.
+
+Commit completed and verified work.
+
+At completion, report:
+
+1. What was implemented.
+2. How to start the application locally.
+3. How to create and join a translated call.
+4. What external configuration is required.
+5. What has been tested automatically.
+6. What requires manual testing on real devices.
+7. Any limitations affecting real-world use.
+
+Prioritize getting two real people into a working translated conversation over adding features.

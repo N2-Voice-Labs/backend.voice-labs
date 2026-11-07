@@ -47,7 +47,7 @@ class InterpreterConfig(BaseModel):
     # Cinematic dubbing (Runtime ``dubbing``): the other person's real voice, quiet and ducked,
     # under the translation. Off (absent from the stored config) unless set; replaces
     # ``hear_original``. true = the default preset, or a preset name.
-    dubbing: bool | Literal["subtle", "balanced", "present"] | None = None
+    dubbing: bool | Literal["subtle", "balanced", "cinematic", "present"] | None = None
     # NS-08: terms the translation must respect; validated and normalized by
     # ``validate_glossary``. Absent from the stored config when not given.
     glossary: list[dict[str, Any]] | None = None

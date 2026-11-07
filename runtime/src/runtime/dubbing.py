@@ -73,6 +73,9 @@ class DubbingProfile:
 PROFILES: dict[str, DubbingProfile] = {
     "subtle": DubbingProfile("subtle", delay_ms=0, base_gain_db=-16, duck_gain_db=-26, attack_ms=150),
     "balanced": DubbingProfile("balanced"),
+    # The shareable-link calls' test setting: the balanced profile with the original 24 dB down
+    # while the translation speaks (goal: start near -24 dB; docs/dubbing-listening.md).
+    "cinematic": DubbingProfile("cinematic", duck_gain_db=-24),
     "present": DubbingProfile("present", delay_ms=300, base_gain_db=-6, duck_gain_db=-18, attack_ms=100),
 }
 _NUMBERS = ("delay_ms", "base_gain_db", "duck_gain_db", "attack_ms", "release_ms", "gate_db", "gate_hold_ms")

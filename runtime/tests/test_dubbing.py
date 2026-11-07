@@ -55,6 +55,15 @@ def level_db(x: np.ndarray) -> float:
 # -- settings ----------------------------------------------------------------------------
 
 
+def test_cinematic_profile_is_balanced_with_the_original_24_db_down() -> None:
+    cinematic = parse_dubbing("cinematic")
+    assert cinematic == PROFILES["cinematic"]
+    assert cinematic.duck_gain_db == -24
+    balanced = PROFILES["balanced"]
+    assert (cinematic.delay_ms, cinematic.base_gain_db, cinematic.attack_ms, cinematic.release_ms) == (
+        balanced.delay_ms, balanced.base_gain_db, balanced.attack_ms, balanced.release_ms)
+
+
 def test_dubbing_is_off_unless_asked_for() -> None:
     assert parse_dubbing(None) is None and parse_dubbing(False) is None
     assert parse_dubbing({"enabled": False}) is None

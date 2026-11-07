@@ -664,7 +664,7 @@ POST /translations
 example ElevenLabs); omitted, Runtime uses its default TTS provider (Cartesia). See
 [Choosing the TTS provider](#choosing-the-tts-provider). `latency_mode` is `instant`, `balanced` (default) or `accurate` (otherwise `422` validation
 error); `hear_original` defaults to `false`; `dubbing` (optional, default off) keeps the other person's real
-voice quietly under the translation: `true` or a preset name (`subtle`, `balanced`, `present`), see
+voice quietly under the translation: `true` or a preset name (`subtle`, `balanced`, `cinematic`, `present`), see
 [dubbing](dubbing.md); it replaces `hear_original` (both set is `422 invalid_interpreter_config`) and, unlike
 `hear_original`, keeps private listening, because the Runtime mixes the voice in and nobody receives
 the other person's microphone; `glossary` follows the [glossary](#glossary-interpreterglossary-translationglossary)
@@ -1003,3 +1003,18 @@ session contract.
 - Applies to the cascaded engine and to agent + translator mode. The realtime engine
   (gpt-realtime-translate) has no instruction or glossary field and ignores it.
 - An invalid glossary is rejected with 422 (`invalid_glossary: <reason>` for `translation`).
+
+## Shareable-link calls (`/calls`)
+
+Opt-in (`PLATFORM_PUBLIC_CALLS=1`, otherwise 404). Full description, configuration and security model: [calls](calls.md).
+
+| Route | Auth | Body → response |
+|---|---|---|
+| `POST /calls` | none (rate limited per address) | `{languages: [mine, theirs], name?, voice_profile_id?, latency_mode?, experience?: "ai_only"\|"cinematic"}` → the same reply as `POST /translations`: `session_id`, `conversation_id`, `connection {url, token}`, `session_token` |
+| `POST /calls/{session_id}/invite` | creator's session token | → `{code, expires_at, ttl_seconds}`; a new code replaces the old one; seats nobody |
+| `GET /calls/invites/{code}` | none (rate limited) | → `{from, me, them, expires_at}`; 404 `invite_not_found`, 410 `invite_expired` / `call_ended` |
+| `POST /calls/invites/{code}/join` | none (rate limited) | `{name?}` → `{participant_identity, connection, session_token, session_id, conversation_id, me, them, from}`; repeating it with the same code returns the same seat; 409 `guest_already_invited` for any other code |
+| `POST /calls/{session_id}/end` | either person's session token | → `{status}`; ends the call for both (idempotent). `POST /voice/sessions/{id}/end` stays creator-only |
+
+`experience: "cinematic"` sets `interpreter.dubbing = "cinematic"` (the `balanced` profile with the original at -24 dB while the translation speaks).
+Providers come from `PLATFORM_CALLS_PROVIDERS`, never from the request.
