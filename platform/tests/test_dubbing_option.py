@@ -27,6 +27,7 @@ def test_dubbing_is_absent_from_the_config_unless_set() -> None:
 def test_dubbing_is_passed_to_the_runtime_when_set() -> None:
     assert interpreter_config(payload(dubbing=True))["dubbing"] is True
     assert interpreter_config(payload(dubbing="subtle"))["dubbing"] == "subtle"
+    assert interpreter_config(payload(dubbing="cinematic"))["dubbing"] == "cinematic"
 
 
 def test_unknown_profiles_are_rejected() -> None:

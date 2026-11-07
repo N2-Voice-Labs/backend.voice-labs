@@ -49,7 +49,7 @@ class TranslationIn(BaseModel):
     latency_mode: str = DEFAULT_LATENCY_MODE
     hear_original: bool = False
     # Cinematic dubbing: the other person's real voice under the translation (default off).
-    dubbing: bool | Literal["subtle", "balanced", "present"] | None = None
+    dubbing: bool | Literal["subtle", "balanced", "cinematic", "present"] | None = None
     glossary: list[dict[str, Any]] | None = None
     # Optional provider records per slot (e.g. ElevenLabs STT, Gemini translation, ElevenLabs
     # voice); an omitted slot uses Runtime's default provider for it.

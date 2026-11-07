@@ -46,11 +46,18 @@ MISSING = "00000000-0000-4000-8000-0000000000ee"
 
 # --------------------------------------------------------------------- route tables
 
-PUBLIC = {("GET", "/health")}
+# The shareable-link call routes (calls.py) take no tenant id: they run as the system principal of the
+# configured calls organisation and find a session only by an unguessable invitation code
+# (tests/test_calls.py covers them, including that an organisation never sees another's call).
+PUBLIC = {("GET", "/health")} | set(auth.PUBLIC_CALL_ROUTES)
 
 # Routes with no tenant data. Each is justified; org-management routes are additionally
 # asserted superadmin-only in test_superadmin_only_routes.
 GLOBAL = {
+    # Invitation-code routes (calls.py): the code, not a tenant id, selects the call, and it is looked up
+    # only inside the configured calls organisation. Also listed in PUBLIC.
+    ("GET", "/calls/invites/{code}"),
+    ("POST", "/calls/invites/{code}/join"),
     # Static catalogue shared by every org (agent templates are cloned into the caller's org
     # by POST /agent-templates/{key}/agents, which is covered by the agents module cases).
     ("GET", "/agent-templates"),
@@ -106,6 +113,8 @@ PARAM_CASES = [
     # translations (two-person interpreter sessions)
     ("GET", "/translations/{session_id}"),
     ("POST", "/translations/{session_id}/invite"),
+    ("POST", "/calls/{session_id}/invite"),
+    ("POST", "/calls/{session_id}/end"),
     # conversations
     ("GET", "/conversations/{conversation_id}"),
     ("GET", "/conversations/{conversation_id}/messages"),

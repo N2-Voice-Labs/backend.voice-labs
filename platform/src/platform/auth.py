@@ -51,6 +51,15 @@ ORGANIZATION_HEADER = "x-organization-id"
 LAST_USED_THROTTLE = timedelta(minutes=1)
 
 PUBLIC_ROUTES = frozenset({("GET", "/health")})
+# Shareable-link calls (calls.py): no account. Each handler refuses with 404 unless
+# PLATFORM_PUBLIC_CALLS is on, and runs as the system principal of the calls organisation.
+PUBLIC_CALL_ROUTES = frozenset(
+    {
+        ("POST", "/calls"),
+        ("GET", "/calls/invites/{code}"),
+        ("POST", "/calls/invites/{code}/join"),
+    }
+)
 RUNTIME_TOKEN_ROUTES = frozenset(
     {
         ("POST", "/runtime/events"),
@@ -83,6 +92,12 @@ SESSION_SCOPED_ROUTES: dict[tuple[str, str], SessionScope] = {
     ("POST", "/voice/sessions/{session_id}/phone-participants"): SessionScope(
         "session_id", "session", creator_only=True
     ),
+    # The creator's shareable code (calls.py); a guest token cannot mint invitations.
+    ("POST", "/calls/{session_id}/invite"): SessionScope(
+        "session_id", "session", creator_only=True
+    ),
+    # Hang up: either person of a call may end it (calls.py); a guest still cannot use /voice/sessions/.../end.
+    ("POST", "/calls/{session_id}/end"): SessionScope("session_id", "session"),
     ("GET", "/translations/{session_id}"): SessionScope("session_id", "session"),
     ("POST", "/translations/{session_id}/invite"): SessionScope(
         "session_id", "session", creator_only=True
@@ -248,6 +263,13 @@ async def authenticate(request: Request, db: Session = Depends(get_db)) -> None:
     route = request.scope.get("route")
     route_key = (request.method, getattr(route, "path", request.url.path))
     if route_key in PUBLIC_ROUTES:
+        return
+    if route_key in PUBLIC_CALL_ROUTES:
+        from .calls import calls_org_id
+
+        request.state.ctx = AuthContext(
+            org_id=calls_org_id(), principal="system", role="owner", request_id=request_id
+        )
         return
     if route_key in RUNTIME_TOKEN_ROUTES:
         # The route checks X-Runtime-Token itself and resolves the org from the session.

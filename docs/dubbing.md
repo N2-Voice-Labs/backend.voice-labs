@@ -10,7 +10,7 @@ Design background and rejected options: [dubbing-feasibility.md](dubbing-feasibi
 
 ## Using it
 
-- Platform: `POST /translations` with `"dubbing": true` (or `"subtle"`, `"balanced"`, `"present"`).
+- Platform: `POST /translations` with `"dubbing": true` (or `"subtle"`, `"balanced"`, `"cinematic"`, `"present"`).
   Absent or `false` is exactly today's behaviour: the setting is not even stored in the hidden agent's
   config, so existing agents and their hashes are unchanged. It cannot be combined with `hear_original`.
 - Runtime: `interpreter.dubbing` takes the same value, or an object
@@ -133,3 +133,6 @@ study itself.
 Rendered comparisons of AI-only, the live prototype and two exploratory replay variants, their
 measured properties, a telephone-codec check and the listening-study protocol are in
 `docs/dubbing-listening.md` (audio in `runtime/bench/dubbing/listening/`).
+
+**`cinematic` profile.** The `balanced` profile with the original 24 dB down (instead of 20) while the translation speaks. It is what the
+"Audio" switch of the shareable-link calls ([calls](calls.md)) selects, as a starting point for testing, not a result of listening tests.

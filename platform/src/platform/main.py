@@ -15,6 +15,7 @@ from . import (
     analytics,
     audit,
     auth,
+    calls,
     campaigns,
     conversations,
     debug,
@@ -119,6 +120,7 @@ for router in (
     agents.router,
     sessions.router,
     translations.router,
+    calls.router,
     conversations.router,
     runtime_ingest.router,
 ):
