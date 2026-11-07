@@ -130,6 +130,18 @@ provider credits; if that matters, keep the URL private, lower the limits and th
   no code or token in the guest's URL or storage → no horizontal overflow on a phone. Runtime providers were stubs: **no translation ran in
   these checks**.
 
+## 6a. First real-provider run (2026-11-07, two phones, ElevenLabs STT/TTS + Google Translate, LiveKit Cloud)
+
+Two phones joined through a public tunnel (an SSH relay, closed afterwards). What happened, from the Platform and Runtime logs:
+
+| Call | Result |
+|---|---|
+| 1 | **Worked end to end.** English speech was transcribed and spoken back in Korean for the other phone: "You are correct. Thank you for that." → "맞습니다. 알려주셔서 감사합니다." and 3 more exchanges. Ended by the Runtime's idle timeout (nobody pressed End). |
+| 2 | Both phones in; the speakers talked **Russian** while the call was set to English ↔ Korean. Each person's speech-to-text is fixed to the language chosen for them, so the transcripts were garbled ("А сейчас еще, еще одно link…") and the translations followed. Not a bug, but the page should say that you must speak the language you picked. A few correct short exchanges ("Hello! Hello, hello!" → "안녕하세요!…"). Ended with a provider failure (below). |
+| 3 | **ElevenLabs "You have exceeded your quota."** The free account (10,000 characters) was used up. The Runtime reported `provider_failed` after about 16 s, and every later `POST /calls` was refused with 503 `provider_unavailable` (the Platform checks the providers first and refuses to start a call it cannot serve; this is the intended fail-closed behavior). The page now explains this in plain words. The quota resets around 2026-12-05, or upgrade the plan. |
+
+Measured on the Runtime (`RUNTIME_TIMELINE_DIAG=1`, two turns that completed): speech end → final transcript 418–425 ms, → turn end ≈ 500 ms, → first translation token 599–731 ms, → first translated audio frame 974–1180 ms Runtime-side; one turn reached LiveKit later (3053 ms, 781 ms in the submit step) and is not explained. STT first-result 0.41–0.50 s; TTS first byte 0.17–0.42 s. Only two turns carried the full timeline, so this is an indication, not a distribution. The ElevenLabs account counted 10,000 of 10,000 characters; the STT log summed to about 193 s of audio across the three calls. Translation accuracy, echo, phone-specific behavior and the cinematic option were **not** assessed in this run.
+
 ## 7. What needs manual testing on real devices (do not treat any of this as verified)
 
 1. A spoken Korean ↔ English call, desktop and phone: both hear the right translation, in the right ears, no echo of their own voice.
