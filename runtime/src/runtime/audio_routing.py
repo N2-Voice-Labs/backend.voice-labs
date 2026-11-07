@@ -76,7 +76,8 @@ from typing import Any
 
 from livekit import rtc
 
-from .participants import ParticipantDirectory, translation_destination
+from .dubbing import DubbingChannel, DubbingProfile
+from .participants import MAX_PARTICIPANTS, ParticipantDirectory, translation_destination
 
 _logger = logging.getLogger(__name__)
 
@@ -156,9 +157,14 @@ class ListenerAudioRouter:
         listen_room_factory: Callable[[str], Awaitable[Any]] | None = None,
         phone_room_factory: Callable[[str], Awaitable[Any]] | None = None,
         audio_stream_factory: Callable[[Any], Any] | None = None,
+        dubbing: DubbingProfile | None = None,
     ) -> None:
         self._directory = directory
         self.hear_original = hear_original
+        # Cinematic dubbing (see ``dubbing``): None keeps today's direct path untouched.
+        self._dubbing = dubbing
+        self._channels: dict[str, DubbingChannel] = {}  # listener identity -> its mix
+        self._original_resamplers: dict[str, Any] = {}  # speaker identity -> 16k/etc. -> track rate
         self._api_settings = api_settings
         self._api_factory = api_factory
         self._api: Any | None = None
@@ -441,6 +447,9 @@ class ListenerAudioRouter:
         entry = self._tracks.pop(identity, None)
         if entry is None:
             return
+        channel = self._channels.pop(identity, None)
+        if channel is not None:
+            await channel.aclose()
         self._subscribed_sids = {pair for pair in self._subscribed_sids if pair[1] != entry.sid}
         try:
             await (entry.room or room).local_participant.unpublish_track(entry.sid)
@@ -552,6 +561,10 @@ class ListenerAudioRouter:
         entry = self._tracks.get(identity) if identity else None
         if entry is None:
             return True  # that listener is not in the room: nothing to play to
+        channel = self._channel_for(entry) if self._dubbing is not None else None
+        if channel is not None and self._dubbable(frame):
+            channel.push_translation(bytes(frame.data))  # mixed on the next block, not delayed
+            return True
         try:
             await entry.source.capture_frame(frame)
             return True
@@ -561,10 +574,88 @@ class ListenerAudioRouter:
             return False
 
     def clear(self) -> None:
+        for channel in self._channels.values():
+            channel.clear()
         for entry in self._tracks.values():
             clear = getattr(entry.source, "clear_queue", None)
             if clear is not None:
                 clear()
+
+    # -- cinematic dubbing -------------------------------------------------------------
+
+    @property
+    def dubbing(self) -> DubbingProfile | None:
+        return self._dubbing
+
+    def _dubbable(self, frame: Any) -> bool:
+        rate, channels, _ = self._audio_format
+        return channels == 1 and getattr(frame, "sample_rate", None) == rate == 24000
+
+    def _channel_for(self, entry: _ListenerTrack) -> DubbingChannel | None:
+        channel = self._channels.get(entry.identity)
+        if channel is None and self._dubbing is not None and not self._closed:
+            rate = self._audio_format[0]
+
+            def make_frame(pcm: bytes) -> Any:
+                return rtc.AudioFrame(pcm, rate, 1, len(pcm) // 2)
+
+            channel = self._channels[entry.identity] = DubbingChannel(
+                entry.source, self._dubbing, make_frame=make_frame
+            )
+        return channel
+
+    async def set_dubbing(self, profile: DubbingProfile | None) -> None:
+        """Switch dubbing on, off or to another profile while the call runs.
+
+        The translation pipeline is not touched. Turning it off sends any translated audio still
+        waiting in a mix straight to the track, so a sentence in progress is not cut.
+        """
+
+        self._dubbing = profile
+        channels, self._channels = self._channels, {}
+        for identity, channel in channels.items():
+            rest = await channel.stop()
+            entry = self._tracks.get(identity)
+            if rest and entry is not None:
+                try:
+                    rate = self._audio_format[0]
+                    await entry.source.capture_frame(rtc.AudioFrame(rest, rate, 1, len(rest) // 2))
+                except Exception:
+                    _logger.debug("Could not flush translation audio", exc_info=True)
+        if profile is None:
+            self._original_resamplers.clear()
+
+    async def feed_original(self, speaker: str, pcm: bytes, sample_rate: int) -> None:
+        """A copy of ``speaker``'s microphone for the *other* person's mix. Never raises.
+
+        Called after the speaker's own audio has been handed to their lane (VAD, STT), so a
+        failure or delay here cannot affect transcription. The speaker's own mix never gets
+        their voice back.
+        """
+
+        if self._dubbing is None or self._closed or not pcm:
+            return
+        try:
+            lane = self._directory.lane_of(speaker)
+            if lane is None:
+                return
+            listener = self._directory.identity_for_lane((lane + 1) % MAX_PARTICIPANTS)
+            entry = self._tracks.get(listener) if listener else None
+            channel = self._channel_for(entry) if entry is not None else None
+            if channel is None:
+                return
+            target_rate = self._audio_format[0]
+            if sample_rate != target_rate:
+                resampler = self._original_resamplers.get(speaker)
+                if resampler is None:
+                    from pipecat.audio.utils import create_stream_resampler
+
+                    resampler = self._original_resamplers[speaker] = create_stream_resampler()
+                pcm = await resampler.resample(pcm, sample_rate, target_rate)
+            if pcm:
+                channel.push_original(pcm)
+        except Exception:
+            _logger.debug("Dubbing could not take the original audio", exc_info=True)
 
     def published_tracks(self) -> dict[str, str]:
         """``identity -> track sid`` of the translation tracks currently published."""
@@ -579,6 +670,10 @@ class ListenerAudioRouter:
             await asyncio.gather(runner, return_exceptions=True)
         streams = [self._stop_phone_stream(identity) for identity in list(self._phone_streams)]
         await asyncio.gather(*(task for task in streams if task), return_exceptions=True)
+        channels, self._channels = self._channels, {}
+        for channel in channels.values():
+            await channel.aclose()
+        self._original_resamplers.clear()
         async with self._tracks_lock:
             for entry in list(self._tracks.values()):
                 await _close_quietly(entry.source)

@@ -172,6 +172,9 @@ class InterpreterSettings:
     # Two-person sessions (RM-002): the listener also hears the other person's original
     # microphone. Default off: each person hears only the translation.
     hear_original: bool = False
+    # Cinematic dubbing (``dubbing``): the other person's real voice, quiet and ducked, under
+    # the translation. None (default) keeps translation-only. Replaces ``hear_original``.
+    dubbing: Any = None
     # NS-08: required renderings and never-translate terms; see ``glossary``.
     glossary: Glossary = ()
 
@@ -203,12 +206,18 @@ class InterpreterSettings:
         hear_original = raw.get("hear_original", False)
         if not isinstance(hear_original, bool):
             raise RuntimeError("interpreter hear_original must be a boolean")
+        from .dubbing import parse_dubbing
+
+        dubbing = parse_dubbing(raw.get("dubbing"))
+        if dubbing is not None and hear_original:
+            raise RuntimeError("interpreter dubbing replaces hear_original: set only one")
         settings = cls(
             languages=(pair[0], pair[1]),
             direction=direction,
             engine=engine,
             latency_mode=latency_mode,
             hear_original=hear_original,
+            dubbing=dubbing,
             glossary=glossary,
         )
         from .translation_engine import get_engine
