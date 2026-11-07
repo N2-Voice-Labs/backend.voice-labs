@@ -994,3 +994,70 @@ def test_translation_works_without_a_timeline_tracker() -> None:
     processor = make_processor()
     down, _ = run(processor, utterance("Hello", "en"))
     assert spoken(down) == ["T:Hello"]
+
+
+def test_call_lifecycle_warms_the_translator_at_start_and_closes_it_at_the_end() -> None:
+    events: list[str] = []
+
+    class Translator:
+        async def warm_up(self):
+            events.append("warm_up")
+
+        async def aclose(self):
+            events.append("aclose")
+
+        async def __call__(self, messages):
+            return "T:" + messages[-1]["content"]
+
+    processor = make_processor(translate=Translator())
+    down, _ = run(processor, utterance("hello"))
+    assert spoken(down) == ["T:hello"]
+    assert events == ["warm_up", "aclose"]  # once each, warm-up first
+
+
+def test_concurrent_calls_do_not_share_translator_state() -> None:
+    """Eight calls at once: each speaks only its own translation and closes only its own translator."""
+
+    from src.runtime.interpreter import FallbackTranslator
+
+    closed: list[int] = []
+
+    class Primary:
+        def __init__(self, number: int, fail: bool) -> None:
+            self.number, self.fail = number, fail
+            self.model = "fake"
+
+        async def warm_up(self):
+            pass
+
+        async def aclose(self):
+            closed.append(self.number)
+
+        async def __call__(self, messages):
+            await asyncio.sleep(0.01 * (self.number % 3))  # interleave the calls
+            if self.fail:
+                raise RuntimeError("provider down")
+            return f"call{self.number}:" + messages[-1]["content"]
+
+    class Backup(Primary):
+        async def __call__(self, messages):
+            yield f"backup{self.number}:" + messages[-1]["content"]
+
+        async def aclose(self):
+            pass
+
+    async def one_call(number: int):
+        # Odd calls have a failing primary: its cooldown must not leak into the other calls.
+        translator = FallbackTranslator(Primary(number, fail=number % 2 == 1), Backup(number, fail=False))
+        processor = make_processor(translate=translator)
+        down, _ = await run_test(processor, frames_to_send=utterance(f"hello{number}"), expected_down_frames=None)
+        return number, spoken(down)
+
+    async def main():
+        return await asyncio.gather(*(one_call(n) for n in range(8)))
+
+    results = dict(asyncio.run(main()))
+    for number, texts in results.items():
+        prefix = "backup" if number % 2 else "call"
+        assert texts == [f"{prefix}{number}:hello{number}"], (number, texts)
+    assert sorted(closed) == list(range(8))  # one close per call, none twice, none missing

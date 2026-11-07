@@ -6,6 +6,11 @@
   row is created, so it also covers the SIP bridge and campaign dispatcher. The count and
   the insert are not one atomic step: concurrent requests can overshoot the cap by the
   number of requests in flight.
+* Per-organisation bound on NEW hidden translation configurations per rolling 24 h
+  (``PLATFORM_MAX_TRANSLATION_CONFIGS``, default 50; ``0`` disables) -> 429
+  ``too_many_translation_configs`` when creating one more would exceed it (only system
+  agents created in the last 24 h count; reusing an existing one always works; checked in ``translations.system_agent_for``). Like the session
+  cap, concurrent creators can overshoot by the number of requests in flight.
 * Token bucket per API key (or per principal+org when there is no key) on
   ``POST /voice/sessions`` (``PLATFORM_SESSION_CREATE_RATE``, default ``30/min``; ``0``
   disables) -> 429 ``rate_limited`` with a ``Retry-After`` header. **The buckets live in
@@ -35,6 +40,9 @@ ACTIVE_SESSION_STATUSES: tuple[str, ...] = ("created", "running")
 
 DEFAULT_MAX_ACTIVE_SESSIONS_PER_ORG = 10
 DEFAULT_SESSION_CREATE_RATE = 30  # per minute
+# Hidden translation (system) agents: one row per distinct interpreter configuration.
+NEW_TRANSLATION_CONFIGS_PER_DAY = 50
+TRANSLATION_CONFIG_WINDOW_SECONDS = 24 * 3600
 
 
 def _env_int(name: str, default: int) -> int:
@@ -51,6 +59,13 @@ def _env_int(name: str, default: int) -> int:
 
 def max_active_sessions_per_org() -> int:
     return _env_int("PLATFORM_MAX_ACTIVE_SESSIONS_PER_ORG", DEFAULT_MAX_ACTIVE_SESSIONS_PER_ORG)
+
+
+def max_new_translation_configs_per_day() -> int:
+    """Per-org bound on new hidden translation configs per rolling 24 h
+    (``PLATFORM_MAX_TRANSLATION_CONFIGS``; 0 disables)."""
+
+    return _env_int("PLATFORM_MAX_TRANSLATION_CONFIGS", NEW_TRANSLATION_CONFIGS_PER_DAY)
 
 
 def session_create_rate() -> int:

@@ -1,11 +1,12 @@
 """Voice session routes: create, participants, phone participants, runtime handoff."""
 
+import hashlib
 import os
 from typing import Any
 from uuid import UUID, uuid4
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import update
 from sqlalchemy.orm import Session
@@ -34,7 +35,7 @@ from .models import (
     VoiceSession,
     utcnow,
 )
-from .tenancy import get_owned, get_scoped_db, scoped
+from .tenancy import get_owned, get_public_agent, get_scoped_db, scoped
 from .validation import validate_e164
 
 router = APIRouter()
@@ -145,12 +146,35 @@ def ready_voice(db: Session, ctx: AuthContext, voice_id: str) -> Voice:
     return voice
 
 
+def assert_voice_matches_tts(
+    db: Session, ctx: AuthContext, voice: Voice, tts_provider: str | None
+) -> None:
+    """409 ``voice_provider_mismatch`` when ``voice`` belongs to another TTS provider.
+
+    When no TTS provider is chosen the Runtime speaks with its default
+    (``health.DEFAULT_PROVIDERS['tts']``), which is what the voice is compared against.
+    Skipped only when the voice has no ``tts_provider_id`` or its provider row cannot be
+    resolved within the organisation.
+    """
+
+    tts_provider = tts_provider or provider_health.DEFAULT_PROVIDERS["tts"]
+    if not voice.tts_provider_id:
+        return
+    owner = db.scalars(
+        scoped(db, ctx, ProviderConfig).where(ProviderConfig.id == voice.tts_provider_id)
+    ).first()
+    if owner is not None and owner.provider != tts_provider:
+        raise HTTPException(status_code=409, detail="voice_provider_mismatch")
+
+
 def participant_entry(
     mode: str | None,
     interpreter: dict[str, Any] | None,
     participant: ParticipantIn,
     db: Session,
     ctx: AuthContext,
+    providers: dict[str, str] | None = None,
+    check_voice_provider: bool = True,
 ) -> dict[str, Any]:
     """Validate a participant against an interpreter and build its contract entry.
 
@@ -169,7 +193,10 @@ def participant_entry(
         raise HTTPException(status_code=422, detail="invalid_participant_language")
     voice_id = None
     if participant.voice_profile_id is not None:
-        voice_id = ready_voice(db, ctx, str(participant.voice_profile_id)).provider_voice_id
+        voice = ready_voice(db, ctx, str(participant.voice_profile_id))
+        if check_voice_provider:
+            assert_voice_matches_tts(db, ctx, voice, (providers or {}).get("tts"))
+        voice_id = voice.provider_voice_id
     display_name = (participant.display_name or "").strip() or None
     return {"language": language, "voice_id": voice_id, "display_name": display_name}
 
@@ -178,14 +205,16 @@ def uses_private_listening(mode: str | None, interpreter: dict[str, Any] | None)
     """Whether participants of this interpreter hear only through their own listen room.
 
     True for two-person interpreter sessions unless ``hear_original`` is set (everyone
-    then shares one room) or ``PLATFORM_PRIVATE_LISTENING`` turns the scheme off.
+    then shares one room). When the scheme is switched off with
+    ``PLATFORM_PRIVATE_LISTENING=0`` such a session is refused (409) rather than started
+    in a shared room that can leak the original microphones.
     """
 
-    return (
-        mode == "interpreter"
-        and not (interpreter or {}).get("hear_original")
-        and private_listening_enabled()
-    )
+    if mode != "interpreter" or (interpreter or {}).get("hear_original"):
+        return False
+    if not private_listening_enabled():
+        raise HTTPException(status_code=409, detail="private_listening_required")
+    return True
 
 
 def participant_connection(
@@ -301,6 +330,8 @@ async def open_voice_session(
     agent_id: UUID | str,
     deployment_id: UUID | str | None = None,
     participant: ParticipantIn | None = None,
+    allow_system: bool = False,
+    preflighted: bool = False,
 ) -> dict[str, Any]:
     """Validate, persist and hand off a new voice session inside ``ctx.org_id``.
 
@@ -313,9 +344,8 @@ async def open_voice_session(
 
     org_id = ctx.org_id
     limits.check_active_session_cap(db, ctx)
-    agent = get_owned(
-        db, ctx, AgentRecord, str(agent_id), not_found_detail="agent_not_found"
-    )
+    # System-managed (hidden interpreter) agents are only reachable by /translations.
+    agent = get_public_agent(db, ctx, agent_id, allow_system=allow_system)
     if agent.status != "enabled":
         raise HTTPException(status_code=409, detail="agent_not_enabled")
     deployment = None
@@ -330,7 +360,9 @@ async def open_voice_session(
     creator_entry = None
     if participant is not None:
         creator_entry = participant_entry(
-            agent.mode, agent.interpreter, participant, db, ctx
+            agent.mode, agent.interpreter, participant, db, ctx,
+            # Checked below against the agent's resolved providers (or the default).
+            check_voice_provider=False,
         )
     runtime_url = os.getenv("RUNTIME_API_URL")
     runtime_token = os.getenv("PLATFORM_RUNTIME_TOKEN", "")
@@ -366,8 +398,10 @@ async def open_voice_session(
             }
             if settings:
                 provider_settings[kind] = settings
+    for voice in used_voices.values():
+        assert_voice_matches_tts(db, ctx, voice, providers.get("tts"))
 
-    if runtime_url:
+    if runtime_url and not preflighted:
         # Before any row exists: a down provider must not leave a junk session behind.
         await provider_health.preflight_providers(
             provider_health.required_providers(agent.mode, agent.interpreter, providers)
@@ -549,12 +583,49 @@ async def get_voice_session(
     }
 
 
+class GuestInviteIn(ParticipantIn):
+    """A browser guest invite.
+
+    ``replace`` is the deliberate way to swap out the guest already seated: it revokes
+    the previous guest's session tokens, frees their Runtime slot and disconnects them
+    from the LiveKit rooms before the new seat is issued. Without it an existing guest is
+    never displaced.
+    """
+
+    replace: bool = False
+
+
+def _key_digest(key: str) -> str:
+    return hashlib.sha256(key.encode()).hexdigest()
+
+
+async def disconnect_livekit_participant(room_name: str, identity: str) -> None:
+    """Best-effort: drop ``identity`` from its session room and private listen room."""
+
+    if not all(os.getenv(n) for n in ("LIVEKIT_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET")):
+        return
+    try:
+        from livekit import api
+
+        async with sip._new_client() as lkapi:
+            for room in (room_name, listen_room_name(room_name, identity)):
+                try:
+                    await lkapi.room.remove_participant(
+                        api.RoomParticipantIdentity(room=room, identity=identity)
+                    )
+                except Exception:  # noqa: BLE001 - not connected / room gone
+                    continue
+    except Exception:  # noqa: BLE001
+        return
+
+
 @router.post("/voice/sessions/{session_id}/participants")
 async def add_voice_session_participant(
     session_id: UUID,
-    payload: ParticipantIn,
+    payload: GuestInviteIn,
     ctx: AuthContext = Depends(member_or_session),
     db: Session = Depends(get_scoped_db),
+    idempotency_key: str | None = Header(default=None, min_length=8, max_length=128),
 ) -> dict[str, Any]:
     """Add the second person to a two-participant interpreter call (TR-020).
 
@@ -563,6 +634,12 @@ async def add_voice_session_participant(
     and the live Runtime session is told, so the next utterance is already translated
     for them. Runtime routes each translation only to the other person and keeps the
     original microphones private unless the interpreter sets ``hear_original``.
+
+    Retry-safe with an ``Idempotency-Key`` header: the seat is persisted before the
+    Runtime is told, and a retry with the same key and language gets the same seat and
+    fresh credentials while every credential already issued stays valid. An invite
+    without a matching key never displaces a seated guest (409 ``guest_already_invited``);
+    ``replace: true`` does so deliberately.
     """
 
     session = _owned_session(db, ctx, session_id, lock=True)
@@ -572,15 +649,40 @@ async def add_voice_session_participant(
     participants = dict(contract.get("participants") or {})
     if not participants:
         raise HTTPException(status_code=409, detail="participants_not_enabled")
-    if len(participants) >= MAX_SESSION_PARTICIPANTS:
+    seat = next((i for i in participants if i.startswith("guest-")), None)
+    invite = dict(contract.get("guest_invite") or {})
+    key_hash = _key_digest(idempotency_key) if idempotency_key else None
+    retry = False
+    if seat is not None:
+        if key_hash is not None and invite.get("key_hash") == key_hash:
+            if participants[seat].get("language") != payload.language.strip().lower():
+                raise HTTPException(status_code=409, detail="idempotency_key_conflict")
+            retry = True
+        elif not payload.replace:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "guest_already_invited",
+                    "message": (
+                        "A guest already holds this call's second seat. Retry with the "
+                        "same Idempotency-Key, or send replace=true to replace them."
+                    ),
+                },
+            )
+    elif len(participants) >= MAX_SESSION_PARTICIPANTS:
         raise HTTPException(status_code=409, detail="session_full")
+    replaced = seat if (seat is not None and not retry) else None
+    others = {i: e for i, e in participants.items() if i != seat}
     entry = participant_entry(
-        contract.get("mode"), contract.get("interpreter"), payload, db, ctx
+        contract.get("mode"), contract.get("interpreter"), payload, db, ctx,
+        contract.get("providers"),
     )
-    if any(existing["language"] == entry["language"] for existing in participants.values()):
+    if retry:
+        entry = participants[seat]
+    elif any(existing["language"] == entry["language"] for existing in others.values()):
         # Two people speaking the same language have nothing to interpret.
         raise HTTPException(status_code=422, detail="participant_languages_must_differ")
-    identity = f"guest-{uuid4().hex[:8]}"
+    identity = seat if retry else f"guest-{uuid4().hex[:8]}"
     configured = all(
         os.getenv(name)
         for name in ("LIVEKIT_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET")
@@ -592,18 +694,30 @@ async def add_voice_session_participant(
         private=bool(contract.get("private_listening")),
     )
 
-    await notify_runtime_participant(session.id, identity, entry)
-
+    # Persist the seat first, then apply it to the Runtime: if the Runtime call or the
+    # response is lost, Platform's durable state still names the seat and a retry with
+    # the same key reconciles it without invalidating anything already issued.
+    if replaced is not None:
+        participants.pop(replaced)
     participants[identity] = entry
     contract["participants"] = participants
+    contract["guest_invite"] = {"identity": identity, "key_hash": key_hash}
     session.runtime_contract = contract
     guest_token, guest_hash = auth.new_session_token()
-    session.guest_token_hashes = [*(session.guest_token_hashes or []), guest_hash]
+    if replaced is not None:
+        session.guest_token_hashes = [guest_hash]
+    else:
+        session.guest_token_hashes = [*(session.guest_token_hashes or []), guest_hash]
     db.commit()
+    if replaced is not None:
+        await withdraw_runtime_participant(session.id, replaced)
+        await disconnect_livekit_participant(session.room_name, replaced)
+    await notify_runtime_participant(session.id, identity, entry)
     return {
         "participant_identity": identity,
         "connection": connection,
         "session_token": guest_token,
+        "replaced_participant_identity": replaced,
     }
 
 
@@ -677,7 +791,8 @@ async def add_voice_session_phone_participant(
     if len(participants) >= MAX_SESSION_PARTICIPANTS:
         raise HTTPException(status_code=409, detail="session_full")
     entry = participant_entry(
-        contract.get("mode"), contract.get("interpreter"), payload, db, ctx
+        contract.get("mode"), contract.get("interpreter"), payload, db, ctx,
+        contract.get("providers"),
     )
     if any(existing["language"] == entry["language"] for existing in participants.values()):
         raise HTTPException(status_code=422, detail="participant_languages_must_differ")

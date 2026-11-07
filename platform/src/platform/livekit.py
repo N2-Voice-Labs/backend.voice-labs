@@ -32,11 +32,12 @@ def phone_room_name(room_name: str, identity: str) -> str:
 def private_listening_enabled() -> bool:
     """Whether interpreter participants get the isolated listening scheme.
 
-    Default off until the web app joins the listen room (``connection.listen``); set
-    ``PLATFORM_PRIVATE_LISTENING=1`` to turn it on.
+    On by default: with ``hear_original`` off, the shared-room scheme would briefly expose
+    the other person's microphone. ``PLATFORM_PRIVATE_LISTENING=0`` turns it off, in which
+    case such sessions are refused instead (see ``sessions.uses_private_listening``).
     """
 
-    return os.getenv("PLATFORM_PRIVATE_LISTENING", "0").strip().lower() in {
+    return os.getenv("PLATFORM_PRIVATE_LISTENING", "1").strip().lower() in {
         "1",
         "true",
         "yes",

@@ -1030,3 +1030,26 @@ def test_participant_disconnect_during_a_pending_fallback_ends_the_session(monke
     assert client.of("SessionEnded") == [
         {"outcome": "ended", "reason": "participant_disconnected"}
     ]
+
+
+@pytest.mark.parametrize(
+    "code,reason,expected",
+    [
+        (1008, "Invalid API key", "auth"),  # ElevenLabs, observed against the real API
+        (1008, "invalid_api_key", "auth"),
+        (1008, "Unauthorized", "auth"),
+        (1011, "internal error", "unavailable"),
+        (1008, "policy violation", "unavailable"),  # no credential wording: still a drop
+        (1006, "", "unavailable"),
+    ],
+)
+def test_websocket_close_with_credential_wording_is_an_auth_failure(code, reason, expected) -> None:
+    from websockets.exceptions import ConnectionClosedError
+    from websockets.frames import Close
+
+    error = ConnectionClosedError(Close(code, reason), None)
+    assert classify_error(exception=error) == expected
+
+
+def test_oserror_with_permission_wording_is_not_taken_for_a_rejected_key() -> None:
+    assert classify_error(exception=PermissionError(13, "Permission denied")) != "auth"

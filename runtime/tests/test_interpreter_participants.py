@@ -962,3 +962,52 @@ def test_unanswered_phone_participant_can_be_withdrawn(runtime_api) -> None:
         assert set(api._session_contracts[key]["participants"]) == {ALICE}
         # The slot is free again for the retry.
         assert client.post(url, json=phone, headers=runtime_api).status_code == 200
+
+
+@pytest.mark.parametrize(
+    "voice",
+    ["../../v1/user", "a/b", "a?b=c", "%2e%2e", "a b", "x" * 129, "ok\n", "../"],
+)
+def test_directory_rejects_voice_ids_that_could_alter_a_provider_url(voice) -> None:
+    directory = ParticipantDirectory(["en", "ko"])
+    with pytest.raises(ParticipantError) as raised:
+        directory.set(ALICE, spec("en", voice))
+    assert raised.value.code == "invalid_participant_voice"
+    assert directory.get(ALICE) is None  # nothing was registered
+
+
+@pytest.mark.parametrize(
+    "voice", ["JBFqnCBsd6RMkjVDRZzb", "0a7b9c3e-1f4d-4a8e-9c2b-7d6e5f4a3b21", "alice-voice", "v_1"]
+)
+def test_directory_accepts_real_looking_provider_voice_ids(voice) -> None:
+    directory = ParticipantDirectory(["en", "ko"])
+    assert directory.set(ALICE, spec("en", voice)).voice_id == voice
+
+
+def test_elevenlabs_session_with_unsafe_default_voice_is_refused_before_any_state(
+    runtime_api,
+) -> None:
+    for bad in ("../v1/x", "voice id", "a" * 129, "ok\n"):
+        payload = start_payload(voice_id=bad, providers={"tts": "elevenlabs"})
+        with TestClient(api.app) as client:
+            response = client.post("/sessions", json=payload, headers=runtime_api)
+        assert (response.status_code, response.json()["detail"]) == (422, "invalid_voice_id")
+        key = payload["session_id"]
+        assert key not in api._session_contracts
+        assert key not in api._session_states
+        assert key not in api._active_sessions
+        assert key not in api._participant_directories
+
+
+def test_elevenlabs_session_with_safe_default_voice_is_accepted(runtime_api) -> None:
+    payload = start_payload(voice_id="Abc_123-x", providers={"tts": "elevenlabs"})
+    with TestClient(api.app) as client:
+        assert client.post("/sessions", json=payload, headers=runtime_api).status_code == 202
+
+
+def test_voice_id_check_does_not_affect_other_tts_providers(runtime_api) -> None:
+    with TestClient(api.app) as client:
+        for providers in ({"tts": "cartesia"}, {}):
+            payload = start_payload(voice_id="../weird id.with:chars", providers=providers)
+            response = client.post("/sessions", json=payload, headers=runtime_api)
+            assert response.status_code == 202, providers

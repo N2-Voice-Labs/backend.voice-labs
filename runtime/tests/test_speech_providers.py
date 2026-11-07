@@ -5,7 +5,8 @@ import pytest
 pytest.importorskip("pipecat")
 
 from src.runtime import speech_providers
-from src.runtime.pipeline import PipelineConfig
+from src.runtime import pipeline as pipeline_module
+from src.runtime.pipeline import PipelineConfig, register_tts_credentials
 from src.runtime.speech_providers import (
     build_llm,
     build_stt,
@@ -51,7 +52,7 @@ def restore_registries():
     """Undo any ``register_*`` made by a test (factories, settings and capabilities)."""
 
     tables = [*speech_providers._REGISTRIES.values(), speech_providers._SETTING_TYPES,
-              speech_providers._CAPABILITIES]
+              speech_providers._CAPABILITIES, pipeline_module._TTS_CREDENTIALS]
     saved = [dict(table) for table in tables]
     yield
     for table, snapshot in zip(tables, saved):
@@ -84,11 +85,30 @@ def test_session_start_rejects_unknown_providers_and_follows_the_registry(
         "CARTESIA_VOICE_ID": "voice",
     }.items():
         monkeypatch.setenv(key, value)
-    with pytest.raises(RuntimeError, match="unsupported tts provider: elevenlabs"):
-        PipelineConfig.from_environment({"providers": {"tts": "elevenlabs"}})
-    register_tts("elevenlabs", lambda config, settings, **extra: None)
-    config = PipelineConfig.from_environment({"providers": {"tts": "elevenlabs"}})
-    assert config.providers["tts"] == "elevenlabs"
+    with pytest.raises(RuntimeError, match="unsupported tts provider: espeak"):
+        PipelineConfig.from_environment({"providers": {"tts": "espeak"}})
+    register_tts("espeak", lambda config, settings, **extra: None)
+    # Registered but without a credential mapping: fail closed, never borrow cartesia's.
+    with pytest.raises(RuntimeError, match="tts provider has no credential mapping: espeak"):
+        PipelineConfig.from_environment({"providers": {"tts": "espeak"}})
+    register_tts_credentials("espeak", ())
+    config = PipelineConfig.from_environment({"providers": {"tts": "espeak"}})
+    assert config.providers["tts"] == "espeak"
+    # Explicitly credential-less: no cartesia fallback through the accessors.
+    assert config.tts_api_key == ""
+    assert config.tts_voice_id == ""
+
+
+def test_register_tts_credentials_validates_fields_and_unmapped_accessors_are_empty(
+    restore_registries,
+) -> None:
+    with pytest.raises(ValueError):
+        register_tts_credentials("x", ("openai_api_key",))
+    with pytest.raises(ValueError):
+        register_tts_credentials("x", ("cartesia_api_key", "cartesia_voice_id", "elevenlabs_api_key"))
+    config = _config(providers={"stt": "deepgram", "llm": "openai", "tts": "unmapped"})
+    assert config.tts_api_key == ""
+    assert config.tts_voice_id == ""
 
 
 def test_deepgram_factory_builds_the_service_with_the_session_settings(monkeypatch) -> None:
@@ -183,8 +203,8 @@ def test_llm_registry_has_openai_and_openai_compatible() -> None:
 
 
 def test_unknown_llm_provider_fails_with_a_clear_error() -> None:
-    config = _config(providers={"stt": "deepgram", "llm": "gemini", "tts": "cartesia"})
-    with pytest.raises(RuntimeError, match="unsupported llm provider: gemini"):
+    config = _config(providers={"stt": "deepgram", "llm": "mistral", "tts": "cartesia"})
+    with pytest.raises(RuntimeError, match="unsupported llm provider: mistral"):
         build_llm(config)
 
 
@@ -224,8 +244,8 @@ def _session_env(monkeypatch) -> None:
 
 def test_session_start_rejects_unknown_llm_provider(monkeypatch) -> None:
     _session_env(monkeypatch)
-    with pytest.raises(RuntimeError, match="unsupported llm provider: gemini"):
-        PipelineConfig.from_environment({"providers": {"llm": "gemini"}})
+    with pytest.raises(RuntimeError, match="unsupported llm provider: mistral"):
+        PipelineConfig.from_environment({"providers": {"llm": "mistral"}})
     with pytest.raises(RuntimeError, match="unsupported voice provider: x"):
         PipelineConfig.from_environment({"providers": {"voice": "x"}})
 
@@ -255,6 +275,7 @@ def test_provider_settings_keys_follow_the_registered_provider(
         lambda config, settings, **extra: None,
         settings={"model": str, "stability": (int, float)},
     )
+    register_tts_credentials("fake", ())
     config = PipelineConfig.from_environment(
         {
             "providers": {"tts": "fake"},
@@ -323,6 +344,7 @@ def fake_providers(restore_registries):
     register_stt("fake", stt, settings={"model": str, "language": str}, features=("keyterms",))
     register_llm("fake", llm, settings={"model": str})
     register_tts("fake", tts, settings={"language": str})
+    register_tts_credentials("fake", ())
     return calls
 
 
@@ -425,3 +447,256 @@ def test_pipelines_fail_for_unregistered_provider_before_building(light_models) 
     config = _config(providers={"stt": "whisper", "llm": "openai", "tts": "cartesia"})
     with pytest.raises(RuntimeError, match="unsupported stt provider: whisper"):
         build_livekit_pipeline(config)
+
+
+# -- the interpreter never uses the agent system prompt ----------------------------------
+
+_SECRET_PROMPT = "SECRET-AGENT-PROMPT-DO-NOT-USE"
+
+
+def _spy_translators(monkeypatch):
+    """Record every message list handed to a translator, with no network involved."""
+
+    from src.runtime import interpreter
+
+    seen: list[list[dict[str, str]]] = []
+
+    class FakeClient:
+        class chat:
+            class completions:
+                @staticmethod
+                async def create(**kwargs):
+                    seen.append(kwargs["messages"])
+                    raise AssertionError("stop")
+
+    original = interpreter.OpenAITranslator.__init__
+
+    def init(self, **kwargs):
+        original(self, **{**kwargs, "client": FakeClient()})
+
+    monkeypatch.setattr(interpreter.OpenAITranslator, "__init__", init)
+    return seen
+
+
+def _translators(worker):
+    from src.runtime.interpreter import TranslationProcessor
+
+    return [p for p in _inner(worker) if isinstance(p, TranslationProcessor)]
+
+
+def _assert_prompt_unused(fake_providers, worker, seen) -> None:
+    import asyncio
+
+    from src.runtime.interpreter import build_translation_messages
+
+    # The LLM registry entry (fake_providers) was never asked for a service.
+    assert "llm" not in [c[0] for c in fake_providers]
+    # No factory call (stt/tts settings and extras) mentions the prompt.
+    assert _SECRET_PROMPT not in repr(fake_providers)
+    processors = _translators(worker)
+    assert processors
+    for processor in processors:
+        async def run():
+            async for _ in processor._translate(build_translation_messages("hello", "en", "ko")):
+                pass
+
+        with pytest.raises(AssertionError):
+            asyncio.run(run())
+    assert seen and _SECRET_PROMPT not in repr(seen)
+
+
+def test_cascaded_interpreter_ignores_agent_system_prompt(
+    light_models, fake_providers, monkeypatch
+) -> None:
+    from src.runtime import pipeline
+
+    seen = _spy_translators(monkeypatch)
+    llm_calls: list[tuple] = []
+    monkeypatch.setattr(pipeline, "build_llm", lambda *a, **k: llm_calls.append(a))
+    config = _fake_config(
+        mode="interpreter",
+        interpreter={"languages": ["en", "ru"], "direction": "auto"},
+        system_instruction=_SECRET_PROMPT,
+    )
+    _, worker = pipeline.build_livekit_pipeline(config)
+
+    assert llm_calls == []
+    _assert_prompt_unused(fake_providers, worker, seen)
+
+
+def test_two_participant_interpreter_ignores_agent_system_prompt(
+    light_models, fake_providers, monkeypatch
+) -> None:
+    from uuid import uuid4
+
+    from src.runtime import pipeline
+    from src.runtime.participants import ParticipantDirectory
+    from src.runtime.session import RuntimeSession
+
+    seen = _spy_translators(monkeypatch)
+    llm_calls: list[tuple] = []
+    monkeypatch.setattr(pipeline, "build_llm", lambda *a, **k: llm_calls.append(a))
+    participants = {
+        "alice": {"language": "en", "voice_id": "v-a"},
+        "bob": {"language": "ko", "voice_id": "v-b"},
+    }
+    config = _fake_config(
+        mode="interpreter",
+        interpreter={"languages": ["en", "ko"], "direction": "one_way"},
+        participants=participants,
+        system_instruction=_SECRET_PROMPT,
+    )
+    session = RuntimeSession(uuid4(), uuid4(), uuid4())
+    session.participants = ParticipantDirectory.from_mapping(("en", "ko"), participants)
+    _, worker = pipeline.build_livekit_pipeline(config, session)
+
+    assert llm_calls == []
+    _assert_prompt_unused(fake_providers, worker, seen)
+
+
+# -- ElevenLabs STT + Gemini translation (no model is locked in code) -----------------
+
+
+_ELEVEN_STACK = {"stt": "elevenlabs", "llm": "gemini", "tts": "elevenlabs"}
+_ELEVEN_ENV = {
+    "LIVEKIT_URL": "ws://localhost:7880",
+    "RUNTIME_LIVEKIT_TOKEN": "token",
+    "LIVEKIT_ROOM_NAME": "room",
+    "ELEVENLABS_API_KEY": "el-key",
+    "ELEVENLABS_VOICE_ID": "voice123",
+    "GEMINI_API_KEY": "gm-key",
+}
+
+
+def _stack_env(monkeypatch, **extra) -> None:
+    for name in (
+        "DEEPGRAM_API_KEY", "OPENAI_API_KEY", "CARTESIA_API_KEY", "CARTESIA_VOICE_ID",
+        "GEMINI_MODEL", "GEMINI_TRANSLATION_MODEL", "GEMINI_BASE_URL", "OPENAI_BASE_URL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in {**_ELEVEN_ENV, **extra}.items():
+        monkeypatch.setenv(name, value)
+
+
+def test_elevenlabs_and_gemini_are_registered() -> None:
+    assert "elevenlabs" in stt_names()
+    assert "gemini" in llm_names()
+    assert provider_capabilities("stt", "elevenlabs").supports("keyterms")
+    assert not provider_capabilities("stt", "elevenlabs").supports("multi_language")
+
+
+def test_elevenlabs_stt_factory_uses_the_key_and_leaves_the_model_to_the_sdk(monkeypatch) -> None:
+    from pipecat.services.elevenlabs import stt
+
+    monkeypatch.setattr(stt, "ElevenLabsRealtimeSTTService", Recorder)
+    monkeypatch.setattr(speech_providers, "_ELEVENLABS_STT_SERVICE", None)
+    config = _config(
+        elevenlabs_api_key="el-key", providers={"stt": "elevenlabs", "llm": "openai", "tts": "cartesia"}
+    )
+
+    service = build_stt(config, "ko")
+
+    assert service.kwargs["api_key"] == "el-key"
+    assert service.kwargs["settings"] == {"language": "ko"}  # no model chosen by Voice Labs
+
+
+def test_elevenlabs_stt_maps_multi_to_auto_detection_and_passes_keyterms(monkeypatch) -> None:
+    from pipecat.services.elevenlabs import stt
+
+    monkeypatch.setattr(stt, "ElevenLabsRealtimeSTTService", Recorder)
+    monkeypatch.setattr(speech_providers, "_ELEVENLABS_STT_SERVICE", None)
+    config = _config(
+        elevenlabs_api_key="el-key",
+        providers={"stt": "elevenlabs", "llm": "openai", "tts": "cartesia"},
+        provider_settings={"stt": {"model": "custom-model"}},
+    )
+
+    service = build_stt(config, "multi", ["Voice Labs"])
+
+    assert service.kwargs["settings"] == {
+        "model": "custom-model",
+        "language": None,
+        "keyterms": ["Voice Labs"],
+    }
+
+
+def test_elevenlabs_stack_needs_only_elevenlabs_and_gemini_keys(monkeypatch) -> None:
+    _stack_env(monkeypatch)
+    config = PipelineConfig.from_environment({"providers": _ELEVEN_STACK})
+    assert (config.stt_api_key, config.llm_api_key, config.tts_api_key) == (
+        "el-key", "gm-key", "el-key",
+    )
+    assert config.deepgram_api_key == "" and config.openai_api_key == ""
+
+
+@pytest.mark.parametrize("missing", ["ELEVENLABS_API_KEY", "GEMINI_API_KEY"])
+def test_elevenlabs_stack_reports_a_missing_key(monkeypatch, missing) -> None:
+    _stack_env(monkeypatch)
+    monkeypatch.delenv(missing)
+    with pytest.raises(RuntimeError, match=missing):
+        PipelineConfig.from_environment({"providers": _ELEVEN_STACK})
+
+
+def test_default_stack_still_requires_deepgram_and_openai(monkeypatch) -> None:
+    _stack_env(monkeypatch, CARTESIA_API_KEY="c", CARTESIA_VOICE_ID="v")
+    with pytest.raises(RuntimeError, match="DEEPGRAM_API_KEY.*OPENAI_API_KEY|OPENAI_API_KEY.*DEEPGRAM_API_KEY"):
+        PipelineConfig.from_environment({})
+
+
+def test_stt_and_llm_providers_without_credential_mapping_fail_closed(
+    monkeypatch, restore_registries
+) -> None:
+    _stack_env(monkeypatch)
+    register_stt("orphan", lambda config, settings: None)
+    with pytest.raises(RuntimeError, match="stt provider has no credential mapping: orphan"):
+        PipelineConfig.from_environment({"providers": {**_ELEVEN_STACK, "stt": "orphan"}})
+    register_llm("orphan", lambda config, settings: None)
+    with pytest.raises(RuntimeError, match="llm provider has no credential mapping: orphan"):
+        PipelineConfig.from_environment({"providers": {**_ELEVEN_STACK, "llm": "orphan"}})
+
+
+def test_gemini_translation_has_no_built_in_model(monkeypatch) -> None:
+    _stack_env(monkeypatch)
+    config = PipelineConfig.from_environment({"providers": _ELEVEN_STACK})
+    with pytest.raises(RuntimeError, match="gemini translation needs a model"):
+        speech_providers.resolve_translation_model(config, default="gpt-4.1-mini")
+    # The record's setting, then the environment, supply it; the OpenAI default is ignored.
+    monkeypatch.setenv("GEMINI_TRANSLATION_MODEL", "env-model")
+    assert speech_providers.resolve_translation_model(config, default="gpt-4.1-mini") == "env-model"
+    with_setting = PipelineConfig.from_environment(
+        {"providers": _ELEVEN_STACK, "provider_settings": {"llm": {"model": "rec-model"}}}
+    )
+    assert speech_providers.resolve_translation_model(with_setting, default="x") == "rec-model"
+
+
+def test_gemini_translator_uses_its_own_endpoint_not_openai_base_url(monkeypatch) -> None:
+    _stack_env(monkeypatch, OPENAI_BASE_URL="https://openai.example/v1")
+    config = PipelineConfig.from_environment({"providers": _ELEVEN_STACK})
+    assert speech_providers.translation_endpoint(config) == (
+        "gm-key", speech_providers.GEMINI_DEFAULT_BASE_URL,
+    )
+    monkeypatch.setenv("GEMINI_BASE_URL", "https://proxy.example/openai/")
+    assert speech_providers.translation_endpoint(config)[1] == "https://proxy.example/openai/"
+    openai_config = _config(providers={"stt": "deepgram", "llm": "openai-compatible", "tts": "cartesia"})
+    assert speech_providers.translation_endpoint(openai_config) == ("oa-key", "https://openai.example/v1")
+
+
+def test_openai_translation_keeps_its_profile_default(monkeypatch) -> None:
+    config = _config(providers={"stt": "deepgram", "llm": "openai-compatible", "tts": "cartesia"})
+    assert speech_providers.resolve_translation_model(config, default="profile-model") == "profile-model"
+    with_setting = _config(provider_settings={"llm": {"model": "mine"}})
+    assert speech_providers.resolve_translation_model(with_setting, default="profile-model") == "mine"
+
+
+def test_translation_failures_are_reported_under_the_real_provider() -> None:
+    assert speech_providers.translation_provider(_config(providers=_ELEVEN_STACK)) == "gemini"
+    assert speech_providers.translation_provider(_config()) == "openai"
+
+
+def test_gemini_without_a_model_fails_at_session_start_for_translation(monkeypatch) -> None:
+    _stack_env(monkeypatch)
+    interpreter = {"mode": "interpreter", "interpreter": {"languages": ["en", "ko"], "direction": "one_way"}}
+    with pytest.raises(RuntimeError, match="gemini translation needs a model"):
+        PipelineConfig.from_environment({"providers": _ELEVEN_STACK, **interpreter})
+    monkeypatch.setenv("GEMINI_TRANSLATION_MODEL", "env-model")
+    assert PipelineConfig.from_environment({"providers": _ELEVEN_STACK, **interpreter}).providers == _ELEVEN_STACK

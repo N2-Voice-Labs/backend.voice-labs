@@ -15,6 +15,7 @@ from . import (
     analytics,
     audit,
     auth,
+    calls,
     campaigns,
     conversations,
     debug,
@@ -26,6 +27,7 @@ from . import (
     sessions,
     templates,
     tools,
+    translations,
     voices,
 )
 from . import health as provider_health
@@ -117,6 +119,8 @@ async def health() -> dict[str, str]:
 for router in (
     agents.router,
     sessions.router,
+    translations.router,
+    calls.router,
     conversations.router,
     runtime_ingest.router,
 ):

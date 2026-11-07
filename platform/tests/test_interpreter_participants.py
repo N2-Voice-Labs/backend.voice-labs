@@ -277,14 +277,93 @@ def test_add_participant_without_runtime_only_stores_it(monkeypatch) -> None:
     assert len(contract_for(session_id)["participants"]) == 2
 
 
-def test_third_participant_is_rejected(runtime) -> None:
+from src.platform.auth import hash_token  # noqa: E402
+
+KEY = "invite-key-0001"
+
+
+def guest_hashes(session_id: str) -> list:
+    with SessionLocal() as db:
+        return list(db.get(VoiceSession, session_id).guest_token_hashes or [])
+
+
+def test_keyed_retry_reuses_the_seat_and_keeps_earlier_access_valid(runtime) -> None:
     with TestClient(app) as client:
         _, session_id = start_two_person_session(client)
         url = f"/voice/sessions/{session_id}/participants"
-        assert client.post(url, json={"language": "ko"}).status_code == 200
-        full = client.post(url, json={"language": "ko"})
-        assert (full.status_code, full.json()["detail"]) == (409, "session_full")
+        headers = {"Idempotency-Key": KEY}
+        first = client.post(url, json={"language": "ko"}, headers=headers)
+        again = client.post(url, json={"language": "ko"}, headers=headers)
+        assert (first.status_code, again.status_code) == (200, 200)
+        assert again.json()["participant_identity"] == first.json()["participant_identity"]
+        # Both responses' tokens work: the guest keeps whatever access they received.
+        assert again.json()["session_token"] != first.json()["session_token"]
+        assert len(guest_hashes(session_id)) == 2
+        stored = guest_hashes(session_id)
+        for token in (first.json()["session_token"], again.json()["session_token"]):
+            assert hash_token(token) in stored
     assert len(contract_for(session_id)["participants"]) == 2
+
+
+def test_unkeyed_invite_never_displaces_a_seated_guest(runtime) -> None:
+    with TestClient(app) as client:
+        _, session_id = start_two_person_session(client)
+        url = f"/voice/sessions/{session_id}/participants"
+        first = client.post(url, json={"language": "ko"}).json()
+        before = guest_hashes(session_id)
+        blocked = client.post(url, json={"language": "ko"})
+        assert blocked.status_code == 409
+        assert blocked.json()["detail"]["code"] == "guest_already_invited"
+        # A different key is not a retry either.
+        other = client.post(
+            url, json={"language": "ko"}, headers={"Idempotency-Key": "another-key-01"}
+        )
+        assert other.status_code == 409
+    assert guest_hashes(session_id) == before
+    assert first["participant_identity"] in contract_for(session_id)["participants"]
+    assert len(contract_for(session_id)["participants"]) == 2
+
+
+def test_key_reused_with_another_language_is_a_conflict(runtime) -> None:
+    with TestClient(app) as client:
+        _, session_id = start_two_person_session(client)
+        url = f"/voice/sessions/{session_id}/participants"
+        headers = {"Idempotency-Key": KEY}
+        assert client.post(url, json={"language": "ko"}, headers=headers).status_code == 200
+        conflict = client.post(url, json={"language": "en"}, headers=headers)
+        assert (conflict.status_code, conflict.json()["detail"]) == (409, "idempotency_key_conflict")
+
+
+def test_replace_is_deliberate_and_revokes_the_previous_guest(runtime) -> None:
+    requests, _ = runtime
+    with TestClient(app) as client:
+        _, session_id = start_two_person_session(client)
+        url = f"/voice/sessions/{session_id}/participants"
+        old = client.post(url, json={"language": "ko"}).json()
+        new = client.post(url, json={"language": "ko", "replace": True})
+        assert new.status_code == 200, new.text
+        body = new.json()
+        assert body["replaced_participant_identity"] == old["participant_identity"]
+        assert body["participant_identity"] != old["participant_identity"]
+        stored = guest_hashes(session_id)
+        assert hash_token(old["session_token"]) not in stored
+        assert stored == [hash_token(body["session_token"])]
+    seats = contract_for(session_id)["participants"]
+    assert old["participant_identity"] not in seats and len(seats) == 2
+    assert any(
+        r.get("method") == "DELETE" and r["url"].endswith(f"/participants/{old['participant_identity']}")
+        for r in requests
+    )
+
+
+def test_browser_invite_is_full_when_a_phone_holds_the_second_seat(
+    runtime, livekit, sip_trunk
+) -> None:
+    with TestClient(app) as client:
+        session_id = create_session(client, make_agent(client), language="en").json()["session_id"]
+        assert client.post(phone_url(session_id), json=PHONE).status_code == 201
+        full = client.post(f"/voice/sessions/{session_id}/participants", json={"language": "ko"})
+        assert (full.status_code, full.json()["detail"]) == (409, "session_full")
 
 
 def test_add_participant_validations(runtime) -> None:
@@ -320,19 +399,24 @@ def test_add_participant_needs_an_active_two_person_session(runtime) -> None:
         assert (ended.status_code, ended.json()["detail"]) == (409, "session_not_active")
 
 
-def test_add_participant_runtime_failure_is_not_persisted(runtime) -> None:
+def test_add_participant_runtime_failure_keeps_the_seat_and_a_retry_reuses_it(runtime) -> None:
     _, state = runtime
     with TestClient(app) as client:
         _, session_id = start_two_person_session(client)
         url = f"/voice/sessions/{session_id}/participants"
         state["participant_status"] = 503
-        failed = client.post(url, json={"language": "ko"})
+        failed = client.post(url, json={"language": "ko"}, headers={"Idempotency-Key": KEY})
         assert (failed.status_code, failed.json()["detail"]["code"]) == (503, "runtime_unavailable")
-        assert len(contract_for(session_id)["participants"]) == 1
+        # Platform's durable state names the seat, so the retry can reconcile it.
+        seats = contract_for(session_id)["participants"]
+        assert len(seats) == 2
+        seat = next(i for i in seats if i.startswith("guest-"))
 
         # 404: the Runtime does not hold the session; the stored contract is enough.
         state["participant_status"] = 404
-        assert client.post(url, json={"language": "ko"}).status_code == 200
+        retried = client.post(url, json={"language": "ko"}, headers={"Idempotency-Key": KEY})
+        assert retried.status_code == 200
+        assert retried.json()["participant_identity"] == seat
     assert len(contract_for(session_id)["participants"]) == 2
 
 
@@ -409,14 +493,25 @@ def test_interpreter_without_a_participant_and_plain_agents_are_unchanged(runtim
         assert "private_listening" not in contract_for(response.json()["session_id"])
 
 
-def test_private_listening_is_off_by_default(runtime, livekit, monkeypatch) -> None:
+def test_private_listening_is_on_by_default(runtime, livekit, monkeypatch) -> None:
     requests, _ = runtime
     monkeypatch.delenv("PLATFORM_PRIVATE_LISTENING", raising=False)
     with TestClient(app) as client:
         created = create_session(client, make_agent(client), language="en").json()
-    assert set(created["connection"]) == {"url", "token"}
-    assert grants(created["connection"]["token"])["canSubscribe"] is True
-    assert "private_listening" not in requests[0]["json"]
+    assert grants(created["connection"]["token"])["canSubscribe"] is False
+    assert "listen" in created["connection"]
+    assert requests[0]["json"]["private_listening"] is True
+
+
+def test_session_is_refused_when_private_listening_is_off_and_originals_are_hidden(
+    runtime, livekit, monkeypatch
+) -> None:
+    requests, _ = runtime
+    monkeypatch.setenv("PLATFORM_PRIVATE_LISTENING", "0")
+    with TestClient(app) as client:
+        response = create_session(client, make_agent(client), language="en")
+    assert (response.status_code, response.json()["detail"]) == (409, "private_listening_required")
+    assert requests == []
 
 
 def test_a_guest_follows_the_privacy_mode_the_session_started_with(runtime, livekit, monkeypatch) -> None:
@@ -518,7 +613,11 @@ def test_phone_participant_without_private_listening_joins_the_session_room(
     dials, hangups, _ = sip_trunk
     monkeypatch.delenv("PLATFORM_PRIVATE_LISTENING", raising=False)
     with TestClient(app) as client:
-        session_id = create_session(client, make_agent(client), language="en").json()["session_id"]
+        agent = make_agent(
+            client,
+            interpreter={"languages": ["en", "ko"], "direction": "one_way", "hear_original": True},
+        )
+        session_id = create_session(client, agent, language="en").json()["session_id"]
         body = client.post(phone_url(session_id), json=PHONE).json()
         identity = body["participant_identity"]
         assert body["room_name"] == f"voice-labs-{session_id}" and not body["private_listening"]

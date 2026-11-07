@@ -19,7 +19,7 @@ from sqlalchemy import select
 from .context import AuthContext, require
 from .models import Agent as AgentRecord
 from .models import ProviderConfig, Voice
-from .tenancy import bypass, get_owned, get_scoped_db, scoped
+from .tenancy import bypass, get_owned, get_public_agent, get_scoped_db, scoped
 from .validation import (
     AUTO_DIRECTION_LANGUAGES,
     DEFAULT_LATENCY_MODE,
@@ -44,6 +44,10 @@ class InterpreterConfig(BaseModel):
     latency_mode: str = DEFAULT_LATENCY_MODE
     # RM-002: two-person calls also hear each other's original microphone (off by default).
     hear_original: bool = False
+    # Cinematic dubbing (Runtime ``dubbing``): the other person's real voice, quiet and ducked,
+    # under the translation. Off (absent from the stored config) unless set; replaces
+    # ``hear_original``. true = the default preset, or a preset name.
+    dubbing: bool | Literal["subtle", "balanced", "cinematic", "present"] | None = None
     # NS-08: terms the translation must respect; validated and normalized by
     # ``validate_glossary``. Absent from the stored config when not given.
     glossary: list[dict[str, Any]] | None = None
@@ -58,7 +62,15 @@ class InterpreterConfig(BaseModel):
         data = handler(self)
         if not data.get("glossary"):
             data.pop("glossary", None)
+        if not data.get("dubbing"):  # off: stored and hashed exactly as before the option existed
+            data.pop("dubbing", None)
         return data
+
+    @model_validator(mode="after")
+    def dubbing_replaces_hear_original(self) -> "InterpreterConfig":
+        if self.dubbing and self.hear_original:
+            raise ValueError("dubbing replaces hear_original: set only one")
+        return self
 
     @field_validator("languages", mode="before")
     @classmethod
@@ -421,7 +433,9 @@ async def list_agents(
 ) -> list[Agent]:
     return [
         agent_response(agent)
-        for agent in db.scalars(scoped(db, ctx, AgentRecord)).all()
+        for agent in db.scalars(
+            scoped(db, ctx, AgentRecord).where(AgentRecord.system.is_(False))
+        ).all()
     ]
 
 
@@ -431,9 +445,7 @@ async def get_agent(
     db: Session = Depends(get_scoped_db),
     ctx: AuthContext = Depends(require("member")),
 ) -> Agent:
-    record = get_owned(
-        db, ctx, AgentRecord, str(agent_id), not_found_detail="agent_not_found"
-    )
+    record = get_public_agent(db, ctx, agent_id)
     return agent_response(record)
 
 
@@ -444,9 +456,7 @@ async def update_agent(
     db: Session = Depends(get_scoped_db),
     ctx: AuthContext = Depends(require("admin")),
 ) -> Agent:
-    record = get_owned(
-        db, ctx, AgentRecord, str(agent_id), not_found_detail="agent_not_found"
-    )
+    record = get_public_agent(db, ctx, agent_id)
 
     changes = provider_ids_for_agent(
         payload.model_dump(exclude_unset=True), db, ctx=ctx
@@ -478,9 +488,7 @@ async def delete_agent(
     db: Session = Depends(get_scoped_db),
     ctx: AuthContext = Depends(require("admin")),
 ) -> None:
-    record = get_owned(
-        db, ctx, AgentRecord, str(agent_id), not_found_detail="agent_not_found"
-    )
+    record = get_public_agent(db, ctx, agent_id)
     record.status = "disabled"
     db.commit()
 

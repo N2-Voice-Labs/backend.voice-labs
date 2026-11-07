@@ -15,7 +15,7 @@ from .db import get_db
 from .models import Agent as AgentRecord
 from .models import AgentKnowledgeDocument, KnowledgeDocument
 from .runtime_auth import require_runtime_token
-from .tenancy import bypass, get_owned, get_scoped_db, scoped
+from .tenancy import bypass, get_owned, get_public_agent, get_scoped_db, scoped
 from .validation import reject_secret_configuration
 
 router = APIRouter(tags=["knowledge"])
@@ -170,9 +170,7 @@ async def delete_document(
 
 
 def get_agent_or_404(agent_id: UUID, db: Session, ctx: AuthContext) -> AgentRecord:
-    return get_owned(
-        db, ctx, AgentRecord, str(agent_id), not_found_detail="agent_not_found"
-    )
+    return get_public_agent(db, ctx, agent_id)
 
 
 @router.put("/agents/{agent_id}/knowledge", response_model=list[DocumentSummary])

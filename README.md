@@ -15,6 +15,10 @@ separate staging repository and is not connected to any remote.
 Each member retains its own `AGENTS.md`, README, project manifest, lockfile, tests, and
 configuration. Follow those member instructions when working within a project.
 
+## Docs
+
+See [`docs/`](docs/README.md) for contracts, status and plans.
+
 ## Checks
 
 From this directory (the `pythonpath` pytest setting makes the existing `src.*`

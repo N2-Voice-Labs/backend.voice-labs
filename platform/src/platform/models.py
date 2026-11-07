@@ -13,6 +13,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    false,
     text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
@@ -37,6 +38,9 @@ class TenantMixin:
 
 class Agent(TenantMixin, Base):
     __tablename__ = "agents"
+    __table_args__ = (
+        UniqueConstraint("organization_id", "system_key", name="uq_agents_org_system_key"),
+    )
     id: Mapped[str] = mapped_column(
         String(36), primary_key=True, default=lambda: str(uuid4())
     )
@@ -63,6 +67,14 @@ class Agent(TenantMixin, Base):
     interpreter: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     # Agent + translator (TR-040): {working_language, caller_languages}.
     translation: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # System-managed agents (the interpreter presets behind ``/translations``) are hidden
+    # from ``GET /agents``; users never create or edit them.
+    system: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=false(), nullable=False
+    )
+    # Idempotency key of a system agent (hash of its config), unique per organisation so
+    # concurrent get-or-create cannot make duplicates. NULL for ordinary agents.
+    system_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
     status: Mapped[str] = mapped_column(String(30), default="enabled")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow

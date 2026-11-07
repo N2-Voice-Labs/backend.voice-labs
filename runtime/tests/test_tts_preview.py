@@ -170,3 +170,161 @@ def test_preview_maps_provider_failures_without_leaking(monkeypatch, kwargs) -> 
     assert response.status_code == 502
     assert response.json() == {"detail": "tts_provider_error"}
     assert "cartesia-test-key" not in response.text
+
+
+def test_elevenlabs_preview_returns_a_wav_wrapping_the_pcm(monkeypatch) -> None:
+    import io
+    import wave
+
+    pcm = b"\x01\x00" * 480
+    calls = install_client(monkeypatch, FakeResponse(content=pcm))
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "eleven-test-key")
+    with TestClient(api.app) as client:
+        response = client.post(
+            "/tts/preview",
+            json={**BODY, "provider": "elevenlabs", "language": "ru"},
+            headers=TOKEN,
+        )
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "audio/wav"
+    request = calls[1]
+    assert request["url"] == "https://api.elevenlabs.io/v1/text-to-speech/voice-1"
+    assert request["params"] == {"output_format": "pcm_24000"}
+    assert request["headers"]["xi-api-key"] == "eleven-test-key"
+    assert request["json"] == {
+        "text": "Hello there",
+        "model_id": tts_preview.ELEVENLABS_DEFAULT_MODEL,
+        "language_code": "ru",
+    }
+    with wave.open(io.BytesIO(response.content), "rb") as handle:
+        assert (handle.getnchannels(), handle.getsampwidth(), handle.getframerate()) == (1, 2, 24000)
+        assert handle.readframes(handle.getnframes()) == pcm
+
+
+def test_elevenlabs_preview_errors_hide_the_upstream_body(monkeypatch) -> None:
+    install_client(monkeypatch, FakeResponse(status_code=401))
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "eleven-test-key")
+    with TestClient(api.app) as client:
+        response = client.post(
+            "/tts/preview", json={**BODY, "provider": "elevenlabs"}, headers=TOKEN
+        )
+    assert response.status_code >= 400
+    assert "secret upstream body" not in response.text
+    assert "eleven-test-key" not in response.text
+
+
+def test_elevenlabs_preview_requires_its_own_key(monkeypatch) -> None:
+    monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
+    calls = install_client(monkeypatch)
+    with TestClient(api.app) as client:
+        response = client.post(
+            "/tts/preview", json={**BODY, "provider": "elevenlabs"}, headers=TOKEN
+        )
+    assert response.status_code == 503
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("model", "language", "sent"),
+    [
+        (None, "ko", "ko"),  # default eleven_flash_v2_5
+        ("eleven_flash_v2_5", "ko-KR", "ko"),  # region suffix reduced
+        ("eleven_v3", "sw", "sw"),  # v3 covers more languages
+        ("eleven_flash_v2_5", "sw", None),  # not listed for flash
+        ("eleven_flash_v2_5", "not a language", None),
+        ("eleven_multilingual_v2", "en", None),  # language_code unsupported for multilingual_v2
+        ("eleven_flash_v2", "en", None),  # English-only model
+        ("some_future_model", "en", None),  # unknown model
+        ("eleven_flash_v2_5", None, None),
+    ],
+)
+def test_elevenlabs_preview_sends_language_code_only_when_supported(
+    monkeypatch, model, language, sent
+) -> None:
+    calls = install_client(monkeypatch, FakeResponse(content=b"\x01\x00" * 8))
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "eleven-test-key")
+    body = {**BODY, "provider": "elevenlabs"}
+    if model:
+        body["model"] = model
+    if language:
+        body["language"] = language
+    with TestClient(api.app) as client:
+        response = client.post("/tts/preview", json=body, headers=TOKEN)
+    assert response.status_code == 200
+    payload = calls[1]["json"]
+    assert payload["model_id"] == (model or "eleven_flash_v2_5")
+    assert payload.get("language_code") == sent
+    assert ("language_code" in payload) is (sent is not None)
+
+
+def test_preview_language_table_mirrors_pipecat() -> None:
+    tts_base = pytest.importorskip("pipecat.services.elevenlabs.tts_base")
+    assert tts_preview.ELEVENLABS_MODEL_LANGUAGES == tts_base.ELEVENLABS_MODEL_LANGUAGES
+
+
+BAD_VOICE_IDS = [
+    "../../v1/user",
+    "a/b",
+    "a?b=c",
+    "%2e%2e",
+    "",
+    "x" * 129,
+    "has space",
+    "tab\tid",
+    "abc\n",
+]
+
+
+@pytest.mark.parametrize("bad", BAD_VOICE_IDS)
+def test_elevenlabs_function_rejects_unsafe_voice_ids_before_any_request(monkeypatch, bad) -> None:
+    import asyncio
+
+    calls = install_client(monkeypatch)
+    with pytest.raises(tts_preview.TTSPreviewError, match="invalid voice id"):
+        asyncio.run(
+            tts_preview.synthesize_elevenlabs_preview(
+                api_key="k", provider_voice_id=bad, text="hi"
+            )
+        )
+    assert calls == []
+
+
+@pytest.mark.parametrize("bad", [b for b in BAD_VOICE_IDS if b])
+def test_elevenlabs_preview_endpoint_rejects_unsafe_voice_ids_without_a_request(
+    monkeypatch, bad
+) -> None:
+    calls = install_client(monkeypatch)
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "eleven-test-key")
+    with TestClient(api.app) as client:
+        response = client.post(
+            "/tts/preview",
+            json={**BODY, "provider": "elevenlabs", "provider_voice_id": bad},
+            headers=TOKEN,
+        )
+    assert response.status_code == 502
+    assert response.json() == {"detail": "tts_provider_error"}
+    assert calls == []
+
+
+def test_elevenlabs_valid_voice_id_is_sent_as_the_last_path_segment(monkeypatch) -> None:
+    calls = install_client(monkeypatch, FakeResponse(content=b"\x01\x00" * 10))
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "eleven-test-key")
+    with TestClient(api.app) as client:
+        response = client.post(
+            "/tts/preview",
+            json={**BODY, "provider": "elevenlabs", "provider_voice_id": "JBFqnCBsd6RMkjVDRZzb"},
+            headers=TOKEN,
+        )
+    assert response.status_code == 200
+    assert calls[1]["url"] == (
+        "https://api.elevenlabs.io/v1/text-to-speech/JBFqnCBsd6RMkjVDRZzb"
+    )
+
+
+def test_cartesia_preview_still_sends_the_voice_id_in_the_json_body(monkeypatch) -> None:
+    calls = install_client(monkeypatch)
+    with TestClient(api.app) as client:
+        client.post(
+            "/tts/preview", json={**BODY, "provider_voice_id": "any/odd id"}, headers=TOKEN
+        )
+    assert calls[1]["json"]["voice"]["id"] == "any/odd id"

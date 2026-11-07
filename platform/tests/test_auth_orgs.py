@@ -18,10 +18,24 @@ from src.platform.db import Base, SessionLocal, engine
 from src.platform.organizations import ensure_default_org
 from src.platform.models import (
     DEFAULT_ORGANIZATION_ID,
+    Agent,
     ApiKey,
+    Conversation,
     Organization,
     VoiceSession,
 )
+
+def make_conversation(db, org_id: str) -> str:
+    """A real conversation row (with its agent): PostgreSQL enforces voice_sessions' foreign key."""
+
+    agent = Agent(name=f"agent-{uuid4()}", organization_id=org_id)
+    db.add(agent)
+    db.flush()
+    conversation = Conversation(agent_id=agent.id, organization_id=org_id)
+    db.add(conversation)
+    db.flush()
+    return conversation.id
+
 
 ADMIN_KEY = "admin-key-1"
 ADMIN = {"Authorization": f"Bearer {ADMIN_KEY}"}
@@ -340,7 +354,7 @@ def test_session_token_ctx_carries_session_org(client) -> None:
         db.add(
             VoiceSession(
                 id=session_id,
-                conversation_id=str(uuid4()),
+                conversation_id=make_conversation(db, org_id),
                 room_name=f"room-{session_id}",
                 session_token_hash=digest,
                 guest_token_hashes=[guest_digest],
@@ -366,7 +380,7 @@ def test_session_token_rejected_when_org_suspended(client) -> None:
         db.add(
             VoiceSession(
                 id=session_id,
-                conversation_id=str(uuid4()),
+                conversation_id=make_conversation(db, org_id),
                 room_name=f"room-{session_id}",
                 session_token_hash=digest,
                 guest_token_hashes=[guest_digest],

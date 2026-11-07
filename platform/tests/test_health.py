@@ -330,3 +330,20 @@ async def test_webhook_failure_is_swallowed(monkeypatch):
     monkeypatch.setattr(health, "_transport", httpx.MockTransport(lambda r: httpx.Response(500)))
     await health.notify_changes([entry("stt", "deepgram", "down", "auth")])
     health.reset()
+
+
+# --- elevenlabs (Runtime probes ("tts", "elevenlabs")) ------------------------------
+
+
+def test_elevenlabs_tts_is_keyed_like_any_provider():
+    required = health.required_providers("agent", None, {"tts": "elevenlabs"})
+    assert ("tts", "elevenlabs") in required
+    # Runtime reports it ok, or does not report it at all (no key probe): never blocks.
+    health.assert_providers_ready(report(entry("tts", "elevenlabs")), required)
+    health.assert_providers_ready(report(entry("tts", "cartesia", "down", "auth")), required)
+    with pytest.raises(HTTPException) as caught:
+        health.assert_providers_ready(
+            report(entry("tts", "elevenlabs", "down", "quota", "out of credit or quota")), required
+        )
+    assert caught.value.detail["provider"] == "elevenlabs"
+    assert caught.value.detail["code"] == "provider_unavailable"

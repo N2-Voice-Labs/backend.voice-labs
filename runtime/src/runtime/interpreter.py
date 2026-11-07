@@ -61,7 +61,9 @@ utterance is still translated and reported, but nothing is spoken.
 from __future__ import annotations
 
 import asyncio
+import html
 import inspect
+import re
 import logging
 import math
 import os
@@ -76,6 +78,7 @@ from pipecat.frames.frames import (
     CancelFrame,
     EndFrame,
     Frame,
+    InputAudioRawFrame,
     InterimTranscriptionFrame,
     StartFrame,
     TranscriptionFrame,
@@ -84,11 +87,12 @@ from pipecat.frames.frames import (
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
     VADUserStartedSpeakingFrame,
+    VADUserStoppedSpeakingFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.services.settings import TTSSettings
 
-from .glossary import Glossary, GlossaryEntry, glossary_prompt, parse_glossary
+from .glossary import Glossary, GlossaryEntry, glossary_prompt, parse_glossary, prompt_has_glossary
 from .latency_modes import (
     DEFAULT_LATENCY_MODE,
     LATENCY_MODES,
@@ -100,7 +104,7 @@ from .participants import MAX_PARTICIPANTS, ParticipantDirectory, normalize_lang
 from .provider_failures import report_provider_exception
 from .stall_watchdog import guard_first_token
 from .guard_events import current_turn_id
-from .timeline import TimelineTracker, UtteranceTimeline
+from .timeline import TimelineTracker, UtteranceTimeline, diag, diag_enabled, is_voiced, probe_line
 
 _logger = logging.getLogger(__name__)
 
@@ -168,6 +172,9 @@ class InterpreterSettings:
     # Two-person sessions (RM-002): the listener also hears the other person's original
     # microphone. Default off: each person hears only the translation.
     hear_original: bool = False
+    # Cinematic dubbing (``dubbing``): the other person's real voice, quiet and ducked, under
+    # the translation. None (default) keeps translation-only. Replaces ``hear_original``.
+    dubbing: Any = None
     # NS-08: required renderings and never-translate terms; see ``glossary``.
     glossary: Glossary = ()
 
@@ -199,12 +206,18 @@ class InterpreterSettings:
         hear_original = raw.get("hear_original", False)
         if not isinstance(hear_original, bool):
             raise RuntimeError("interpreter hear_original must be a boolean")
+        from .dubbing import parse_dubbing
+
+        dubbing = parse_dubbing(raw.get("dubbing"))
+        if dubbing is not None and hear_original:
+            raise RuntimeError("interpreter dubbing replaces hear_original: set only one")
         settings = cls(
             languages=(pair[0], pair[1]),
             direction=direction,
             engine=engine,
             latency_mode=latency_mode,
             hear_original=hear_original,
+            dubbing=dubbing,
             glossary=glossary,
         )
         from .translation_engine import get_engine
@@ -322,6 +335,22 @@ async def _close_stream(stream: Any) -> None:
         return
 
 
+async def close_translator(translator: Any) -> None:
+    """Release a translator's HTTP connections at the end of a call; never raises.
+
+    Translators without ``aclose`` (plain functions in tests) are left alone. Safe to call
+    twice.
+    """
+
+    closer = getattr(translator, "aclose", None)
+    if closer is None:
+        return
+    try:
+        await closer()
+    except Exception:  # pragma: no cover - cleanup only
+        _logger.debug("Closing translator failed", exc_info=True)
+
+
 def as_streaming_translator(translate: TranslateFn) -> StreamingTranslateFn:
     """Wrap ``translate`` so it always yields text deltas.
 
@@ -360,6 +389,7 @@ class OpenAITranslator:
         client: Any | None = None,
     ) -> None:
         self.model = model
+        self._owns_client = client is None
         if client is None:
             from openai import AsyncOpenAI
 
@@ -370,6 +400,12 @@ class OpenAITranslator:
                 max_retries=1,
             )
         self._client = client
+
+    async def aclose(self) -> None:
+        """Close the client this translator created (an injected one belongs to the caller)."""
+
+        if self._owns_client:
+            await self._client.close()
 
     async def warm_up(self) -> None:
         """Open the HTTPS connection before the first translation (best effort, free)."""
@@ -396,6 +432,168 @@ class OpenAITranslator:
                 content = getattr(delta, "content", None)
                 if content:
                     yield content
+        finally:
+            await _close_stream(stream)
+
+
+_LANGS_IN_PROMPT = re.compile(r"from .*?\(([\w-]+)\) to .*?\(([\w-]+)\)")
+
+
+class GoogleTranslateTranslator:
+    """Translate with Google Cloud Translation (the classic machine-translation API).
+
+    Much faster than an LLM (a dedicated model, one short request) but not streamed and
+    blind to context: the whole sentence arrives at once, and the conversation history and
+    the glossary in the prompt are not used. The language pair is read from the prompt
+    :func:`build_translation_messages` builds.
+    """
+
+    URL = "https://translation.googleapis.com/language/translate/v2"
+    # Total deadline for one sentence. A request that outlives it counts as a failure, so
+    # the LLM fallback takes over instead of the speaker waiting on a hung connection.
+    DEFAULT_TIMEOUT_S = 2.0
+    # How long an idle connection stays open for the next sentence. httpx's own default is 5 s,
+    # shorter than the gap between sentences, so every sentence paid a new TCP+TLS handshake
+    # (measured: median 455 ms with 5 s, 223 ms with 30 s; scripts/keepalive_comparison.py).
+    # GOOGLE_TRANSLATE_KEEPALIVE_S=5 restores the old behaviour. No periodic requests are sent.
+    DEFAULT_KEEPALIVE_S = 30.0
+
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        client: Any | None = None,
+        timeout: float | None = None,
+        url: str | None = None,
+        keepalive_s: float | None = None,
+    ) -> None:
+        self.model = "google-translate"
+        self.URL = (url or os.getenv("GOOGLE_TRANSLATE_BASE_URL") or self.URL).rstrip("/")
+        self._timeout = timeout if timeout is not None else float(
+            os.getenv("GOOGLE_TRANSLATE_TIMEOUT_S") or self.DEFAULT_TIMEOUT_S
+        )
+        # A header, not ?key=: URLs end up in error messages and logs.
+        self._headers = {"x-goog-api-key": api_key}
+        self._owns_client = client is None
+        if client is None:
+            import httpx
+
+            keepalive = keepalive_s if keepalive_s is not None else float(
+                os.getenv("GOOGLE_TRANSLATE_KEEPALIVE_S") or self.DEFAULT_KEEPALIVE_S
+            )
+            client = httpx.AsyncClient(timeout=10.0, limits=httpx.Limits(keepalive_expiry=keepalive))
+        self._client = client
+
+    async def aclose(self) -> None:
+        if self._owns_client:
+            await self._client.aclose()
+
+    async def warm_up(self) -> None:
+        try:  # lists languages: opens the connection, translates (and bills) nothing
+            await self._client.get(
+                self.URL + "/languages", params={"target": "en"}, headers=self._headers
+            )
+        except Exception:
+            _logger.debug("Translator warm-up failed", exc_info=True)
+
+    async def __call__(self, messages: list[dict[str, str]]) -> str:
+        match = _LANGS_IN_PROMPT.search(messages[0]["content"]) if messages else None
+        if match is None:
+            raise RuntimeError("google translate: no language pair in the translation prompt")
+        source, target = match.groups()
+        extensions: dict[str, Any] | None = None
+        events: list[str] = []
+        if diag_enabled():  # diagnostics: did this request have to open a connection?
+
+            async def trace(name: str, _info: Any) -> None:
+                events.append(name)
+
+            extensions = {"trace": trace}
+        started = time.monotonic()
+        response = await asyncio.wait_for(
+            self._client.post(
+                self.URL,
+                headers=self._headers,
+                json={"q": messages[-1]["content"], "source": source, "target": target, "format": "text"},
+                extensions=extensions,
+            ),
+            self._timeout,
+        )
+        if extensions is not None:
+            diag(
+                "google_request new_connection="
+                f"{any(e.startswith('connection.connect_tcp.started') for e in events)} "
+                f"ms={(time.monotonic() - started) * 1000:.1f}"
+            )
+        response.raise_for_status()
+        return html.unescape(response.json()["data"]["translations"][0]["translatedText"])
+
+
+class FallbackTranslator:
+    """Fast machine translation first, the LLM when it cannot do the job.
+
+    The LLM (``secondary``) takes over when the sentence needs the glossary (machine
+    translation cannot apply it) and when ``primary`` fails or returns nothing. After a
+    failure ``primary`` is skipped for ``cooldown`` seconds so each sentence of an outage
+    does not wait for its timeout first.
+    """
+
+    def __init__(
+        self,
+        primary: Any,
+        secondary: Any,
+        *,
+        cooldown: float = 30.0,
+        primary_name: str = "primary",
+        secondary_name: str = "fallback",
+    ) -> None:
+        self.model = f"{primary.model}+{secondary.model}"
+        self._primary, self._secondary = primary, secondary
+        self._primary_name, self._secondary_name = primary_name, secondary_name
+        self._cooldown = cooldown
+        self._skip_until = 0.0
+
+    async def warm_up(self) -> None:
+        await asyncio.gather(self._primary.warm_up(), self._secondary.warm_up())
+
+    async def aclose(self) -> None:
+        await asyncio.gather(close_translator(self._primary), close_translator(self._secondary))
+
+    async def __call__(self, messages: list[dict[str, str]]) -> AsyncIterator[str]:
+        needs_llm = bool(messages) and prompt_has_glossary(messages[0]["content"])
+        if not needs_llm and time.monotonic() >= self._skip_until:
+            try:
+                text = await self._primary(messages)
+                if text and text.strip():
+                    yield text
+                    return
+                _logger.warning(
+                    "Primary translator (%s) returned nothing; using the fallback (%s)",
+                    self._primary_name,
+                    self._secondary_name,
+                )
+            except Exception as error:
+                self._skip_until = time.monotonic() + self._cooldown
+                _logger.warning(
+                    "Primary translator (%s) failed (%s); using the fallback (%s)",
+                    self._primary_name,
+                    type(error).__name__,
+                    self._secondary_name,
+                )
+        stream = self._secondary(messages)
+        try:
+            async for delta in stream:
+                yield delta
+        except Exception as error:
+            # Which provider broke: the failure report names it, not the session's llm.
+            _logger.warning(
+                "Fallback translator (%s) failed (%s)", self._secondary_name, type(error).__name__
+            )
+            try:
+                error.translator_provider = self._secondary_name  # type: ignore[attr-defined]
+            except Exception:  # pragma: no cover - exotic exception types
+                pass
+            raise
         finally:
             await _close_stream(stream)
 
@@ -520,13 +718,18 @@ class TranslationProcessor(FrameProcessor):
         context_pairs: int = MAX_CONTEXT_PAIRS,
         clause_min_chars: int | None = CLAUSE_MIN_CHARS,
         on_empty_translation: EmptyTranslationHook | None = None,
+        provider: str = "openai",
+        on_dropped: Callable[[str | None], None] | None = None,
     ) -> None:
         super().__init__()
         self._settings = settings
+        self._provider = provider
+        self._on_dropped = on_dropped
         self._on_empty_translation = on_empty_translation
         self._timeline = timeline
         self._context_pairs = context_pairs
         self._clause_min_chars = clause_min_chars
+        self._translator = translate
         self._translate = as_streaming_translator(translate)
         self._model = model
         self._session = session
@@ -547,6 +750,11 @@ class TranslationProcessor(FrameProcessor):
         self._history: deque[tuple[str, str, str, str]] = deque(maxlen=max(1, context_pairs))
         # Per-speaker turn state; a single-participant session uses the key "".
         self._turns: dict[str, _TurnState] = {}
+        # Diagnostics only (RUNTIME_TIMELINE_DIAG): latest partial per speaker, and the partial
+        # that was current at the VAD stop, waiting for the first final transcript.
+        self._diag = diag_enabled()
+        self._partials: dict[str, tuple[str, float]] = {}
+        self._probes: dict[str, tuple[float, tuple[str, float] | None]] = {}
         self._queue: asyncio.Queue[_Utterance] = asyncio.Queue()
         self._worker: asyncio.Task | None = None
 
@@ -575,6 +783,9 @@ class TranslationProcessor(FrameProcessor):
         if isinstance(frame, StartFrame):
             await self.push_frame(frame, direction)
             self._ensure_worker()
+            warm_up = getattr(self._translator, "warm_up", None)
+            if warm_up is not None:  # open the connection now, so the first sentence reuses it
+                self.create_task(warm_up(), "translator-warm-up")
         elif isinstance(frame, EndFrame):
             await self._drain()
             await self.push_frame(frame, direction)
@@ -589,6 +800,15 @@ class TranslationProcessor(FrameProcessor):
                 key = self._key(frame.user_id)
                 if self._timeline is not None:
                     self._timeline.transcript(key)
+                    if frame.finalized:
+                        self._timeline.final_transcript(key)
+                        probe = self._probes.pop(key, None)
+                        if probe is not None and diag_enabled():
+                            partial = probe[1]
+                            diag(probe_line(
+                                key, partial[1] if partial else None, probe[0],
+                                self._timeline.now(), partial[0] if partial else None, frame.text,
+                            ))
                 turn = self._turn(key)
                 turn.segments.append(frame)
                 if turn.turn_ended:
@@ -603,9 +823,25 @@ class TranslationProcessor(FrameProcessor):
         elif isinstance(frame, InterimTranscriptionFrame):
             if self._timeline is not None and frame.text and frame.text.strip():
                 self._timeline.transcript(self._key(frame.user_id))
+                if diag_enabled():
+                    self._partials[self._key(frame.user_id)] = (frame.text, self._timeline.now())
+            await self.push_frame(frame, direction)
+        elif isinstance(frame, InputAudioRawFrame):
+            if self._diag and self._timeline is not None and is_voiced(frame.audio):
+                self._timeline.voiced_input(self._key(getattr(frame, "user_id", None)))
             await self.push_frame(frame, direction)
         elif isinstance(frame, VADUserStartedSpeakingFrame):
             self._on_vad_started(frame)
+            await self.push_frame(frame, direction)
+        elif isinstance(frame, VADUserStoppedSpeakingFrame):
+            if self._timeline is not None:
+                if self._participants is None:
+                    self._timeline.vad_stopped("", frame.stop_secs)
+                elif frame.metadata.get("user_id"):
+                    self._timeline.vad_stopped(frame.metadata["user_id"], frame.stop_secs)
+                if diag_enabled():
+                    for key in self._frame_keys(frame):
+                        self._probes[key] = (self._timeline.now(), self._partials.get(key))
             await self.push_frame(frame, direction)
         elif isinstance(frame, UserStartedSpeakingFrame):
             # Late segments still pending belong to the previous turn.
@@ -625,6 +861,10 @@ class TranslationProcessor(FrameProcessor):
 
     def _on_vad_started(self, frame: VADUserStartedSpeakingFrame) -> None:
         """T0/T1 of an utterance (RM-003); two-person lanes tag the speaker's identity."""
+
+        if diag_enabled():  # a partial of the previous utterance must not be mistaken for this one
+            for key in self._frame_keys(frame):
+                self._partials.pop(key, None)
 
         if self._timeline is None:
             return
@@ -717,7 +957,7 @@ class TranslationProcessor(FrameProcessor):
                 # ST-10a: a dropped utterance is never silent. ``other`` is emitted and the
                 # call goes on; repeated ones end it (see provider_failures).
                 report_provider_exception(
-                    self._session, "translation", "openai", exc, stage="process_utterance"
+                    self._session, "translation", self._provider, exc, stage="process_utterance"
                 )
             finally:
                 self._queue.task_done()
@@ -738,6 +978,10 @@ class TranslationProcessor(FrameProcessor):
         worker, self._worker = self._worker, None
         if worker is not None and not worker.done():
             await self.cancel_task(worker)
+
+    async def cleanup(self) -> None:
+        await super().cleanup()
+        await close_translator(self._translator)  # the call is over: release its connections
 
     async def process_utterance(self, utterance: _Utterance) -> None:
         """Translate one utterance and push the TTS frames. Never raises on provider errors."""
@@ -877,7 +1121,18 @@ class TranslationProcessor(FrameProcessor):
                 "stopped after %d spoken chunk(s)" % len(spoken) if spoken else "skipping utterance",
             )
             # PR-30: rejected key or no credit must end the call, not silently skip every turn.
-            report_provider_exception(self._session, "translation", "openai", exc)
+            outcome = report_provider_exception(
+                self._session,
+                "translation",
+                getattr(exc, "translator_provider", None) or self._provider,
+                exc,
+            )
+            if not spoken and outcome in ("retry", "noted") and self._on_dropped is not None:
+                # The call goes on, so the speaker must not be left thinking they were heard.
+                try:
+                    self._on_dropped(utterance.user_id)
+                except Exception:
+                    _logger.warning("Could not notify the speaker of a dropped utterance", exc_info=True)
             if spoken:
                 # Report what the listener actually heard; keep it out of the context.
                 self._emit_assistant_transcript(
