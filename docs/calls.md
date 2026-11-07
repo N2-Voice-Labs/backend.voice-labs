@@ -142,6 +142,43 @@ Two phones joined through a public tunnel (an SSH relay, closed afterwards). Wha
 
 Measured on the Runtime (`RUNTIME_TIMELINE_DIAG=1`, two turns that completed): speech end → final transcript 418–425 ms, → turn end ≈ 500 ms, → first translation token 599–731 ms, → first translated audio frame 974–1180 ms Runtime-side; one turn reached LiveKit later (3053 ms, 781 ms in the submit step) and is not explained. STT first-result 0.41–0.50 s; TTS first byte 0.17–0.42 s. Only two turns carried the full timeline, so this is an indication, not a distribution. The ElevenLabs account counted 10,000 of 10,000 characters; the STT log summed to about 193 s of audio across the three calls. Translation accuracy, echo, phone-specific behavior and the cinematic option were **not** assessed in this run.
 
+## 6b. Audio path: the browser must join the private listen room (fixed 2026-11-08)
+
+With private listening (the default for two-person calls) the session-room LiveKit token **cannot subscribe to anything**, and each
+person's translation is published by the Runtime on `translation-for-<identity>` in a separate subscribe-only room
+(`connection.listen`, see [contracts](contracts.md)). The call page used to connect only to the session room, so **a browser never
+received any translated audio** (the transcript worked, the sound did not). `useCallRoom` now joins the listen room next to the session
+room (`CallCredentials.listen`, passed from the create and join replies) and plays that track through the same element path as before. The earlier
+two-phone call's transcript is therefore real, but whether anybody heard the voice is unknown; it has to be re-run with the fixed page.
+
+## 6c. Browser-side audio latency (opt-in)
+
+Off by default. Switch on with `?latency=1` in the page address (on `/call`, or `/join?latency=1#c=…`) or `localStorage["vl-latency-diag"] = "1"`;
+read it with `window.__voiceLabsLatency.export()` in the console. It taps the **translated track this person listens to** (never their own
+microphone), adds no node to the playback path, and records only event names, `performance.now()` times, identities, track names and counts: no speech and no credentials.
+
+| Event | Exact meaning |
+|---|---|
+| `listener_room_connected` | the listen room's connect resolved |
+| `translated_track_subscribed` | the `translation-for-<identity>` audio track was subscribed (tagged with `listener`, `speaker` = the other participant seen in the session room, `track`) |
+| `first_rtp_audio_received` | the receiver's `bytesReceived` first became > 0 (polled every 250 ms; says the track carries audio, not that a translation started) |
+| `browser_first_voiced_audio` (`seq` n) | the page's analyser first read non-silent PCM (RMS ≥ 0.01 for ≥ 40 ms) from the track for the nth voiced stretch, backdated to its first voiced sample; resolution 20 ms, later in a background tab. **Not confirmed audibility**: the output device, volume and the OS are out of view |
+| `browser_voiced_audio_ended` (`seq` n) | the last voiced sample before 400 ms of silence |
+| `playback_started` / `playback_failed` / `playback_blocked` / `playback_allowed` | the element's `playing`, a rejected `play()` (reason = error name, e.g. `NotAllowedError`), the page's autoplay status |
+| `element_waiting` / `element_stalled` / `element_error`, `audio_concealment` | buffering, stalls, decode errors; concealed samples reported by the receiver (loss or underrun) |
+| `listener_reconnecting` / `listener_reconnected` / `listener_disconnected`, `listener_connect_failed`, `analyser_unavailable`, `receiver_stats_unavailable` | connection trouble, and measurements that could not be made (with the reason) |
+
+**Limits.** Times are this browser's clock and are never subtracted from a Runtime timestamp (another machine, another clock): compare durations
+(the gap between onsets, connection to first onset). Nothing in the audio carries a `turn_id`, so utterances are identified by their ordinal on each
+listener's track, which holds only while no utterance is dropped, merged or split; pairing them with the Runtime's `utterance_timeline` events
+(`speaker`, `listener`, `destination`) is by order per listener. A tab in the background throttles timers: its onsets are late.
+
+**Validation without providers or credits** (`scripts/browser_latency_check.cjs` + `scripts/synthetic_translation_publisher.py`, needs a running Platform without a Runtime,
+the built frontend and LiveKit): a synthetic publisher plays a short translation twice (0.5 s, 3 s apart) on the creator's listen track and one long one (3 s) on the guest's,
+starting together; real Chrome pages record. Result, 2026-11-08: all checks passed. Onset numbering per listener, silence not counted, the creator's first audio 311 ms after hand-over
+and the guest's 322 ms (the 3 s translation did not delay the other listener: 12 ms apart), utterance lengths 0.5 s and 3.00 s, the 3 s gap read as 3.02 s, no failures. These figures include the
+publisher's ~200 ms lead over real time and a loopback host clock: they validate the instrument, they are not a Runtime latency.
+
 ## 7. What needs manual testing on real devices (do not treat any of this as verified)
 
 1. A spoken Korean ↔ English call, desktop and phone: both hear the right translation, in the right ears, no echo of their own voice.
