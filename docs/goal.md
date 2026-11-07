@@ -1,103 +1,85 @@
-Our next objective is to develop a natural, cinematic real-time dubbing experience for human-to-human translated calls.
+Our next objective is to determine whether cinematic dubbing actually improves the experience of real-time translated conversations.
 
-The fundamental product goal is to make users feel that they are communicating with a real person through a translator, rather than speaking to an AI assistant.
+The technical prototype is complete. Now we need to establish whether it delivers the intended product value.
 
-Currently, the listener hears only the AI-translated voice. We want to investigate and implement an alternative experience where the original speaker's voice remains present, creating a documentary or movie-style dubbing effect.
+### Primary goal
 
-### Desired experience
+Make translated calls feel like natural communication between two real humans rather than interaction with an AI-generated voice.
 
-When someone speaks:
+We want to preserve the original speaker's identity, emotion, and human presence while ensuring the listener clearly understands the translation.
 
-- The listener initially hears the real speaker's voice.
-- The original audio may be delayed slightly to create a more natural transition into the translation.
-- When the AI translation begins, it becomes the dominant voice.
-- The original voice fades into the background instead of abruptly disappearing.
-- The listener can still perceive the original speaker's emotion, intonation, and human presence.
-- The translated speech remains clear and understandable.
+The critical question is whether keeping the original voice audible improves trust and naturalness without making conversations confusing, distracting, or slower.
 
-The intended result is natural, trustworthy human-to-human communication.
+### What I want to achieve
 
-### Primary requirements
+Create realistic audio demonstrations of different listening experiences using our existing dubbing system.
 
-**1. Preserve latency**
+Compare:
 
-The existing translation pipeline must remain unaffected.
+**AI-only translation:** The listener hears only the translated voice.
 
-Do not delay translated speech to synchronize it with the original audio. The original audio should adapt to the translation, not the opposite way around.
+**Current cinematic dubbing:** The original speaker is heard with a slight delay, and their volume is dynamically reduced when translation begins.
 
-**2. High-quality audio mixing**
+**Alternative cinematic dubbing:** Explore whether replaying a delayed portion of the original speech underneath the translation creates a more natural documentary-style experience.
 
-Investigate and implement a suitable approach to delaying, buffering, mixing, and dynamically ducking the original speaker's audio.
+The third option is exploratory. Do not implement a new production architecture unless the listening results justify it.
 
-Experiment with different delay and volume configurations to identify which creates the most natural dubbing experience.
+### Key considerations
 
-Avoid distracting overlaps, abrupt volume changes, clipping, echo, and unnecessary audio artifacts.
+Our current implementation has an important limitation: during isolated sentences, the original voice finishes before the translation starts, so there is no meaningful overlap.
 
-**3. Correct audio routing**
+Investigate whether this actually matters for perceived naturalness.
 
-The listener should hear the appropriate combination of the remote speaker's original voice and translated speech.
+Avoid sacrificing the existing low translation latency merely to create synchronized audio.
 
-The original speaker must not hear their own delayed voice.
+Pay particular attention to:
 
-Ensure the mixer does not interfere with STT processing, VAD, turn detection, or translation.
+- How natural the transitions between original and translated voices sound.
+- Whether the original voice makes the call feel more human.
+- Whether simultaneous languages interfere with comprehension.
+- Whether the original voice should be heard continuously or only briefly.
+- How the experience behaves during interruptions and overlapping conversation.
+- Whether users might mistake the translated voice for an AI caller rather than a real person using translation.
 
-**4. Configurable experience**
+### Validation approach
 
-Implement the feature behind a session-level setting that defaults to disabled.
+Use existing recordings or synthetic audio to generate realistic listening examples.
 
-The architecture should support switching between translation-only and cinematic dubbing modes without rebuilding the translation pipeline.
+Include short utterances, longer sentences, continuous speech, natural pauses, and interruptions.
 
-**5. Maintain production reliability**
+Make the examples easy for a human listener to compare.
 
-Preserve existing translation performance, fallback behavior, concurrency isolation, and connection management.
+Preserve the same source content and translation across versions so the comparison isolates the audio presentation.
 
-Avoid introducing significant per-call CPU or memory overhead.
+Recommend an objective listening evaluation that measures trust, intelligibility, naturalness, and preference.
 
-Ensure buffers and other resources are released when calls end or fail.
+Do not claim that the experience is better based solely on audio metrics. Human listening is required.
 
-### Development approach
+### Technical constraints
 
-You have discretion over the technical implementation.
+Keep production dubbing disabled by default.
 
-First, examine the existing LiveKit audio architecture and identify the cleanest integration point.
+Do not modify the existing translation architecture, STT, TTS, fallback, or latency settings.
 
-Then implement the smallest maintainable solution that achieves the intended experience.
+Do not consume additional ElevenLabs credits.
 
-Validate it through automated tests, offline audio mixing experiments, and latency measurements.
+Use existing audio and offline processing wherever possible.
 
-Use existing audio recordings or synthetic test data where possible.
-
-Do not consume ElevenLabs credits or change the default production experience.
-
-### Evaluation criteria
-
-Evaluate the prototype against our existing AI-only experience using:
-
-- Audio intelligibility.
-- Naturalness of voice transitions.
-- Preservation of the speaker's human presence.
-- Added end-to-end latency.
-- Audio artifacts and echo risk.
-- CPU and memory overhead.
-- Reliability during interruptions, short utterances, and overlapping speech.
-
-Do not assume cinematic dubbing automatically increases trust. Treat that as a product hypothesis requiring actual listener testing.
+Investigate echo risk and resource consumption, but prioritize evaluating the actual listening experience over further engineering optimization.
 
 ### Definition of success
 
-We should have a working, configurable dubbing prototype that preserves the existing translation pipeline's performance and allows us to compare different audio experiences.
+We should finish with realistic, directly comparable audio examples and a clear understanding of what remains to be validated by human listeners.
 
-The implementation should be production-safe when disabled, independently testable, and ready for a future listening study.
+The final deliverable should include:
 
-Run relevant automated tests and commit verified changes.
+1. Playable audio comparisons of the different approaches.
+2. An explanation of how each approach changes the listening experience.
+3. A recommended configuration for an initial human listening test.
+4. A simple evaluation protocol with measurable criteria.
+5. Technical limitations that could affect real phone calls.
+6. A recommendation on which experience should become our default if listener testing supports it.
 
-When finished, report:
+Do not prematurely declare cinematic dubbing better than AI-only translation.
 
-- What was implemented.
-- How the mixing and timing work.
-- What the resulting audio experience is like.
-- Any measurable latency or resource overhead.
-- Limitations and unresolved issues.
-- Whether this is ready for live user testing.
-
-Prioritize the quality of the actual conversation over adding unnecessary features.
+The goal is to discover the best human-to-human communication experience, not simply demonstrate that our mixer works.

@@ -127,3 +127,9 @@ Rendered WAVs (`--wav-dir`) are the material for a listening study; they are not
 For an internal listening study with headphones: yes, off by default and safe when off. Before exposing it
 to customers: the echo test on speakers and phones, a longer soak for the timer cost, and the listening
 study itself.
+
+## Listening demos and evaluation plan
+
+Rendered comparisons of AI-only, the live prototype and two exploratory replay variants, their
+measured properties, a telephone-codec check and the listening-study protocol are in
+`docs/dubbing-listening.md` (audio in `runtime/bench/dubbing/listening/`).
