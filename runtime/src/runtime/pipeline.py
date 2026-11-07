@@ -636,6 +636,7 @@ def build_interpreter_pipeline(config: PipelineConfig, session=None):
         router = ListenerAudioRouter(
             directory,
             hear_original=settings.hear_original,
+            dubbing=settings.dubbing,
             api_settings=LiveKitApiSettings.from_environment(config.livekit_url),
             listen_room_factory=(
                 listen_room_connector(config)

@@ -11,7 +11,7 @@ import hashlib
 import json
 import os
 from datetime import timedelta
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
@@ -48,6 +48,8 @@ class TranslationIn(BaseModel):
     creator: ParticipantIn
     latency_mode: str = DEFAULT_LATENCY_MODE
     hear_original: bool = False
+    # Cinematic dubbing: the other person's real voice under the translation (default off).
+    dubbing: bool | Literal["subtle", "balanced", "present"] | None = None
     glossary: list[dict[str, Any]] | None = None
     # Optional provider records per slot (e.g. ElevenLabs STT, Gemini translation, ElevenLabs
     # voice); an omitted slot uses Runtime's default provider for it.
@@ -85,6 +87,7 @@ def interpreter_config(payload: TranslationIn) -> dict[str, Any]:
             engine="cascaded",
             latency_mode=payload.latency_mode,
             hear_original=payload.hear_original,
+            dubbing=payload.dubbing,
             glossary=payload.glossary,
         )
     except ValueError as exc:

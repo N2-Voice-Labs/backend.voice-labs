@@ -164,9 +164,10 @@ class PerParticipantLiveKitInput(LiveKitInputTransport):
     ``_audio_in_task_handler`` with one resampler per participant identity.
     """
 
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, *args, router: ListenerAudioRouter | None = None, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._participant_resamplers: dict[str, object] = {}
+        self._router = router  # only to hand a copy of each microphone to cinematic dubbing
 
     async def _audio_in_task_handler(self) -> None:
         async for audio_data in self._client.get_next_audio_frame():
@@ -184,6 +185,11 @@ class PerParticipantLiveKitInput(LiveKitInputTransport):
             )
             if not audio:  # the filter is still buffering
                 continue
+            router = self._router
+            if router is not None and router.dubbing is not None:
+                # A copy for the other person's mix, taken after the lane's own audio is
+                # resampled and before anything else: the lane's frame below is unchanged.
+                await router.feed_original(participant_id, audio, self.sample_rate)
             await self.push_audio_frame(
                 UserAudioRawFrame(
                     user_id=participant_id,
@@ -216,7 +222,7 @@ class PerParticipantLiveKitTransport(LiveKitTransport):
     def input(self) -> PerParticipantLiveKitInput:
         if not self._input:
             self._input = PerParticipantLiveKitInput(
-                self, self._client, self._params, name=self._input_name
+                self, self._client, self._params, name=self._input_name, router=self._router
             )
         return self._input
 
