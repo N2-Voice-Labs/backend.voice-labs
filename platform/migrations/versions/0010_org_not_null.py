@@ -97,7 +97,13 @@ def downgrade() -> None:
         with op.batch_alter_table(table) as batch:
             if table == "tools":
                 batch.drop_constraint("uq_tools_organization_id_name", type_="unique")
-                batch.create_unique_constraint("uq_tools_name", ["name"])
+                # Restore the name upgrade() drops: PostgreSQL's auto-name from 0004.
+                name = (
+                    "tools_name_key"
+                    if op.get_bind().dialect.name == "postgresql"
+                    else "uq_tools_name"
+                )
+                batch.create_unique_constraint(name, ["name"])
             batch.drop_constraint(_fk(table), type_="foreignkey")
             batch.alter_column(
                 "organization_id", existing_type=sa.String(36), nullable=True

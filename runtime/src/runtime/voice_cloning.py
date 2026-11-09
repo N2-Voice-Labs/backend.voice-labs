@@ -23,6 +23,8 @@ CLONE_UPLOAD_TIMEOUT_SECONDS = 60.0
 MAX_SAMPLE_BYTES = 10 * 1024 * 1024
 MAX_REDIRECTS = 3
 _REDIRECT_STATUSES = {301, 302, 303, 307, 308}
+# Hosts such as Wikimedia answer 403 to the default python-httpx user agent.
+SAMPLE_USER_AGENT = "VoiceLabs/1.0 (voice sample fetch)"
 
 
 class UnsupportedSampleURL(Exception):
@@ -35,6 +37,10 @@ class SampleUnavailable(Exception):
 
 class CloneProviderError(Exception):
     """Cartesia call failed. The message is safe to log (no key, no upstream body)."""
+
+
+class ClonePlanRequired(CloneProviderError):
+    """Cartesia answered 402: this account's plan does not include cloning."""
 
 
 async def _resolve_host(host: str) -> list[str]:
@@ -134,7 +140,10 @@ async def download_sample(url: str) -> tuple[bytes, str, str]:
                 timeout=SAMPLE_DOWNLOAD_TIMEOUT_SECONDS, follow_redirects=False
             ) as client:
                 async with client.stream(
-                    "GET", pinned_url, headers=headers, extensions=extensions
+                    "GET",
+                    pinned_url,
+                    headers={"User-Agent": SAMPLE_USER_AGENT, **headers},
+                    extensions=extensions,
                 ) as response:
                     if response.status_code in _REDIRECT_STATUSES:
                         location = response.headers.get("location")
@@ -205,6 +214,8 @@ async def clone_voice(
             response.raise_for_status()
             body = response.json()
     except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 402:
+            raise ClonePlanRequired("cartesia plan does not include cloning") from None
         raise CloneProviderError(
             f"cartesia returned status {exc.response.status_code}"
         ) from None

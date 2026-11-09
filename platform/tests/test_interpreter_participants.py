@@ -217,6 +217,19 @@ def start_two_person_session(client: TestClient, **first):
     return agent, created["session_id"]
 
 
+def test_connection_url_prefers_livekit_public_url(runtime, livekit, monkeypatch) -> None:
+    monkeypatch.setenv("LIVEKIT_PUBLIC_URL", "ws://localhost:7880")
+    with TestClient(app) as client:
+        _, session_id = start_two_person_session(client)
+        bob_voice = make_ready_voice(client, "cartesia-bob")
+        response = client.post(
+            f"/voice/sessions/{session_id}/participants",
+            json={"language": "ko", "voice_profile_id": bob_voice["id"], "display_name": "Bob"},
+        )
+    assert response.status_code == 200, response.text
+    assert response.json()["connection"]["url"] == "ws://localhost:7880"
+
+
 def test_add_participant_returns_guest_connection_and_notifies_runtime(runtime, livekit) -> None:
     requests, _ = runtime
     with TestClient(app) as client:

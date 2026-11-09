@@ -241,6 +241,11 @@ def test_provision_requires_runtime_configuration(monkeypatch) -> None:
     [
         (FakeResponse(422, {"detail": "sample_unavailable"}), None, "sample_unavailable"),
         (FakeResponse(502, {"detail": "clone_provider_error"}), None, "clone_provider_error"),
+        (
+            FakeResponse(502, {"detail": "clone_plan_upgrade_required"}),
+            None,
+            "clone_plan_upgrade_required",
+        ),
         (FakeResponse(500, {"detail": "boom secret"}), None, "runtime_error_500"),
         (FakeResponse(503, "plain"), None, "runtime_error_503"),
         (None, httpx.ConnectError("down"), "runtime_unreachable"),
@@ -340,3 +345,52 @@ def test_provision_retries_voice_stuck_in_processing(monkeypatch) -> None:
         response = provision(client, stale["id"])
         assert response.status_code == 200, response.text
         assert response.json()["status"] == "ready"
+
+
+def test_auto_provision_clones_without_a_second_call(monkeypatch) -> None:
+    monkeypatch.setenv("PLATFORM_AUTO_PROVISION_CLONES", "1")
+    calls = install_client(monkeypatch)
+    with TestClient(app) as client:
+        voice = make_clone(client)
+        # The response is written first; provisioning follows as a background task.
+        assert voice["status"] == "pending"
+        stored = client.get(f"/voices/{voice['id']}").json()
+        assert stored["status"] == "ready"
+        assert stored["provider_voice_id"] == "cart-voice-1"
+    assert calls[1]["json"]["sample_url"] == SAMPLE
+
+
+def test_auto_provision_is_off_by_default(monkeypatch) -> None:
+    calls = install_client(monkeypatch)
+    with TestClient(app) as client:
+        voice = make_clone(client)
+        assert client.get(f"/voices/{voice['id']}").json()["status"] == "pending"
+    assert calls == []
+
+
+def test_auto_provision_failure_is_visible_and_retry_provisions_again(monkeypatch) -> None:
+    monkeypatch.setenv("PLATFORM_AUTO_PROVISION_CLONES", "1")
+    install_client(
+        monkeypatch, response=FakeResponse(502, {"detail": "clone_plan_upgrade_required"})
+    )
+    with TestClient(app) as client:
+        voice = make_clone(client)
+        stored = client.get(f"/voices/{voice['id']}").json()
+        assert stored["status"] == "failed"
+        assert stored["failure_reason"] == "clone_plan_upgrade_required"
+        # What the frontend's Retry button sends.
+        install_client(monkeypatch)
+        retry = client.post(f"/voices/{voice['id']}/status", json={"status": "pending"})
+        assert retry.status_code == 200
+        assert client.get(f"/voices/{voice['id']}").json()["status"] == "ready"
+
+
+def test_auto_provision_records_a_sample_it_cannot_fetch(monkeypatch) -> None:
+    monkeypatch.setenv("PLATFORM_AUTO_PROVISION_CLONES", "1")
+    calls = install_client(monkeypatch)
+    with TestClient(app) as client:
+        voice = make_clone(client, sample="s3://bucket/a.wav")
+        stored = client.get(f"/voices/{voice['id']}").json()
+        assert stored["status"] == "failed"
+        assert stored["failure_reason"] == "unsupported_sample_url"
+    assert calls == []

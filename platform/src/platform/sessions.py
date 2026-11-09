@@ -20,6 +20,7 @@ from .livekit import (
     listen_room_name,
     phone_room_name,
     private_listening_enabled,
+    public_livekit_url,
 )
 from .models import Agent as AgentRecord
 from .models import (
@@ -200,7 +201,7 @@ def participant_connection(
     """
 
     connection: dict[str, Any] = {
-        "url": os.getenv("LIVEKIT_URL", ""),
+        "url": public_livekit_url(),
         "token": (
             create_participant_token(room_name, identity, can_subscribe=not private)
             if configured

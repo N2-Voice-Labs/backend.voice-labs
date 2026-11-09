@@ -127,7 +127,10 @@ def test_clone_success_downloads_then_uploads(monkeypatch) -> None:
     stream = next(c for c in calls if "stream" in c)
     # Connects to the validated IP, keeping the hostname for Host header and TLS SNI.
     assert stream["stream"] == ("GET", f"https://{PUBLIC_IP}/me.wav")
-    assert stream["kwargs"]["headers"] == {"Host": "samples.example.com"}
+    assert stream["kwargs"]["headers"] == {
+        "User-Agent": voice_cloning.SAMPLE_USER_AGENT,
+        "Host": "samples.example.com",
+    }
     assert stream["kwargs"]["extensions"] == {"sni_hostname": "samples.example.com"}
     assert {"client": {"timeout": 20.0, "follow_redirects": False}} in calls
     upload = next(c for c in calls if "post" in c)
@@ -303,6 +306,13 @@ def test_clone_provider_failure_does_not_leak(monkeypatch, kwargs) -> None:
     assert response.json() == {"detail": "clone_provider_error"}
     assert KEY not in response.text
     assert "upstream" not in response.text
+
+
+def test_clone_plan_rejection_has_its_own_code(monkeypatch) -> None:
+    install(monkeypatch, post=FakePostResponse(402))
+    response = post()
+    assert response.status_code == 502
+    assert response.json() == {"detail": "clone_plan_upgrade_required"}
 
 
 def test_clone_invalid_json_from_provider(monkeypatch) -> None:

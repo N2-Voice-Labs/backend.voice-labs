@@ -32,7 +32,9 @@ def transport(handler):
 def probe(monkeypatch, env, handler):
     for name in env:
         monkeypatch.setenv(name, SECRET)
-    return run(provider_health.probe_providers(transport=transport(handler)))
+    statuses = run(provider_health.probe_providers(transport=transport(handler)))
+    # Drop the synthetic "API key not configured" entries of required providers we did not set.
+    return [s for s in statuses if s.reason != provider_health.MISSING_KEY_REASON]
 
 
 def by_key(statuses):
@@ -121,11 +123,35 @@ def test_elevenlabs_exhausted_characters_is_quota(monkeypatch):
     assert (got.status, got.category) == ("down", "quota")
 
 
-def test_no_configured_providers_means_no_requests():
+def test_no_configured_providers_means_no_requests_and_required_ones_are_down():
     def handler(request):
         raise AssertionError("no request expected")
 
-    assert run(provider_health.probe_providers(transport=transport(handler))) == []
+    statuses = by_key(run(provider_health.probe_providers(transport=transport(handler))))
+    # Required providers (and the realtime mirror of openai) are down; optional elevenlabs is omitted.
+    assert set(statuses) == {
+        ("stt", "deepgram"), ("llm", "openai"), ("realtime", "openai"), ("tts", "cartesia")
+    }
+    for got in statuses.values():
+        assert (got.status, got.category, got.reason) == ("down", "auth", "API key not configured")
+        assert got.latency_ms is None and got.checked_at
+    assert provider_health.overall_status(list(statuses.values())) == "down"
+
+
+def test_missing_required_key_is_down_next_to_a_healthy_provider(monkeypatch):
+    monkeypatch.setenv("DEEPGRAM_API_KEY", SECRET)
+    statuses = by_key(
+        run(provider_health.probe_providers(transport=transport(lambda r: httpx.Response(200))))
+    )
+    assert statuses[("stt", "deepgram")].status == "ok"
+    assert statuses[("tts", "cartesia")].reason == "API key not configured"
+    assert ("tts", "elevenlabs") not in statuses
+
+
+def test_health_report_without_keys_is_down():
+    report = run(provider_health.health_report(force=True))
+    assert report["overall"] == "down"
+    assert {p["status"] for p in report["providers"]} == {"down"}
 
 
 def test_cache_ttl(monkeypatch):
@@ -258,7 +284,10 @@ def test_health_providers_endpoint(monkeypatch):
         body = client.get("/health/providers", headers={"X-Runtime-Token": "t0ken"}).json()
         assert body["overall"] == "down"
         providers = {(p["kind"], p["name"]): p for p in body["providers"]}
-        assert set(providers) == {("stt", "deepgram"), ("tts", "cartesia")}
+        assert set(providers) == {
+            ("stt", "deepgram"), ("tts", "cartesia"), ("llm", "openai"), ("realtime", "openai")
+        }
+        assert providers[("llm", "openai")]["reason"] == "API key not configured"
         assert set(providers[("tts", "cartesia")]) == {
             "kind", "name", "status", "category", "latency_ms", "checked_at", "reason"
         }

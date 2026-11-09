@@ -14,7 +14,11 @@ Probes (3 s timeout each, all concurrent):
 * ``tts/cartesia``    ``GET https://api.cartesia.ai/voices?limit=1``
 * ``tts/elevenlabs``  ``GET https://api.elevenlabs.io/v1/user/subscription``
 
-A provider is probed only when its API key is set in the environment.
+A provider is probed only when its API key is set in the environment. A REQUIRED provider
+(deepgram, openai, cartesia: the defaults of the cascaded pipeline) whose key is missing is
+reported ``down`` / ``auth`` / "API key not configured" without any request, so a stack
+started without keys is honestly unhealthy instead of reporting an empty, ``ok`` list.
+Optional providers (elevenlabs) are simply omitted when unset.
 
 Status/category mirror ``provider_failures.classify_error``: 401/403 ``auth`` and 402 /
 ``insufficient_quota`` ``quota`` are ``down``; 408/425/429/5xx and network errors are
@@ -48,6 +52,8 @@ DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_OPENAI_HEALTH_MODEL = "gpt-4.1-mini"
 DEEPGRAM_PROJECTS_URL = "https://api.deepgram.com/v1/projects"
 ELEVENLABS_SUBSCRIPTION_URL = "https://api.elevenlabs.io/v1/user/subscription"
+
+MISSING_KEY_REASON = "API key not configured"
 
 OK = "ok"
 DEGRADED = "degraded"
@@ -148,6 +154,7 @@ class _Probe:
     key_env: str
     run: Callable[[httpx.AsyncClient, str], Awaitable[_Outcome]]
     mirror_kinds: tuple[str, ...] = ()  # same result reported under these kinds too
+    required: bool = False  # missing key -> reported down (not omitted)
 
 
 async def _probe_deepgram(client: httpx.AsyncClient, key: str) -> _Outcome:
@@ -178,9 +185,11 @@ async def _probe_elevenlabs(client: httpx.AsyncClient, key: str) -> _Outcome:
 
 
 _PROBES: tuple[_Probe, ...] = (
-    _Probe("stt", "deepgram", "DEEPGRAM_API_KEY", _probe_deepgram),
-    _Probe("llm", "openai", "OPENAI_API_KEY", _probe_openai, mirror_kinds=("realtime",)),
-    _Probe("tts", "cartesia", "CARTESIA_API_KEY", _probe_cartesia),
+    _Probe("stt", "deepgram", "DEEPGRAM_API_KEY", _probe_deepgram, required=True),
+    _Probe(
+        "llm", "openai", "OPENAI_API_KEY", _probe_openai, mirror_kinds=("realtime",), required=True
+    ),
+    _Probe("tts", "cartesia", "CARTESIA_API_KEY", _probe_cartesia, required=True),
     _Probe("tts", "elevenlabs", "ELEVENLABS_API_KEY", _probe_elevenlabs),
 )
 
@@ -200,6 +209,12 @@ async def _run_probe(
         outcome = _Outcome(DEGRADED, "other", _REASONS["other"])
     latency = int((time.monotonic() - started) * 1000)
     checked_at = _now_iso()
+    return _statuses_for(probe, outcome, latency, checked_at)
+
+
+def _statuses_for(
+    probe: _Probe, outcome: _Outcome, latency: int | None, checked_at: str
+) -> list[ProviderStatus]:
     return [
         ProviderStatus(
             kind=kind,
@@ -214,18 +229,26 @@ async def _run_probe(
     ]
 
 
+def _missing_key_statuses(probe: _Probe) -> list[ProviderStatus]:
+    outcome = _Outcome(DOWN, "auth", MISSING_KEY_REASON)
+    return _statuses_for(probe, outcome, None, _now_iso())
+
+
 async def probe_providers(
     *, transport: httpx.AsyncBaseTransport | None = None, only: str | None = None
 ) -> list[ProviderStatus]:
     """Probe every configured provider (or just ``only``) concurrently (no caching)."""
 
-    selected = [(p, os.getenv(p.key_env, "")) for p in _PROBES if only in (None, p.name)]
-    selected = [(p, key) for p, key in selected if key]
+    candidates = [(p, os.getenv(p.key_env, "")) for p in _PROBES if only in (None, p.name)]
+    missing = [
+        status for p, key in candidates if not key and p.required for status in _missing_key_statuses(p)
+    ]
+    selected = [(p, key) for p, key in candidates if key]
     if not selected:
-        return []
+        return missing
     async with httpx.AsyncClient(timeout=PROBE_TIMEOUT_SECONDS, transport=transport) as client:
         groups = await asyncio.gather(*(_run_probe(p, client, key) for p, key in selected))
-    return [status for group in groups for status in group]
+    return [*missing, *(status for group in groups for status in group)]
 
 
 # --- cache and passive updates ------------------------------------------------------

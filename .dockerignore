@@ -1,0 +1,16 @@
+.git
+.venv
+**/.venv
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+.ruff_cache
+.claude
+**/.env
+**/.env.*
+!**/.env.example
+!**/.env.public.example
+**/*.db
+evals/results
+evals/audio
+**/*.egg-info

@@ -1,0 +1,129 @@
+# Voice Labs backend: Postgres + LiveKit + Platform (control plane) + Runtime (realtime).
+#   cp .env.example .env   # fill provider keys
+#   make up                # or: docker compose up -d --build
+#
+# Profiles (COMPOSE_PROFILES in .env, comma-separated):
+#   local-livekit  the bundled LiveKit server (default for local dev)
+#   tunnel         Cloudflare Tunnel exposing Platform (public demo, see README)
+# Public demo: cp .env.public.example .env && make public
+name: voice-labs-backend
+
+x-livekit-env: &livekit-env
+  # Server-side address, used by Platform and Runtime: the bundled server by default,
+  # wss://<project>.livekit.cloud with LiveKit Cloud.
+  LIVEKIT_URL: ${LIVEKIT_URL:-ws://livekit:7880}
+  LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-devkey}
+  LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-secret}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-voice_labs}
+      POSTGRES_USER: ${POSTGRES_USER:-voice_labs}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local-only}
+    ports: ["127.0.0.1:${POSTGRES_PORT:-5432}:5432"]
+    volumes: ["postgres-data:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  livekit:
+    profiles: ["local-livekit"]
+    image: livekit/livekit-server:v1.9.0
+    command: ["--config", "/etc/livekit.yaml"]
+    environment:
+      LIVEKIT_KEYS: "${LIVEKIT_API_KEY:-devkey}: ${LIVEKIT_API_SECRET:-secret}"
+      NODE_IP: ${LIVEKIT_NODE_IP:-127.0.0.1} # IP advertised to WebRTC clients
+    volumes: ["./docker/livekit.yaml:/etc/livekit.yaml:ro"]
+    ports:
+      - "${LIVEKIT_PORT:-7880}:7880"
+      - "7881:7881"
+      - "7882:7882/udp"
+    restart: unless-stopped
+
+  migrate:
+    build: { context: ., dockerfile: platform/Dockerfile }
+    image: voice-labs-platform
+    command: ["migrate"]
+    environment:
+      PLATFORM_DATABASE_URL: &db-url postgresql+psycopg://${POSTGRES_USER:-voice_labs}:${POSTGRES_PASSWORD:-local-only}@postgres:5432/${POSTGRES_DB:-voice_labs}
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: "no"
+
+  platform:
+    build: { context: ., dockerfile: platform/Dockerfile }
+    image: voice-labs-platform
+    environment:
+      <<: *livekit-env
+      PLATFORM_DATABASE_URL: *db-url
+      PLATFORM_API_KEYS: ${PLATFORM_API_KEYS:-}
+      PLATFORM_RUNTIME_TOKEN: ${RUNTIME_TOKEN:-local-runtime-token-change-me}
+      RUNTIME_API_URL: http://runtime:8301
+      # What browsers receive in session responses (the host-published LiveKit port, or the
+      # LiveKit Cloud wss:// URL).
+      LIVEKIT_PUBLIC_URL: ${LIVEKIT_PUBLIC_URL:-ws://localhost:7880}
+      PLATFORM_WEB_ORIGIN: ${PLATFORM_WEB_ORIGIN:-http://localhost:3000}
+      LIVEKIT_SIP_TRUNK_ID: ${LIVEKIT_SIP_TRUNK_ID:-}
+      PLATFORM_ALERT_WEBHOOK_URL: ${PLATFORM_ALERT_WEBHOOK_URL:-}
+      PLATFORM_MAX_ACTIVE_SESSIONS_PER_ORG: ${PLATFORM_MAX_ACTIVE_SESSIONS_PER_ORG:-10}
+      PLATFORM_SESSION_CREATE_RATE: ${PLATFORM_SESSION_CREATE_RATE:-30/min}
+      PLATFORM_REAPER_INTERVAL_SECS: ${PLATFORM_REAPER_INTERVAL_SECS:-60}
+      PLATFORM_STALE_SESSION_SECS: ${PLATFORM_STALE_SESSION_SECS:-900}
+      # Clone at the provider right after POST /voices/clone (the frontend has no provision step).
+      PLATFORM_AUTO_PROVISION_CLONES: ${PLATFORM_AUTO_PROVISION_CLONES:-1}
+    # Loopback only: the Cloudflare tunnel reaches Platform over the compose network.
+    ports: ["127.0.0.1:${PLATFORM_PORT:-8300}:8300"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
+    restart: unless-stopped
+
+  runtime:
+    build: { context: ., dockerfile: runtime/Dockerfile }
+    image: voice-labs-runtime
+    environment:
+      <<: *livekit-env
+      RUNTIME_PLATFORM_URL: http://platform:8300
+      RUNTIME_PLATFORM_TOKEN: ${RUNTIME_TOKEN:-local-runtime-token-change-me}
+      DEEPGRAM_API_KEY: ${DEEPGRAM_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      OPENAI_HEALTH_MODEL: ${OPENAI_HEALTH_MODEL:-}
+      CARTESIA_API_KEY: ${CARTESIA_API_KEY:-}
+      CARTESIA_VOICE_ID: ${CARTESIA_VOICE_ID:-}
+      ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY:-}
+      LIVEKIT_SIP_TRUNK_ID: ${LIVEKIT_SIP_TRUNK_ID:-}
+      SIP_TRANSFER_TO: ${SIP_TRANSFER_TO:-}
+      RUNTIME_MAX_SESSIONS: ${RUNTIME_MAX_SESSIONS:-}
+      RUNTIME_MAX_SESSION_SECS: ${RUNTIME_MAX_SESSION_SECS:-}
+      RUNTIME_IDLE_PROMPT_SECS: ${RUNTIME_IDLE_PROMPT_SECS:-}
+      RUNTIME_IDLE_END_SECS: ${RUNTIME_IDLE_END_SECS:-}
+    ports: ["127.0.0.1:${RUNTIME_PORT:-8301}:8301"]
+    depends_on:
+      # Only present with the local-livekit profile (absent when using LiveKit Cloud).
+      livekit: { condition: service_started, required: false }
+    stop_grace_period: 35s
+    restart: unless-stopped
+    # Single replica only: session ownership is process-local.
+
+  # Public demo: publishes Platform through a Cloudflare Tunnel. The public hostname ->
+  # http://platform:8300 mapping is configured in the Cloudflare dashboard (see README).
+  tunnel:
+    profiles: ["tunnel"]
+    image: cloudflare/cloudflared:2025.11.1
+    command: ["tunnel", "--no-autoupdate", "run"]
+    environment:
+      # Not `:?`-required: compose interpolates profiled-out services too, which would break
+      # local `make up`. `make public` checks it before starting.
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    depends_on:
+      platform: { condition: service_healthy }
+    restart: unless-stopped
+
+volumes:
+  postgres-data:

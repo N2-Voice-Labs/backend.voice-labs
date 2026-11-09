@@ -151,6 +151,27 @@ def test_create_session_refuses_when_stt_down_and_creates_no_rows(runtime):
         assert runtime["posts"] == []
 
 
+def test_create_session_refuses_when_runtime_has_no_provider_keys(runtime):
+    missing = dict(status="down", category="auth", reason="API key not configured")
+    runtime["health"] = report(
+        entry("stt", "deepgram", **missing), entry("llm", "openai", **missing),
+        entry("realtime", "openai", **missing), entry("tts", "cartesia", **missing),
+        overall="down",
+    )
+    with TestClient(app) as client:
+        agent = make_agent(client)
+        before = counts()
+        response = start(client, agent)
+        assert response.status_code == 503
+        detail = response.json()["detail"]
+        assert detail["code"] == "provider_unavailable"
+        assert (detail["provider"], detail["category"]) == ("deepgram", "auth")
+        assert detail["message"] == "Voice service unavailable: deepgram API key not configured"
+        assert counts() == before and runtime["posts"] == []
+        overall = client.get("/health/providers").json()
+        assert overall["overall"] == "down"
+
+
 def test_create_session_proceeds_when_health_fetch_fails(runtime):
     runtime["health"] = None
     with TestClient(app) as client:

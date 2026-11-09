@@ -19,6 +19,7 @@ from .lifecycle import EndReason, max_sessions, terminal_payload
 from .session import RuntimeSession, SessionState
 from .tts_preview import PREVIEW_PROVIDERS, TTSPreviewError, get_preview_provider
 from .voice_cloning import (
+    ClonePlanRequired,
     CloneProviderError,
     SampleUnavailable,
     UnsupportedSampleURL,
@@ -527,6 +528,8 @@ async def voices_clone(
         raise HTTPException(status_code=422, detail="unsupported_sample_url") from exc
     except SampleUnavailable as exc:
         raise HTTPException(status_code=422, detail="sample_unavailable") from exc
+    except ClonePlanRequired as exc:
+        raise HTTPException(status_code=502, detail="clone_plan_upgrade_required") from exc
     except CloneProviderError as exc:
         raise HTTPException(status_code=502, detail="clone_provider_error") from exc
     return {"provider_voice_id": provider_voice_id}

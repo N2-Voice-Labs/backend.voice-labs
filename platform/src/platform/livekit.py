@@ -6,6 +6,16 @@ from datetime import timedelta
 LISTEN_ROOM_SEPARATOR = "--listen--"
 
 
+def public_livekit_url() -> str:
+    """LiveKit URL handed to browsers/clients in session responses.
+
+    ``LIVEKIT_PUBLIC_URL`` when set (e.g. ``ws://localhost:7880`` while the server-side
+    ``LIVEKIT_URL`` is the in-network ``ws://livekit:7880``); otherwise ``LIVEKIT_URL``.
+    """
+
+    return os.getenv("LIVEKIT_PUBLIC_URL") or os.getenv("LIVEKIT_URL", "")
+
+
 def listen_room_name(room_name: str, identity: str) -> str:
     """Name of the room only ``identity`` and the Runtime join to hear translations.
 

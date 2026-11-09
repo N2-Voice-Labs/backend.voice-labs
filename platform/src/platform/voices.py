@@ -9,7 +9,7 @@ from urllib.parse import quote
 from uuid import UUID
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Response, status
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -23,7 +23,7 @@ from sqlalchemy.orm import Session
 from . import audit, storage
 from .context import AuthContext, get_ctx, require, role_at_least
 from .models import Agent as AgentRecord, ProviderConfig, Voice as VoiceRecord, utcnow
-from .tenancy import bypass, get_owned, get_scoped_db, link_check, scoped
+from .tenancy import bypass, get_owned, get_scoped_db, link_check, scoped, scoped_session_for
 
 _logger = logging.getLogger(__name__)
 router = APIRouter(tags=["voices"])
@@ -232,6 +232,7 @@ async def create_voice(
 @router.post("/voices/clone", response_model=Voice, status_code=status.HTTP_201_CREATED)
 async def clone_voice(
     payload: VoiceCloneIn,
+    background_tasks: BackgroundTasks,
     ctx: AuthContext = Depends(require("admin")),
     db: Session = Depends(get_scoped_db),
 ) -> Voice:
@@ -259,6 +260,8 @@ async def clone_voice(
         sample_reference=payload.sample_reference,
         consent=consent,
     )
+    if _auto_provision_enabled():
+        background_tasks.add_task(_auto_provision, record.id, record.organization_id, ctx)
     return Voice.model_validate(record)
 
 
@@ -333,6 +336,7 @@ async def update_voice(
 async def update_voice_status(
     voice_id: UUID,
     payload: VoiceStatusIn,
+    background_tasks: BackgroundTasks,
     ctx: AuthContext = Depends(require_superadmin),
     db: Session = Depends(get_scoped_db),
 ) -> Voice:
@@ -362,6 +366,9 @@ async def update_voice_status(
     )
     db.commit()
     db.refresh(record)
+    if payload.status == "pending" and record.source == "clone" and _auto_provision_enabled():
+        # A retry of a failed clone: nothing else would pick the voice up again.
+        background_tasks.add_task(_auto_provision, record.id, record.organization_id, ctx)
     return Voice.model_validate(record)
 
 
@@ -588,6 +595,7 @@ _RUNTIME_CLONE_ERRORS = {
     "unsupported_sample_url",
     "sample_unavailable",
     "clone_provider_error",
+    "clone_plan_upgrade_required",
     "tts_not_configured",
     "unsupported_tts_provider",
     "invalid_runtime_token",
@@ -626,19 +634,15 @@ def _is_stale_processing(record: VoiceRecord) -> bool:
     return datetime.now(timezone.utc) - updated_at > PROVISION_STALE_AFTER
 
 
-@router.post("/voices/{voice_id}/provision", response_model=Voice)
-async def provision_voice(
-    voice_id: UUID,
-    ctx: AuthContext = Depends(require("admin")),
-    db: Session = Depends(get_scoped_db),
-) -> Voice:
-    """Clone a consented sample at the TTS provider via Runtime (Platform never touches audio)."""
+def _auto_provision_enabled() -> bool:
+    return os.getenv("PLATFORM_AUTO_PROVISION_CLONES", "0") == "1"
 
-    record = get_voice_or_404(voice_id, db, ctx)
-    if record.source != "clone" or not (
-        record.status in {"pending", "failed"} or _is_stale_processing(record)
-    ):
-        raise HTTPException(status_code=409, detail="invalid_voice_status_transition")
+
+def _provision_request(
+    db: Session, ctx: AuthContext, record: VoiceRecord
+) -> tuple[str, str, dict[str, str]]:
+    """Validate a clone for provisioning: ``(runtime_url, runtime_token, body)`` or HTTP error."""
+
     consent = record.consent
     if not isinstance(consent, dict) or consent.get("confirmed") is not True:
         raise HTTPException(status_code=409, detail="voice_consent_required")
@@ -661,6 +665,18 @@ async def provision_voice(
         "language": language,
         "sample_url": sample_reference,
     }
+    return runtime_url, runtime_token, body
+
+
+async def _run_provision(
+    db: Session,
+    ctx: AuthContext,
+    record: VoiceRecord,
+    runtime_url: str,
+    runtime_token: str,
+    body: dict[str, str],
+) -> bool:
+    """Clone at the provider via Runtime; the voice ends ``ready`` (True) or ``failed`` (False)."""
 
     record.status = "processing"
     record.failure_reason = None
@@ -680,7 +696,7 @@ async def provision_voice(
     except Exception as exc:  # never leave the voice stuck in ``processing``
         failure_reason = _provision_failure_reason(exc)
         if failure_reason == "runtime_error":
-            _logger.exception("unexpected error provisioning voice %s", voice_id)
+            _logger.exception("unexpected error provisioning voice %s", record.id)
     else:
         if isinstance(candidate, str) and 0 < len(candidate) <= 200:
             provider_voice_id = candidate
@@ -688,18 +704,8 @@ async def provision_voice(
             failure_reason = "runtime_invalid_response"
 
     if provider_voice_id is None:
-        record.status = "failed"
-        record.failure_reason = failure_reason
-        audit.record(
-            db,
-            ctx,
-            "voice.provision_failed",
-            resource_type="voice",
-            resource_id=record.id,
-            metadata={"source": record.source, "failure_reason": failure_reason},
-        )
-        db.commit()
-        raise HTTPException(status_code=502, detail="voice_provisioning_failed")
+        _mark_provision_failed(db, ctx, record, failure_reason)
+        return False
     record.status = "ready"
     record.provider_voice_id = provider_voice_id
     record.failure_reason = None
@@ -712,5 +718,56 @@ async def provision_voice(
         metadata={"source": record.source},
     )
     db.commit()
+    return True
+
+
+def _mark_provision_failed(
+    db: Session, ctx: AuthContext, record: VoiceRecord, failure_reason: str | None
+) -> None:
+    record.status = "failed"
+    record.failure_reason = failure_reason
+    audit.record(
+        db,
+        ctx,
+        "voice.provision_failed",
+        resource_type="voice",
+        resource_id=record.id,
+        metadata={"source": record.source, "failure_reason": failure_reason},
+    )
+    db.commit()
+
+
+async def _auto_provision(voice_id: str, org_id: str, ctx: AuthContext) -> None:
+    """Provision a just-saved clone after the response; the request's session is gone by now."""
+
+    with scoped_session_for(org_id) as db:
+        record = db.get(VoiceRecord, voice_id)
+        if record is None or record.source != "clone" or record.status != "pending":
+            return
+        try:
+            request = _provision_request(db, ctx, record)
+        except HTTPException as exc:
+            # No caller is waiting for the error: record it where the voice list shows it.
+            _mark_provision_failed(db, ctx, record, str(exc.detail))
+            return
+        await _run_provision(db, ctx, record, *request)
+
+
+@router.post("/voices/{voice_id}/provision", response_model=Voice)
+async def provision_voice(
+    voice_id: UUID,
+    ctx: AuthContext = Depends(require("admin")),
+    db: Session = Depends(get_scoped_db),
+) -> Voice:
+    """Clone a consented sample at the TTS provider via Runtime (Platform never touches audio)."""
+
+    record = get_voice_or_404(voice_id, db, ctx)
+    if record.source != "clone" or not (
+        record.status in {"pending", "failed"} or _is_stale_processing(record)
+    ):
+        raise HTTPException(status_code=409, detail="invalid_voice_status_transition")
+    request = _provision_request(db, ctx, record)
+    if not await _run_provision(db, ctx, record, *request):
+        raise HTTPException(status_code=502, detail="voice_provisioning_failed")
     db.refresh(record)
     return Voice.model_validate(record)
