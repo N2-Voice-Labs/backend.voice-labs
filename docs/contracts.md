@@ -71,8 +71,7 @@ even while authentication is disabled but are not required.
 preview, PSTN dialing, SIP transfer ...") describes Milestone 8 only. Preview, provisioning,
 dialing and transfer exist now and are described further down.
 
-Backend-only contracts for the **Voice → Agent → Deployment → Call** model (see
-[Backend Milestone 8](../../stack.voice-labs/docs/BACKEND_STUDIO_PLAN.md)). Platform stores durable metadata only: no
+Backend-only contracts for the **Voice → Agent → Deployment → Call** model. Platform stores durable metadata only: no
 audio, no raw voice samples, no provider provisioning, TTS preview, PSTN dialing, SIP
 transfer, embeddings, or LLM summaries. Error bodies are `{"detail": "<code>"}`; request
 shape/format failures (for example a non-E.164 phone number or a secret-looking
@@ -553,7 +552,7 @@ Validation and errors:
 - `409 voice_provider_mismatch`: the voice's TTS provider record names a different provider than the session's TTS provider (checked only when both are known; see [Translation sessions](#choosing-the-tts-provider)).
 - Runtime-side `422 invalid_participant_voice`: the provider voice id is not `^[A-Za-z0-9_-]{1,128}$`.
 
-**Status:** Verified 2026-10-18 with Korean ↔ English (0.8–1.4 s end-to-speech) on Cartesia. Fixed Pipecat shared-resampler crosstalk. *Note 2026-11-05:* per-listener routing (RM-001/002: a private listen room per person, `connection.listen`, track `translation-for-<identity>`, and one TTS per listener) landed after this check, so the line "everyone hears all audio" no longer describes the code. [Status](status.md) records the routing as verified with real providers, but this page holds no date or measurement for it; `smoke-test.md` re-checks it.
+**Status:** Verified 2026-10-18 with Korean ↔ English (0.8–1.4 s end-to-speech) on Cartesia. Fixed Pipecat shared-resampler crosstalk. *Note 2026-11-05:* per-listener routing (RM-001/002: a private listen room per person, `connection.listen`, track `translation-for-<identity>`, and one TTS per listener) landed after this check, so the line "everyone hears all audio" no longer describes the code. The rebuilt routing is mock-tested only (see [Status](status.md)); `smoke-test.md` re-checks it.
 
 #### Agent translation (assistant + translator)
 
@@ -630,6 +629,24 @@ Interpreter and agent+translator pipelines emit additional metrics in `LatencyMe
 | `outbound_translation_first_chunk_ms` | agent+translator | Agent reply start → first translated text (LLM translation step) |
 
 **Status:** Runtime emits these in TR-040 (agent+translator), TR-010 (realtime engine), and TR-004 (cascaded). Platform stores and reports them in analytics. Payload shape is provisional pending Runtime emission.
+
+#### Audio ownership
+
+Every audio track in an interpreter room has one owner and an explicit audience. Enforcement is
+server-side (Runtime and the LiveKit server API), so it holds for any client (browser, phone, API)
+without trusting it.
+
+| Track | Published by | Who may hear it |
+| --- | --- | --- |
+| A's microphone | Participant A | Runtime only |
+| B's microphone | Participant B | Runtime only |
+| A's words in B's language (`translation-for-<B>`) | Runtime | B only |
+| B's words in A's language (`translation-for-<A>`) | Runtime | A only |
+| Agent replies (single-caller modes) | Runtime | the caller |
+
+1. A participant never hears their own microphone or their own translation.
+2. Participants do not hear each other's original audio unless `hear_original` (or `dubbing`) is set.
+3. Single-participant sessions (agent, agent + translator) publish one track that the caller hears.
 
 ### Translation sessions (`/translations`)
 

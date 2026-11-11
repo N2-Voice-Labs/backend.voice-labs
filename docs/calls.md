@@ -33,11 +33,10 @@ either    ── POST /calls/{id}/end ──────► call ends for both; 
 ```
 
 Nothing about translation changed: `POST /calls` calls the same code as `POST /translations`, and joining uses the same
-participant path as `POST /voice/sessions/{id}/participants`. The Runtime, the audio routing and the latency path are untouched
-(`docs/latency-analysis.md`). The link carries only the invitation code, in the URL `#fragment`, which browsers never send to a server;
+participant path as `POST /voice/sessions/{id}/participants`. The Runtime, the audio routing and the latency path are untouched. The link carries only the invitation code, in the URL `#fragment`, which browsers never send to a server;
 `/join` strips it from the address bar at once.
 
-`platform/src/platform/calls.py` is the whole backend feature; the frontend is `frontend.voice-labs`
+`platform/src/platform/calls.py` is the whole backend feature; the frontend is the sibling `frontend` repository
 (`lib/platform.ts` call functions, `components/features/call/*`, `lib/invite.ts`).
 
 ## 3. Start it locally
@@ -67,7 +66,7 @@ export ELEVENLABS_API_KEY=... ELEVENLABS_VOICE_ID=... GOOGLE_TRANSLATE_API_KEY=.
 PYTHONPATH=src uvicorn runtime.api:app --port 8001
 
 # 4. Frontend
-cd frontend.voice-labs
+cd frontend
 echo 'NEXT_PUBLIC_PLATFORM_URL=http://localhost:8000' > .env.local
 npm ci && npm run dev      # http://localhost:3000/call
 ```
@@ -185,9 +184,9 @@ publisher's ~200 ms lead over real time and a loopback host clock: they validate
 2. iOS Safari and Android Chrome: microphone permission prompt, audio playback after the first tap, backgrounding the tab, screen lock, switching Wi-Fi/cellular.
 3. Reconnection: kill the network for 10-20 s on each side and watch both pages recover or say so.
 4. Headphones vs speakers: the other person's translation leaking into your microphone (also with the cinematic option).
-5. AI-only vs cinematic (the Audio option): intelligibility, whether the original voice helps or distracts; this is the listening study in
-   [dubbing-listening](dubbing-listening.md), on a real call.
-6. Latency end to end: use `RUNTIME_TIMELINE_DIAG=1` (see [latency-analysis](latency-analysis.md)); the link adds nothing to the translation path.
+5. AI-only vs cinematic (the Audio option): intelligibility, whether the original voice helps or distracts; this is the listening study described in
+   [Dubbing](dubbing.md), on a real call.
+6. Latency end to end: use `RUNTIME_TIMELINE_DIAG=1` (the timeline events are described in [Contracts](contracts.md)); the link adds nothing to the translation path.
 7. Interruptions, overlapping speech, short utterances, sentence splitting, translation accuracy.
 8. A link sent through KakaoTalk/WhatsApp/SMS: the in-app browser may not allow the microphone; the page should be opened in the system browser (not verified).
 9. Abuse: the per-address limits behind your real proxy (`PLATFORM_TRUST_PROXY`).
@@ -198,4 +197,4 @@ publisher's ~200 ms lead over real time and a loopback host clock: they validate
 - A guest who closes the tab and reloads loses the page state; re-opening the link from the messenger gets the same seat back (within 30 minutes of the link's creation).
 - Nobody can *leave* without ending the call for both. Two people only, no waiting room, no names beyond what they type, no transcript download.
 - The first screen reads the voice library (`/voices`), which needs an admin key, so with authentication on the "My translated voice" choice never appears (the call uses the default voice).
-- `frontend.voice-labs/__tests__/call-poll.test.tsx` has one failing test that also fails without this work (it depends on the current date).
+- `frontend/__tests__/call-poll.test.tsx` has one failing test that also fails without this work (it depends on the current date).

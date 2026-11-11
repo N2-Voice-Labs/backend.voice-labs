@@ -13,8 +13,7 @@ run. Section 11 holds the recorded results.
 
 It exists to close the gap recorded in [Status](status.md): ElevenLabs live TTS and the
 `/translations` API are implemented and mock-tested but never real-provider-verified. It also
-re-checks per-listener audio routing after the 2026-11 changes (task TR-051 in
-[Translate plan](translate-plan.md)).
+re-checks per-listener audio routing after the 2026-11 changes.
 
 ## What this tests
 
@@ -44,7 +43,7 @@ ElevenLabs-registered voice on a default `/translations` is also `409 voice_prov
 - Optional but recommended: a Korean speaker and an English speaker. The test script below uses
   `ko` and `en`.
 - A way to join a LiveKit room with the tokens Platform returns and to **publish a microphone**
-  and **subscribe to a second "listen" room** (see step 5). `frontend.voice-labs` contains
+  and **subscribe to a second "listen" room** (see step 5). The `frontend` repository contains
   private-listening playback code (`components/features/call/use-call-room.ts`), but I found no
   call to `/translations` in its `app`, `components` or `lib` directories, so whether the web app can
   start this flow was not verified. If it cannot, use any LiveKit-capable client that accepts a
@@ -92,8 +91,7 @@ placeholders.
 | `CARTESIA_API_KEY`, `CARTESIA_VOICE_ID` | Runtime | Needed for Part A (and Part B's baseline); `CARTESIA_VOICE_ID` is the default voice for a participant without a voice profile |
 | `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID` | Runtime | Needed for Part B; required when a session selects the `elevenlabs` TTS provider, and `ELEVENLABS_API_KEY` also when it selects `elevenlabs` for STT (`stt_provider_id`). `ELEVENLABS_API_KEY_FILE` is read only by `scripts/elevenlabs_smoke.py`, not by the Runtime |
 
-`stack.voice-labs/.env.example` does not yet list `ELEVENLABS_*`; add them to your untracked
-`.env` (see [Stale stack docs](stale-stack-docs.md#envexample-patch)).
+`stack.voice-labs/.env.example` lists `ELEVENLABS_API_KEY` and `ELEVENLABS_VOICE_ID`; set them in your untracked `.env`.
 
 ## 2. Start everything
 

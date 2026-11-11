@@ -1,168 +1,62 @@
-# Goal: Enable Real Human-to-Human Translated Calls Through Shareable Links
+# Goal: an AI voice agent people can actually call
 
-We are moving from infrastructure development to real-world product testing.
+Status: **draft, 2026-11-11. Confirm with the team, then remove this line.** This page replaces
+the earlier translator goal and the North Star plan (both are in git history). When it changes,
+update the date.
 
-Our immediate objective is to make our existing real-time translation system usable by two real people through a simple browser-based voice call.
+## The product
 
-This is a prototyping and validation platform, not our final distribution channel. We may eventually integrate carrier calls, messengers, or native applications, but those are out of scope for now.
+A caller talks, by voice, to an AI agent that has a prompt, tools and knowledge documents. The
+agent answers out loud, uses its tools during the call, and hands over to a human when it
+should. Every call leaves a transcript, an outcome and latency numbers in Platform.
 
-## Primary objective
+Voice Labs is the orchestration layer, not a model company. We do not build our own WebRTC,
+SIP, STT, LLM, TTS or VAD. We connect existing ones (LiveKit, Pipecat, Deepgram or ElevenLabs,
+OpenAI or Gemini, Cartesia or ElevenLabs, Silero), make them swappable through the provider
+registries, route the audio correctly, measure every turn, and make the whole thing reliable.
 
-Two people who speak different languages should be able to establish a real-time translated voice call without installing an application or creating accounts.
+## Where it stands (2026-11-11)
 
-The experience should be approximately as simple as joining a Google Meet call.
+Evidence levels are those in [Status](status.md): ✅ real providers, 🧪 mocks only.
 
-### Intended user experience
+| Part of an agent call | Evidence |
+| --- | --- |
+| Browser call: speech → LLM → speech | ✅ October 2026, about 1.65 s from end of speech to first reply audio. Not re-run on today's `main`. |
+| Agent + translator (English agent, Russian caller) | ✅ October 2026, n=2, about 1.9 s |
+| Prompt, language, model, voice settings; templates | ✅ |
+| Transcripts, outcomes, signed events | ✅ |
+| Tools (HTTP and built-in `record_outcome`, `transfer_to_human`, `search_knowledge`) | 🧪 |
+| Knowledge documents (keyword search) | 🧪 |
+| Interruption (barge-in) | 🧪, time to stop never measured |
+| Handoff to a human | 🧪 |
+| Deployed somewhere a stranger can use it | ❌ |
 
-**Person A:**
-1. Opens our website.
-2. Selects their language and the other participant's language.
-3. Clicks Start Call.
-4. Receives a shareable invitation link.
-5. Sends the link through KakaoTalk, WhatsApp, SMS, or another messenger.
+## The next proofs, in order
 
-**Person B:**
-1. Opens the invitation link.
-2. Confirms their language.
-3. Grants microphone access.
-4. Joins the existing call.
-5. Immediately begins communicating through our translation system.
+Each one is done only when it has been run with real providers and the result is written into
+[Status](status.md) with a date and numbers.
 
-Both participants should hear translations in their respective languages.
+1. **Re-run the browser agent call on today's `main`.** A lot changed since October (provider
+   registry, ElevenLabs, Google/Gemini, routing). Record p50 and p95 reply latency over at least
+   20 turns.
+2. **Tools and knowledge with real providers.** One agent with one HTTP tool and one knowledge
+   document answers questions that need both. Record whether the right tool was called and the
+   answer was correct.
+3. **Interruption, measured.** Time from the caller starting to speak to the agent's audio
+   stopping, p50 and p95.
+4. **Handoff to a human.** In the browser first (a person joins the room); phone transfer waits
+   for a SIP trunk.
+5. **A link a stranger can use.** Platform and Runtime deployed, one agent behind a public page,
+   10 calls in a row without a failure.
 
-## Technical objectives
+## Not now
 
-### 1. Reuse existing infrastructure
+These exist in code or in plans, but they are not the goal and do not get work until the
+proofs above are done:
 
-We already have:
-
-- LiveKit.
-- Bidirectional real-time translation.
-- ElevenLabs STT/TTS.
-- Google Cloud Translation with Gemini fallback.
-- Per-call session isolation.
-- Audio routing.
-- Optional cinematic dubbing.
-- Latency instrumentation.
-
-Audit the existing application before implementing anything.
-
-Reuse existing components and avoid unnecessary architectural changes.
-
-### 2. Implement browser-based calls
-
-Build the minimum frontend and backend functionality required to:
-
-- Create a call.
-- Generate a secure invitation link.
-- Join an existing call.
-- Connect both participants to the same translation session.
-- Display connection status.
-- Mute/unmute the microphone.
-- Hang up.
-- End and clean up abandoned sessions.
-
-Support desktop and mobile browsers.
-
-### 3. Make the experience simple
-
-Prioritize a minimal, functional interface.
-
-Avoid unnecessary onboarding, registration, complex settings, or additional features.
-
-The recipient should be able to join with as few interactions as possible.
-
-Handle microphone permissions, audio playback restrictions, connection failures, and reconnections clearly.
-
-### 4. Translation and dubbing
-
-Both participants must receive the correct translations.
-
-For testing, support two audio experiences:
-
-- AI translation only.
-- Live original voice with cinematic ducking.
-
-Use the existing dubbing implementation.
-
-Make the original voice quieter when the AI translation starts. Start by testing approximately −24 dB during translated playback.
-
-Allow the experience to be selected for testing, but preserve existing production defaults.
-
-Do not introduce additional translation latency.
-
-### 5. Security and reliability
-
-Even though this is a prototype, implement basic safeguards:
-
-- Unpredictable invitation links.
-- Expiring invitations.
-- Short-lived LiveKit access tokens.
-- Maximum two human participants per room.
-- No API credentials exposed to browsers.
-- Session cleanup after calls.
-- Protection against unauthorized joins.
-- Basic limits against resource abuse.
-
-### 6. Real-world testing
-
-The application should allow us to test:
-
-- Korean ↔ English translation.
-- End-to-end conversational latency.
-- Translation accuracy.
-- Sentence splitting.
-- Interruptions and overlapping speech.
-- AI-only versus cinematic dubbing.
-- Audio echo with headphones and speakers.
-- Mobile versus desktop behavior.
-- Connection stability.
-
-Keep existing instrumentation available for debugging.
-
-### Constraints
-
-- Do not implement SIP, carrier calling, or messenger voice-call integrations.
-- Do not build native mobile applications.
-- Do not introduce unnecessary infrastructure.
-- Preserve existing translation architecture.
-- Do not consume ElevenLabs credits or paid calling resources without authorization.
-- Keep the implementation modular enough to support additional calling platforms later.
-
-## Definition of success
-
-I can open our website on one device, create a translated call, copy its invitation link, open it on another device, and establish a real bidirectional conversation.
-
-One person speaks Korean.
-
-The other speaks English.
-
-Both hear accurate translations through our existing Runtime.
-
-The call works on desktop and mobile browsers, and both participants can disconnect normally.
-
-## Development instructions
-
-You have discretion over the technical implementation.
-
-First inspect the repository and determine what already exists.
-
-Implement the smallest maintainable solution that meets the objectives.
-
-Write appropriate automated tests and run the relevant test suites.
-
-Do not claim that browser compatibility or real-call performance has been verified until actual device testing has occurred.
-
-Commit completed and verified work.
-
-At completion, report:
-
-1. What was implemented.
-2. How to start the application locally.
-3. How to create and join a translated call.
-4. What external configuration is required.
-5. What has been tested automatically.
-6. What requires manual testing on real devices.
-7. Any limitations affecting real-world use.
-
-Prioritize getting two real people into a working translated conversation over adding features.
+- Two-person translated calls and cinematic dubbing ([Calls](calls.md), [Dubbing](dubbing.md)
+  describe the code that exists; keep it working, do not extend it).
+- Phone (SIP) calls and campaigns: blocked on a SIP account and number anyway.
+- Messenger channels, text chat, voice cloning, live self-cloning.
+- New languages (Kazakh, Uzbek, Kyrgyz) and mixed-language speech: no supported speech
+  provider is wired in.
