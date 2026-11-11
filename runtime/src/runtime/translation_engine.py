@@ -25,12 +25,19 @@ contract is the registry key.
 
 from __future__ import annotations
 
+import asyncio
+
 import logging
 import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
-from .speech_providers import build_stt, build_tts
+from .speech_providers import (
+    build_stt,
+    build_tts,
+    build_translator,
+    translation_provider,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -69,6 +76,19 @@ class TranslationEngine(Protocol):
 
 
 _ENGINES: dict[str, TranslationEngine] = {}
+
+
+def dropped_utterance_hook(session):
+    """Tell the speaker their last sentence was lost (translation failed, the call goes on)."""
+
+    def notify(speaker_identity):
+        play = getattr(session, "play_apology", None)
+        if play is None or not speaker_identity:
+            return
+        task = asyncio.ensure_future(play(speaker_identity=speaker_identity))
+        task.add_done_callback(lambda t: t.cancelled() or t.exception())
+
+    return notify
 
 
 def register_engine(engine: TranslationEngine) -> TranslationEngine:
@@ -125,7 +145,7 @@ class CascadedEngine:
 
         from .glossary import glossary_keyterms
         from .guard_events import translation_empty_hook
-        from .interpreter import OpenAITranslator, TranslationProcessor
+        from .interpreter import TranslationProcessor
         from .language_capabilities import stt_language_for
         from .participants import MAX_PARTICIPANTS, translation_destination
 
@@ -141,24 +161,22 @@ class CascadedEngine:
             extra = {"transport_destination": destination} if destination else {}
             return build_tts(config, language, **extra)
 
-        model = config.provider_settings.get("llm", {}).get("model") or profile.translation_model
+        translator, model = build_translator(config, default=profile.translation_model)
         translation = TranslationProcessor(
             settings=settings,
-            translate=OpenAITranslator(
-                api_key=config.openai_api_key,
-                model=model,
-                base_url=os.getenv("OPENAI_BASE_URL") or None,
-            ),
+            translate=translator,
             model=model,
+            provider=translation_provider(config),
             session=context.session,
             initial_tts_language=target,
             participants=directory,
-            default_voice_id=config.cartesia_voice_id,
+            default_voice_id=config.tts_voice_id,
             route_by_listener=directory is not None,
             timeline=context.timeline,
             context_pairs=profile.context_pairs,
             clause_min_chars=profile.clause_min_chars,
             on_empty_translation=translation_empty_hook(context.session, "interpreter"),
+            on_dropped=dropped_utterance_hook(context.session),
         )
 
         def make_vad():

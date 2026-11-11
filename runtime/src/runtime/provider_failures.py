@@ -191,6 +191,12 @@ def classify_error(
         if _is_timeout(exception):
             return "timeout"
         text = f"{text} {type(exception).__name__} {exception}"
+        if type(exception).__name__.startswith("ConnectionClosed") and _AUTH_TEXT.search(
+            str(exception)
+        ):
+            # ElevenLabs accepts the WebSocket handshake and then closes with
+            # 1008 "Invalid API key" (observed against the real API, 2026-11-05).
+            return "auth"
         if isinstance(exception, OSError) or type(
             exception
         ).__name__.startswith("ConnectionClosed"):
@@ -456,10 +462,10 @@ def cascaded_fallback_config(config: "PipelineConfig") -> "PipelineConfig | None
     if interpreter.get("engine") != "realtime" or interpreter.get("direction", "one_way") != "one_way":
         return None
     if not (
-        config.deepgram_api_key
-        and config.cartesia_api_key
-        and config.cartesia_voice_id
-        and config.openai_api_key
+        config.stt_api_key
+        and config.tts_api_key
+        and config.tts_voice_id
+        and config.llm_api_key
     ):
         return None
     return dataclasses.replace(config, interpreter={**interpreter, "engine": "cascaded"})
@@ -510,7 +516,15 @@ def watch_provider_failures(
         report_provider_failure(
             session,
             kind,
-            providers.get(kind) or ("openai" if kind == "translation" else kind),
+            providers.get(kind)
+            or (translation_provider_name(providers) if kind == "translation" else kind),
             reason,
             fatal=fatal,
         )
+
+
+def translation_provider_name(providers: Mapping[str, str]) -> str:
+    """Provider name translation failures are reported under (the session's LLM provider)."""
+
+    name = providers.get("llm") or "openai"
+    return "openai" if name == "openai-compatible" else name

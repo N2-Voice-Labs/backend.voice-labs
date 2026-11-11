@@ -20,7 +20,7 @@ from livekit.protocol.sip import SIPParticipantInfo
 from src.platform import campaigns, sessions, sip
 from src.platform.db import SessionLocal
 from src.platform.main import app
-from src.platform.models import Campaign, CampaignTarget
+from src.platform.models import Campaign, CampaignTarget, Conversation
 
 
 def phone() -> str:
@@ -133,9 +133,14 @@ class FakePlatform:
             raise HTTPException(status_code=404, detail="agent_not_found")
         self.sessions += 1
         sid = str(uuid4())
+        # A real row: the real service creates one, and PostgreSQL enforces the foreign key
+        # from campaign_targets.conversation_id (SQLite does not).
+        conversation = Conversation(agent_id=str(agent_id), organization_id=ctx.org_id)
+        db.add(conversation)
+        db.flush()
         return {
             "session_id": sid,
-            "conversation_id": str(uuid4()),
+            "conversation_id": conversation.id,
             "room_name": f"voice-labs-{sid}",
         }
 

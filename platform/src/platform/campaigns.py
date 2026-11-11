@@ -229,7 +229,9 @@ async def create_campaign(
     # Org-scoped lookups: another organisation's agent/deployment is indistinguishable
     # from a nonexistent one (both 422 invalid_*_id).
     agent = db.scalars(
-        scoped(db, ctx, AgentRecord).where(AgentRecord.id == str(payload.agent_id))
+        scoped(db, ctx, AgentRecord).where(
+            AgentRecord.id == str(payload.agent_id), AgentRecord.system.is_(False)
+        )
     ).first()
     deployment = db.scalars(
         scoped(db, ctx, DeploymentRecord).where(

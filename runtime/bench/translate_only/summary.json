@@ -1,0 +1,7 @@
+{
+ "kind": "translate",
+ "requests": 1000,
+ "endpoint": "real",
+ "pause_s": 0.05,
+ "timeout_s": 10.0
+}

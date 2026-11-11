@@ -8,7 +8,7 @@ from enum import Enum
 from typing import TYPE_CHECKING
 from uuid import UUID
 
-from .apology import MAX_PLAYBACK_SECONDS, PLAYBACK_MARGIN_SECONDS, apology_plans
+from .apology import MAX_PLAYBACK_SECONDS, PLAYBACK_MARGIN_SECONDS, apology_plans, speaker_plans
 from .events import RuntimeEvent, RuntimeEventType
 from .lifecycle import EndReason, classify_end_reason, terminal_payload
 from .participants import ParticipantDirectory
@@ -118,7 +118,9 @@ class RuntimeSession:
 
         return self._pipeline_cancel_requested or self.state == SessionState.ENDED
 
-    async def play_apology(self, timeout: float = MAX_PLAYBACK_SECONDS) -> bool:
+    async def play_apology(
+        self, timeout: float = MAX_PLAYBACK_SECONDS, *, speaker_identity: str | None = None
+    ) -> bool:
         """Play the pre-rendered apology to the caller(s) and wait for it (ST-10b).
 
         The clip is written straight to the transport's output processor
@@ -127,7 +129,8 @@ class RuntimeSession:
         ``transport_destination`` in two-person sessions, so each listener hears their own
         language on their own track. Returns True when the clip was queued and its duration
         elapsed; False when nothing could be played. Never raises and never takes longer
-        than ``timeout`` (queueing and playback together).
+        than ``timeout`` (queueing and playback together). With ``speaker_identity`` only that
+        person hears it (a lost utterance, the call goes on).
         """
 
         transport, config = self._transport, self._pipeline_config
@@ -135,7 +138,11 @@ class RuntimeSession:
         if output_of is None or config is None or self._pipeline_worker is None or self.ending:
             return False
         try:
-            plans = apology_plans(config, self.participants, self.caller_language)
+            plans = (
+                apology_plans(config, self.participants, self.caller_language)
+                if speaker_identity is None
+                else speaker_plans(config, self.participants, speaker_identity)
+            )
             if not plans:
                 return False
             from .apology import to_frames

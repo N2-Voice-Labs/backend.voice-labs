@@ -151,6 +151,20 @@ def select_entries(
     return applicable[:MAX_PROMPT_ENTRIES]
 
 
+GLOSSARY_RULE = (
+    "Glossary. These terms have a required translation: always use exactly "
+    "this wording (adjust only grammar, such as endings), even where another "
+    "wording would also be correct:\n"
+)
+KEEP_RULE = "Never translate these names or terms; keep them exactly as written "
+
+
+def prompt_has_glossary(system_prompt: str) -> bool:
+    """True when :func:`glossary_prompt` added a section to this translation prompt."""
+
+    return GLOSSARY_RULE in system_prompt or KEEP_RULE in system_prompt
+
+
 def glossary_prompt(
     glossary: Sequence[GlossaryEntry],
     text: str,
@@ -176,15 +190,13 @@ def glossary_prompt(
                 line += f" ({entry.note})"
             lines.append(line)
         parts.append(
-            "Glossary. These terms have a required translation: always use exactly "
-            "this wording (adjust only grammar, such as endings), even where another "
-            "wording would also be correct:\n" + "\n".join(lines)
+            GLOSSARY_RULE + "\n".join(lines)
         )
     if kept:
         names = ", ".join(json.dumps(e.source, ensure_ascii=False) for e in kept)
         parts.append(
-            "Never translate these names or terms; keep them exactly as written "
-            f"(transliterate only if the target script requires it): {names}"
+            KEEP_RULE
+            + f"(transliterate only if the target script requires it): {names}"
         )
     return "\n\n".join(parts)
 

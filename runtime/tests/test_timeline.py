@@ -19,6 +19,7 @@ from pipecat.frames.frames import (
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
     VADUserStartedSpeakingFrame,
+    VADUserStoppedSpeakingFrame,
 )
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
@@ -610,3 +611,335 @@ def test_abandon_returns_an_unheard_utterance_and_unblocks_the_queue() -> None:
     assert cut.queued
     # Once audio has been heard it cannot be taken back.
     assert tracker.abandon(other) is False
+
+
+# -- fine-grained marks between the end of speech and the translation ---------------------
+
+
+def test_fine_marks_follow_the_server_order_on_one_monotonic_clock():
+    clock = FakeClock()
+    session = FakeSession()
+    tracker = TimelineTracker(session, "cascaded", clock=clock)
+    tracker.speech_started("", 0.2)
+    clock.advance(2.0)
+    tracker.vad_stopped("", 0.2)  # the VAD saw 0.2 s of silence
+    clock.advance(0.46)
+    tracker.final_transcript("")
+    tracker.final_transcript("")  # only the first counts
+    clock.advance(0.01)
+    tracker.turn_stopped("")
+    clock.advance(0.002)
+    timeline = tracker.take("")
+    clock.advance(0.003)
+    tracker.mark(timeline, "translation_start")
+    clock.advance(0.2)
+    tracker.mark(timeline, "first_audio")
+    tracker.mark(timeline, "tts_request")
+    marks = timeline.marks
+    assert marks["speech_end"] == pytest.approx(marks["vad_stop"] - 0.2)
+    ordered = [marks[k] for k in ("vad_stop", "final_transcript", "turn_end", "translation_start")]
+    assert ordered == sorted(ordered)
+    assert marks["final_transcript"] - marks["vad_stop"] == pytest.approx(0.46)
+    assert marks["translation_start"] - marks["turn_end"] == pytest.approx(0.005)
+
+
+def test_the_event_carries_the_monotonic_anchor_and_the_new_marks():
+    clock = FakeClock(500.0)
+    session = FakeSession()
+    tracker = TimelineTracker(session, "cascaded", clock=clock)
+    tracker.speech_started("", 0.2)
+    clock.advance(1.0)
+    tracker.vad_stopped("", 0.2)
+    tracker.final_transcript("")
+    tracker.turn_stopped("")
+    timeline = tracker.take("")
+    tracker.mark(timeline, "first_audio")
+    tracker._emit(timeline)
+    name, payload = session.events[-1]
+    assert payload["t0_monotonic_s"] == pytest.approx(499.8)
+    assert {"speech_end", "vad_stop", "final_transcript", "turn_end"} <= set(payload["marks_ms"])
+
+
+def test_no_latency_code_reads_the_wall_clock():
+    """Durations must come from time.monotonic (or the loop clock), never time.time/datetime.now."""
+
+    import re
+    from pathlib import Path
+
+    source = Path(__file__).resolve().parents[1] / "src" / "runtime"
+    banned = re.compile(r"\btime\.time\(|\bdatetime\.(now|utcnow)\(|time\.perf_counter_ns\(\)\s*//\s*1000\s*\+\s*time\.time")
+    allowed = {"events.py", "events_client.py", "provider_health.py"}  # timestamps for people, not durations
+    offenders = [
+        f"{path.name}:{number}"
+        for path in sorted(source.glob("*.py"))
+        if path.name not in allowed
+        for number, line in enumerate(path.read_text().splitlines(), 1)
+        if banned.search(line) and not line.lstrip().startswith("#")
+    ]
+    assert offenders == []
+
+
+def test_translation_processor_records_vad_stop_final_transcript_and_turn_end() -> None:
+    tracker, clock, session = make()
+    processor = translator(tracker, session)
+    drive(
+        clock,
+        processor,
+        [
+            VADUserStartedSpeakingFrame(start_secs=0.2),
+            UserStartedSpeakingFrame(),
+            settle(),
+            Tick(seconds=2.0),
+            VADUserStoppedSpeakingFrame(stop_secs=0.2),
+            settle(),
+            Tick(seconds=0.46),
+            TranscriptionFrame("Hello there", "speaker", "2026-01-01T00:00:00Z", None, finalized=True),
+            settle(),
+            Tick(seconds=0.05),
+            UserStoppedSpeakingFrame(),
+            settle(0.1),
+        ],
+    )
+    [queued] = list(tracker._queue)
+    marks = queued.marks
+    assert marks["vad_stop"] == pytest.approx(102.0)
+    assert marks["speech_end"] == pytest.approx(101.8)
+    assert marks["final_transcript"] == pytest.approx(102.46)
+    assert marks["turn_end"] == pytest.approx(102.51)
+    assert marks["turn_end"] <= marks["translation_start"]
+
+
+def test_diagnostics_are_off_by_default_and_never_log_speech(monkeypatch, capsys) -> None:
+    from src.runtime.timeline import diag, probe_line
+
+    monkeypatch.delenv("RUNTIME_TIMELINE_DIAG", raising=False)
+    diag(probe_line("", 1.0, 2.0, 2.3, "secret words", "secret words."))
+    assert capsys.readouterr().err == ""
+    monkeypatch.setenv("RUNTIME_TIMELINE_DIAG", "1")
+    diag(probe_line("", 1.0, 2.0, 2.3, "hello", "Hello."))
+    assert capsys.readouterr().err.startswith('partial_probe {"key": ""')
+
+
+def test_translation_processor_probes_the_partial_current_at_the_vad_stop(monkeypatch, capsys) -> None:
+    monkeypatch.setenv("RUNTIME_TIMELINE_DIAG", "1")
+    tracker, clock, session = make()
+    processor = translator(tracker, session)
+    drive(
+        clock,
+        processor,
+        [
+            VADUserStartedSpeakingFrame(start_secs=0.2),
+            UserStartedSpeakingFrame(),
+            settle(),
+            InterimTranscriptionFrame("Hello th", "speaker", "2026-01-01T00:00:00Z"),
+            settle(),
+            Tick(seconds=1.0),
+            InterimTranscriptionFrame("Hello there", "speaker", "2026-01-01T00:00:00Z"),
+            settle(),
+            Tick(seconds=0.2),
+            VADUserStoppedSpeakingFrame(stop_secs=0.2),
+            settle(),
+            Tick(seconds=0.26),
+            TranscriptionFrame("Hello there.", "speaker", "2026-01-01T00:00:00Z", None, finalized=True),
+            settle(),
+            UserStoppedSpeakingFrame(),
+            settle(0.1),
+        ],
+    )
+    lines = [l for l in capsys.readouterr().err.splitlines() if l.startswith("partial_probe ")]
+    assert len(lines) == 1
+    import json
+
+    probe = json.loads(lines[0].removeprefix("partial_probe "))
+    assert probe["partial"] == "Hello there" and probe["final"] == "Hello there."
+    assert probe["t_vad_stop"] - probe["t_partial"] == pytest.approx(0.2, abs=0.01)
+    assert probe["t_final"] - probe["t_vad_stop"] == pytest.approx(0.26, abs=0.01)
+
+
+def test_output_marks_follow_tts_frame_to_livekit_submit(monkeypatch) -> None:
+    monkeypatch.setenv("RUNTIME_TIMELINE_DIAG", "1")
+    tracker, clock, session = make()
+    timeline = tracker.speech_started("", 0.2)
+    clock.advance(0.1)
+    tracker.take("")
+    tracker.enqueue_audio(timeline)
+    tracker.chunk_pushed(timeline)
+    tracker.speech_done(timeline)
+    clock.advance(0.05)
+    tracker.on_audio(pcm(20, amplitude=10), RATE)  # a silent first frame still counts as the TTS frame
+    clock.advance(0.03)
+    assert tracker.output_submitting(pcm(40, amplitude=10)) is None  # silence is not submitted-voice
+    clock.advance(0.02)
+    submitting = tracker.output_submitting(pcm(40))
+    assert submitting is timeline
+    clock.advance(0.004)
+    tracker.output_submitted(submitting)
+    assert tracker.output_submitting(pcm(40)) is None  # only the first voiced chunk
+    marks = timeline.marks
+    assert marks["tts_first_frame"] < marks["livekit_submit"] < marks["livekit_submitted"]
+    assert marks["livekit_submitted"] - marks["livekit_submit"] == pytest.approx(0.004)
+
+
+def test_voiced_input_keeps_the_last_frame_before_the_vad_stop() -> None:
+    tracker, clock, session = make()
+    tracker.speech_started("", 0.2)
+    for _ in range(3):
+        clock.advance(0.01)
+        tracker.voiced_input("")
+    last = clock.now
+    clock.advance(0.2)
+    tracker.vad_stopped("", 0.2)
+    clock.advance(0.01)
+    tracker.voiced_input("")  # after the stop: ignored
+    assert tracker.pending("").marks["audio_in_last_voiced"] == pytest.approx(last)
+
+
+def test_output_marks_are_absent_without_diagnostics(monkeypatch) -> None:
+    monkeypatch.delenv("RUNTIME_TIMELINE_DIAG", raising=False)
+    tracker, clock, session = make()
+    timeline = tracker.speech_started("", 0.2)
+    tracker.take("")
+    tracker.enqueue_audio(timeline)
+    tracker.on_audio(pcm(20), RATE)
+    assert tracker.output_submitting(pcm(40)) is None
+    assert "tts_first_frame" not in timeline.marks and "livekit_submit" not in timeline.marks
+
+
+# -- two listeners, independent output clocks --------------------------------------------------
+
+LANE0, LANE1 = "translation-lane-0", "translation-lane-1"
+
+
+def start_turn(tracker, key, listener, destination):
+    """An utterance of speaker ``key`` that will be heard by ``listener`` on ``destination``."""
+
+    timeline = tracker.speech_started(key, 0.2)
+    tracker.take(key)
+    tracker.enqueue_audio(timeline, listener, destination)
+    tracker.chunk_pushed(timeline)
+    tracker.speech_done(timeline)
+    return timeline
+
+
+def test_a_long_translation_for_one_listener_does_not_delay_the_other_listeners_first_audio(monkeypatch) -> None:
+    """The 2026-11-07 call: a 2.65 s English translation for one listener, 0.57 s later a short Korean one
+    for the other. The second one's first audio is its own first frame, not the end of the first one's audio."""
+
+    monkeypatch.setenv("RUNTIME_TIMELINE_DIAG", "1")  # tts_first_frame is a diagnostic mark
+    tracker, clock, session = make("cascaded")
+    long_one = start_turn(tracker, "korean-speaker", "english-listener", LANE0)
+    clock.advance(0.78)
+    short_one = start_turn(tracker, "english-speaker", "korean-listener", LANE1)
+    clock.advance(0.20)
+    first_frame_long = clock.now
+    tracker.on_audio(pcm(2650), RATE, 1, LANE0)  # arrives as a burst, plays for 2.65 s
+    clock.advance(0.571)
+    first_frame_short = clock.now
+    tracker.on_audio(pcm(400), RATE, 1, LANE1)
+    assert long_one.marks["first_audio"] == pytest.approx(first_frame_long)
+    assert short_one.marks["first_audio"] == pytest.approx(first_frame_short)  # not first_frame_long + 2.65
+    assert short_one.marks["tts_first_frame"] == pytest.approx(first_frame_short)
+
+
+def test_the_same_listener_still_waits_for_their_own_earlier_audio() -> None:
+    tracker, clock, _ = make("cascaded")
+    first = start_turn(tracker, "a", "listener", LANE0)
+    clock.advance(0.5)
+    second = start_turn(tracker, "a2", "listener", LANE0)
+    clock.advance(0.1)
+    start = clock.now
+    tracker.on_audio(pcm(2000), RATE, 1, LANE0)
+    tracker.on_tts_stopped(LANE0)  # the first is done
+    clock.advance(0.3)
+    tracker.on_audio(pcm(300), RATE, 1, LANE0)
+    assert first.marks["first_audio"] == pytest.approx(start)
+    assert second.marks["first_audio"] == pytest.approx(start + 2.0)  # behind the first, on the same track
+
+
+def test_tts_stopped_and_frames_of_one_destination_never_touch_the_others_utterance() -> None:
+    tracker, clock, session = make("cascaded")
+    one = start_turn(tracker, "a", "listener-1", LANE0)
+    two = start_turn(tracker, "b", "listener-2", LANE1)
+    tracker.on_tts_stopped(LANE1)  # the other listener's speech ended
+    assert two.finished and not one.finished
+    clock.advance(0.1)
+    tracker.on_audio(pcm(200), RATE, 1, LANE0)
+    assert "first_audio" in one.marks
+    assert "tts_first_frame" not in two.marks or two.marks.get("first_audio") is None
+
+
+def test_the_livekit_submit_mark_goes_to_the_utterance_of_the_destination_written(monkeypatch) -> None:
+    """Turn 9's trailing audio, written to its listener's track, must not become turn 11's submit mark."""
+
+    monkeypatch.setenv("RUNTIME_TIMELINE_DIAG", "1")
+    tracker, clock, _ = make("cascaded")
+    start_turn(tracker, "a", "english-listener", LANE0)
+    clock.advance(0.1)
+    tracker.on_audio(pcm(100), RATE, 1, LANE0)
+    tracker.on_tts_stopped(LANE0)  # turn 9's synthesis is finished; its audio is still being written out
+    waiting = start_turn(tracker, "b", "korean-listener", LANE1)
+    clock.advance(0.05)
+    assert tracker.output_submitting(pcm(40), LANE0) is None  # the old audio leaves for LANE0
+    assert "livekit_submit" not in waiting.marks
+    clock.advance(0.2)
+    tracker.on_audio(pcm(300), RATE, 1, LANE1)
+    clock.advance(0.01)
+    assert tracker.output_submitting(pcm(40), LANE1) is waiting
+    assert waiting.marks["tts_first_frame"] < waiting.marks["livekit_submit"]  # the order the data must have
+
+
+def test_a_single_output_engine_behaves_as_before() -> None:
+    tracker, clock, session = make("cascaded")
+    timeline = speak_utterance(tracker, clock)
+    clock.advance(0.2)
+    tracker.on_audio(pcm(600), RATE)
+    assert timeline.marks["first_audio"] == pytest.approx(clock.now)
+    assert [t.destination for t in tracker._queue] in ([None], [])
+
+
+def test_the_diagnostic_line_names_speaker_listener_and_destination(monkeypatch, capsys) -> None:
+    monkeypatch.setenv("RUNTIME_TIMELINE_DIAG", "1")
+    tracker, clock, _ = make("cascaded")
+    start_turn(tracker, "korean-speaker", "english-listener", LANE0)
+    clock.advance(0.2)
+    tracker.on_audio(pcm(700), RATE, 1, LANE0)
+    err = capsys.readouterr().err
+    assert "speaker=korean-speaker" in err and "listener=english-listener" in err and f"destination={LANE0}" in err
+
+
+def test_event_processor_hands_each_frames_destination_to_the_timeline() -> None:
+    """Frames carry the listener's ``transport_destination``; the processor must use it, so a long
+    translation on one listener's track cannot move the other listener's first audio."""
+
+    tracker, clock, session = make()
+    long_one = start_turn(tracker, "a", "english-listener", LANE0)
+    short_one = start_turn(tracker, "b", "korean-listener", LANE1)
+    observer = RuntimeEventProcessor(session, timeline=tracker)
+    long_audio = TTSAudioRawFrame(pcm(2650), RATE, 1)
+    long_audio.transport_destination = LANE0
+    short_audio = TTSAudioRawFrame(pcm(400), RATE, 1)
+    short_audio.transport_destination = LANE1
+    stop = TTSStoppedFrame()
+    stop.transport_destination = LANE1
+    drive(clock, observer, [long_audio, settle(0.05), Tick(0.571), settle(0.05), short_audio, settle(0.05), stop, settle(0.05)])
+    assert short_one.finished and not long_one.finished  # the stop frame ended only its own destination's utterance
+    gap = short_one.marks["first_audio"] - long_one.marks["first_audio"]
+    assert gap == pytest.approx(0.571, abs=0.05)  # not 0.571 + 2.65
+
+
+def test_the_benchmark_still_parses_old_and_new_diagnostic_lines() -> None:
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[1] / "scripts" / "translation_benchmark.py"
+    spec = importlib.util.spec_from_file_location("translation_benchmark_for_test", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    old = 'utterance_timeline turn=3 engine=cascaded t0_monotonic_s=12.500000 marks_ms={"vad": 200.0, "first_audio": 1500.0}'
+    new = (
+        "utterance_timeline turn=3 engine=cascaded speaker=a listener=b destination=translation-lane-1 "
+        't0_monotonic_s=12.500000 marks_ms={"vad": 200.0, "first_audio": 1500.0}'
+    )
+    for line in (old, new):
+        match = module.FINE_LOG.search(line)
+        assert match and match.group(1) == "12.500000" and '"first_audio": 1500.0' in match.group(2)

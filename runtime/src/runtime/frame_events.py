@@ -155,9 +155,11 @@ class RuntimeEventProcessor(FrameProcessor):
         elif direction != FrameDirection.DOWNSTREAM:
             return
         elif isinstance(frame, TTSAudioRawFrame):
-            timeline.on_audio(frame.audio, frame.sample_rate, frame.num_channels)
+            timeline.on_audio(
+                frame.audio, frame.sample_rate, frame.num_channels, getattr(frame, "transport_destination", None)
+            )
         elif isinstance(frame, TTSStoppedFrame):
-            timeline.on_tts_stopped()
+            timeline.on_tts_stopped(getattr(frame, "transport_destination", None))
 
     async def _emit_ttfb_latency(self, frame: MetricsFrame) -> None:
         for data in frame.data:
