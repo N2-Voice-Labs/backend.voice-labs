@@ -96,7 +96,12 @@ def normalize_language(value: object) -> str | None:
         return None
     text = str(getattr(value, "value", value)).strip().lower().replace("_", "-")
     base = text.split("-", 1)[0]
-    return base or None
+    return {
+        "eng": "en", "rus": "ru", "kor": "ko", "jpn": "ja",
+        "zho": "zh", "chi": "zh", "spa": "es", "fra": "fr", "fre": "fr",
+        "deu": "de", "ger": "de", "ita": "it", "por": "pt",
+        "nld": "nl", "dut": "nl", "hin": "hi", "tur": "tr", "pol": "pl",
+    }.get(base, base) or None
 
 
 @dataclass(frozen=True)

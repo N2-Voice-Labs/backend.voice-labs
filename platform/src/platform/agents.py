@@ -37,6 +37,7 @@ router = APIRouter()
 class InterpreterConfig(BaseModel):
     languages: list[str]
     direction: str = "auto"
+    speaker_language: Literal["declared", "auto"] = "declared"
     engine: Literal["cascaded", "realtime"] = "cascaded"
     # RM-011: "instant" | "balanced" | "accurate". Checked in ``validate_interpreter_engine``
     # (422 invalid_interpreter_config). ``instant`` picks the realtime engine when the
@@ -60,6 +61,8 @@ class InterpreterConfig(BaseModel):
     @model_serializer(mode="wrap")
     def omit_empty_glossary(self, handler: Any) -> dict[str, Any]:
         data = handler(self)
+        if data.get("speaker_language") == "declared" and "speaker_language" not in self.model_fields_set:
+            data.pop("speaker_language", None)
         if not data.get("glossary"):
             data.pop("glossary", None)
         if not data.get("dubbing"):  # off: stored and hashed exactly as before the option existed

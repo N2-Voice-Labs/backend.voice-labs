@@ -48,6 +48,8 @@ Findings from the 2026-11-13 real runs (fixed, with regression tests):
 - **Voice escalation failed.** Gemini 3 requires the `thought_signature` of every replayed function call; Pipecat's OpenAI-compatible service drops it, so the follow-up request after `transfer_to_human` got 400 and the session went `failed`. The Runtime's Gemini service now adds Google's documented placeholder signature and drops the nameless phantom call Gemini's stream produces (`runtime/src/runtime/speech_providers.py`). Verified against the API (400 → 200) and in 3/3 escalation calls since.
 - **Portal ended every call on the first reply.** `useEffect(() => el.scrollIntoView(...))` returned the Promise current Chromium gives back, and React called it as a cleanup ("i is not a function"), unmounting the panel. jsdom hid it; the test mock now returns a Promise.
 - **Chat rate limit was 60× too strict** (minutes passed where seconds were expected): 20 per hour instead of 20 per minute.
+- **Translation feedback loop on shared or speaker setups** (found in a manual test, one laptop and one mic for both people): the translation played on the speakers was transcribed again and re-translated, 12 times in 30 s. The Runtime now drops a transcript that closely matches translated speech it played in the last 10 s (`runtime/src/runtime/echo_guard.py`; short phrases under 8 letters, such as "Hello.", are never dropped; `RUNTIME_ECHO_GUARD=0` turns it off, `RUNTIME_ECHO_GUARD_SECS` sets the window). 🧪 tests, including a replay of the loop; not yet re-run with real audio.
+- **Each person was locked to one language** (user feedback, 2026-11-13). Translated calls now default to `speaker_language: "auto"` (`PLATFORM_CALLS_SPEAKER_LANGUAGE`; `declared` keeps the old behaviour): each sentence's language is detected (speech recognizer, corrected by a clear Cyrillic/Latin/Hangul script majority), translated into the listener's language, or played unchanged when it is already in it. ✅ one EN/RU handoff call (headless, recorded voices): 6 sentences, both people switched language once, all 6 routed correctly (2 played unchanged, 4 translated). 🧪 tests. Known limits: very short words may be misdetected when both languages share a script; a person repeating the exact same sentence within 10 s while the other side heard it unchanged is dropped by the echo guard.
 - **Demo sessions share the `/calls` per-IP limit (6 per hour by default).** A live demo where the audience shares one venue IP will hit it; raise `PLATFORM_CALLS_PER_IP_HOUR` for demo day.
 - Prompt: the agent recited its own instruction ("when asking about deadlines…") and once converted won to US dollars; the prompt now forbids both (5/5 chat and 3/3 voice tuition answers in won only afterwards).
 
@@ -141,7 +143,9 @@ Extra credit budget: **121k credits** (10k approved for MVP verification). Recor
 | 2026-11-13 | 10 consecutive AI voice calls | 700 | 1,224 | 524 | |
 | 2026-11-13 | translated handoff call (110 s, 11 turns) | 1,224 | 1,449 | 225 | plus ~250 for its two recorded tracks, inside the next row |
 | 2026-11-13 | track audio, 3 tuition re-checks, phone-viewport calls | 1,449 | 1,680 | 231 | |
-| | **total** | | | **1,680** | of 10k approved |
+| 2026-11-13 | manual tests by the lead (one laptop, then phone + laptop), HTTPS tunnel check | 1,680 | 2,459 | 779 | includes the 30 s feedback loop |
+| 2026-11-13 | mixed-language EN/RU handoff call (auto detection) + its tracks | 2,459 | 2,587 | 128 | track TTS mostly counted in the previous row |
+| | **total** | | | **2,587** | of 10k approved |
 
 ## Run history
 

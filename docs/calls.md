@@ -204,3 +204,11 @@ publisher's ~200 ms lead over real time and a loopback host clock: they validate
 - Nobody can *leave* without ending the call for both. Two people only, no waiting room, no names beyond what they type, no transcript download.
 - The first screen reads the voice library (`/voices`), which needs an admin key, so with authentication on the "My translated voice" choice never appears (the call uses the default voice).
 - `frontend/__tests__/call-poll.test.tsx` has one failing test that also fails without this work (it depends on the current date).
+
+Two-person calls use `interpreter.speaker_language`: `declared` fixes recognition and
+translation to the speaker’s declared language (Runtime default when omitted); `auto`
+resolves each utterance from STT detection, with script correction and declared-language
+fallback. Speech already in the listener’s declared language is played as-is, without
+translation. `/calls` and handoffs default to `auto`; set
+`PLATFORM_CALLS_SPEAKER_LANGUAGE=declared` to restore fixed recognition. Invalid environment
+values fall back to `auto`. Listener languages and voice routing stay unchanged.

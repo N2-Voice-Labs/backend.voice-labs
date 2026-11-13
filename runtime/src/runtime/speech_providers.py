@@ -418,13 +418,15 @@ def _elevenlabs_stt(
 
     from pipecat.services.elevenlabs.stt import ElevenLabsRealtimeSTTService
 
-    if settings.get("language") == "multi":
+    detection = settings.get("language") == "multi"
+    if detection:
         settings["language"] = None
     if keyterms and "keyterms" not in settings:
         settings["keyterms"] = keyterms
     return _elevenlabs_stt_service_class()(
         api_key=config.elevenlabs_api_key,
         settings=ElevenLabsRealtimeSTTService.Settings(**settings),
+        **({"include_language_detection": True} if detection else {}),
     )
 
 

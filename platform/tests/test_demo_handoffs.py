@@ -86,7 +86,12 @@ def test_demo_response_limits_and_absolute_duration(monkeypatch, runtime, liveki
 
 
 @pytest.mark.parametrize("admin_auth", [False, True])
-def test_handoff_auth_staff_accept_transcript(monkeypatch, runtime, livekit, admin_auth):
+@pytest.mark.parametrize("speaker_language", [None, "declared"])
+def test_handoff_auth_staff_accept_transcript(monkeypatch, runtime, livekit, admin_auth, speaker_language):
+    if speaker_language is None:
+        monkeypatch.delenv("PLATFORM_CALLS_SPEAKER_LANGUAGE", raising=False)
+    else:
+        monkeypatch.setenv("PLATFORM_CALLS_SPEAKER_LANGUAGE", speaker_language)
     with TestClient(app) as client:
         session = source(client, monkeypatch)
         if admin_auth:
@@ -97,6 +102,8 @@ def test_handoff_auth_staff_accept_transcript(monkeypatch, runtime, livekit, adm
         created = handoff(client, session)
         assert created.status_code == 201, created.text
         result = created.json()
+        with SessionLocal() as db:
+            assert db.get(VoiceSession, result["session_id"]).runtime_contract["interpreter"]["speaker_language"] == (speaker_language or "auto")
         assert "invite_code" not in result and result["session_token"].startswith("vls_")
         assert handoff(client, session).status_code == 409
         assert client.get("/staff/handoffs").status_code == 404

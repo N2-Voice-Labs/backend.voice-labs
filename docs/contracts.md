@@ -1053,3 +1053,11 @@ Opt-in (`PLATFORM_PUBLIC_CALLS=1`, otherwise 404). Full description, configurati
 
 `experience: "cinematic"` sets `interpreter.dubbing = "cinematic"` (the `balanced` profile with the original at -24 dB while the translation speaks).
 Providers come from `PLATFORM_CALLS_PROVIDERS`, never from the request.
+
+Two-person calls use `interpreter.speaker_language`: `declared` fixes recognition and
+translation to the speaker’s declared language (Runtime default when omitted); `auto`
+resolves each utterance from STT detection, with script correction and declared-language
+fallback. Speech already in the listener’s declared language is played as-is, without
+translation. `/calls` and handoffs default to `auto`; set
+`PLATFORM_CALLS_SPEAKER_LANGUAGE=declared` to restore fixed recognition. Invalid environment
+values fall back to `auto`. Listener languages and voice routing stay unchanged.

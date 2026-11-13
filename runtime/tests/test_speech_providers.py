@@ -612,6 +612,7 @@ def test_elevenlabs_stt_maps_multi_to_auto_detection_and_passes_keyterms(monkeyp
     )
 
     service = build_stt(config, "multi", ["Voice Labs"])
+    assert service.kwargs["include_language_detection"] is True
 
     assert service.kwargs["settings"] == {
         "model": "custom-model",

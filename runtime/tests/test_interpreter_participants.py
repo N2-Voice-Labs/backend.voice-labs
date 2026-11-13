@@ -125,20 +125,22 @@ def test_directory_update_notifies_listeners() -> None:
 # -- translation: per-speaker language, voice and events ---------------------------
 
 
-def translator_with(directory, *, session=None, default_voice=DEFAULT_VOICE, calls=None):
+def translator_with(directory, *, session=None, default_voice=DEFAULT_VOICE, calls=None, speaker_language="declared", route=False):
     async def translate(messages):
         if calls is not None:
             calls.append(messages)
         return "T:" + messages[-1]["content"]
 
     return TranslationProcessor(
-        settings=InterpreterSettings(languages=directory.languages, direction="auto"),
+        settings=InterpreterSettings(languages=directory.languages, direction="auto", speaker_language=speaker_language),
         translate=translate,
         model="test-model",
         session=session,
         initial_tts_language=directory.languages[1],
         participants=directory,
         default_voice_id=default_voice,
+        route_by_listener=route,
+        echo_guard=False,  # the fake translator returns its input, so a repeated sentence would look like an echo
     )
 
 
@@ -1011,3 +1013,122 @@ def test_voice_id_check_does_not_affect_other_tts_providers(runtime_api) -> None
             payload = start_payload(voice_id="../weird id.with:chars", providers=providers)
             response = client.post("/sessions", json=payload, headers=runtime_api)
             assert response.status_code == 202, providers
+
+
+@pytest.mark.parametrize("mode", ["auto", "declared"])
+def test_speaker_language_settings(mode):
+    assert InterpreterSettings.from_mapping({"languages": ["en", "ru"], "speaker_language": mode}).speaker_language == mode
+    assert InterpreterSettings.from_mapping({"languages": ["en", "ru"]}).speaker_language == "declared"
+
+
+@pytest.mark.parametrize("mode", ["invalid", None, 1, []])
+def test_invalid_speaker_language_settings(mode):
+    with pytest.raises(RuntimeError, match="speaker_language"):
+        InterpreterSettings.from_mapping({"languages": ["en", "ru"], "speaker_language": mode})
+
+
+@pytest.mark.parametrize("detected", ["ru", "rus", None, "en", "fra"])
+def test_auto_russian_passthrough_to_russian_listener(detected):
+    from src.runtime.echo_guard import EchoGuard
+
+    directory = directory_with((ALICE, spec("en", "alice-voice")), (BOB, spec("ru")), pair=("en", "ru"))
+    calls = []
+    session = FakeSession()
+    processor = translator_with(directory, calls=calls, session=session, speaker_language="auto", route=True)
+    processor._echo = EchoGuard()
+    text = "Здравствуйте, как ваши дела?"
+    down, _ = run(processor, turn(text, ALICE, detected))
+    assert calls == []
+    speech = [f for f in down if isinstance(f, TTSSpeakFrame)]
+    assert [(f.text, f.metadata["listener_lane"]) for f in speech] == [(text, 1)]
+    assert processor._echo.is_echo(text)
+    events = session.of("TranscriptFinal")
+    assert [(e["role"], e["content"], e["primary_language"], e["target_language"]) for e in events] == [
+        ("user", text, "ru", "ru"), ("assistant", text, "ru", "ru")]
+    assert not session.of("LatencyMeasured")
+    assert list(processor._history) == [("ru", text, "ru", text)]
+
+
+@pytest.mark.parametrize("text,detected,expected", [
+    ("Hello, how are you?", "rus", "en"),
+    ("12345", "eng", "en"),
+    ("12345", "rus", "ru"),
+    ("12345", None, "en"),
+])
+def test_auto_source_detection_and_fallback(text, detected, expected):
+    directory = directory_with((ALICE, spec("en")), (BOB, spec("ru")), pair=("en", "ru"))
+    calls = []
+    session = FakeSession()
+    processor = translator_with(directory, calls=calls, session=session, speaker_language="auto")
+    run(processor, turn(text, ALICE, detected))
+    assert session.of("TranscriptFinal")[0]["primary_language"] == expected
+    assert len(calls) == (expected != "ru")
+
+
+def test_auto_gate_never_updates_declared_language():
+    directory = directory_with((ALICE, spec("en")))
+    stt = FakeSTT("STT")
+    gate = ParticipantLaneGate(directory, 1, stt=stt, language="en", sync_language=False)
+    run(Pipeline([gate, stt]), [SleepFrame(sleep=0.02)])
+    # Both StartFrame synchronization and a later participant notification are disabled.
+    asyncio.run(directory.update(BOB, spec("ko")))
+    assert stt.language_updates == []
+
+
+@pytest.mark.parametrize("provider", ["deepgram", "elevenlabs"])
+@pytest.mark.parametrize("mode", ["auto", "declared"])
+def test_builder_auto_lanes_override_fixed_provider_language(light_models, monkeypatch, provider, mode):
+    monkeypatch.setenv("LIVEKIT_API_KEY", "key")
+    monkeypatch.setenv("LIVEKIT_API_SECRET", "secret")
+    config = pipeline_config(
+        mode="interpreter", interpreter={"languages": ["en", "ru"], "speaker_language": mode},
+        participants={ALICE: spec("en")}, provider_settings={"stt": {"language": "en"}},
+        providers={"stt": provider, "llm": "openai", "tts": "cartesia"},
+        elevenlabs_api_key="test-key",
+    )
+    _, worker = build_livekit_pipeline(config)
+    for index, lane in enumerate(top_level(worker)[1].processors):
+        stt = next(p for p in lane._processors if type(p).__name__ in {"DeepgramSTTService", "VoiceLabsElevenLabsSTTService"})
+        gate = next(p for p in lane._processors if isinstance(p, ParticipantLaneGate))
+        expected = ("multi" if provider == "deepgram" else None) if mode == "auto" else ("en", "ru")[index]
+        from src.runtime.participants import normalize_language
+        actual = stt._settings.language
+        assert (normalize_language(actual) if mode == "declared" else actual) == expected
+        assert gate._sync_declared_language == (mode == "declared")
+        if provider == "elevenlabs":
+            assert stt._include_language_detection == (mode == "auto")
+
+
+@pytest.mark.parametrize("code,expected", [("eng", "en"), ("rus", "ru"), ("kor", "ko")])
+def test_iso_three_letter_language_normalization(code, expected):
+    from src.runtime.participants import normalize_language
+    assert normalize_language(code) == expected
+
+
+@pytest.mark.parametrize("pair,text,expected", [
+    (("en", "ru"), "Hello Ж", "en"),
+    (("en", "ru"), "Hi Привет", "ru"),
+    (("en", "ru"), "Hi Да", None),
+    (("en", "es"), "Hello", None),
+])
+def test_auto_script_vote_requires_clear_pair_candidate(pair, text, expected):
+    from src.runtime.interpreter import guess_language_from_script
+    assert guess_language_from_script(text, pair, clear_vote=True) == expected
+
+
+def test_passthrough_timeline_tracks_tts_without_translation_marks():
+    from unittest.mock import AsyncMock
+    from src.runtime.interpreter import _Utterance
+    from src.runtime.timeline import TimelineTracker, UtteranceTimeline
+
+    session = FakeSession()
+    directory = directory_with((ALICE, spec("en")), (BOB, spec("ru")), pair=("en", "ru"))
+    processor = translator_with(directory, session=session, speaker_language="auto", route=True)
+    processor.push_frame = AsyncMock()
+    processor._timeline = TimelineTracker(session, "cascaded")
+    timeline = UtteranceTimeline("cascaded", 0.0, speaker=ALICE, turn_id=7)
+    asyncio.run(processor.process_utterance(_Utterance("Здравствуйте!", "rus", ALICE, "now", timeline)))
+    assert timeline.speech_complete and timeline.chunks_pushed == 1
+    assert timeline.listener == BOB and timeline.destination == "translation-lane-1"
+    assert set(timeline.marks) == {"tts_request"}
+    assert all(e["turn_id"] == 7 for e in session.of("TranscriptFinal"))
