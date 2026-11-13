@@ -1,0 +1,52 @@
+Source: https://apply.inha.ac.kr/bbs/apply/148681/185116/download.do
+Source: https://apply.inha.ac.kr/bbs/apply/148681/185118/download.do
+Source: https://apply.inha.ac.kr/apply/18430/subview.do
+Source: https://apply.inha.ac.kr/apply/18403/subview.do
+Retrieved: 2026-11-12
+# Undergraduate and graduate scholarships
+
+Undergraduate Global 1: Korean citizens ineligible; no double scholarships. Admission Administration Committee determines eligibility after all documents are submitted. Full four-year scholarships are ranked within budget using internal tie criteria; all confirmed conditional pre-selection full four-year recipients receive the scholarship.
+For tests on or after January 21, 2026, TOEFL IBT conversion: 115 → 6; 106 → 5.5; 96 → 5; 90 → 4.5.
+Freshmen, both Korean and English tracks: TOPIK LEVEL 4 gives 1 semester 30% tuition fee; TOPIK LEVEL 5 gives 1 semester half tuition fee; TOPIK LEVEL 6 gives 1 semester full tuition fee. Inha University Korean Language Center LEVEL 6 Graduate: 1 semester full tuition fee.
+Freshmen Korean track, Gaokao (Chinese students only): Minimum cutoff score (本年度 本科) + 70 points gives 4-year full tuition fee (5 years for Architecture majors), Monthly supplement of KRW 300,000 and Dormitory expenses (4 person room). + 50 points gives the same tuition and monthly supplement, without dormitory expenses. Minimum cutoff score gives 1 year full tuition fee. An additional 10 points is awarded if Physics was selected in Gaokao.
+Freshmen Korean track English-score scholarships (native speakers ineligible): TOEFL IBT 115 or IELTS 9 or higher gives 4-year full tuition fee (5 years for Architecture majors), Monthly supplement of KRW 300,000 and Dormitory expenses (4 person room). TOEFL IBT 106 or IELTS 8 or higher gives the same tuition and monthly supplement without dormitory expenses. TOEFL IBT 96 or IELTS 7 or higher gives 1 year full tuition fee. TOEFL IBT 90 or IELTS 6.5 or higher gives 1 semester half tuition fee.
+Freshmen English track, with TOPIK Level 3 or higher (native speakers ineligible): TOEFL IBT 115 or IELTS 9 or higher gives 4-year full tuition fee, Monthly supplement of KRW 300,000 and Dormitory expenses (4 person room). TOEFL IBT 106 or IELTS 8 or higher gives 4-year full tuition fee and Monthly supplement of KRW 300,000. TOEFL IBT 96, IELTS 7 or higher gives 1 year full tuition fee; TOEFL IBT 90, IELTS 6.5 or higher gives 1 semester half tuition fee.
+Freshmen English track without TOPIK (native speakers ineligible): TOEFL IBT 115 or IELTS 9 or higher gives 2 year full tuition fee; TOEFL IBT 106 or IELTS 8 or higher gives 1 year full tuition fee; TOEFL IBT 96, IELTS 7 or higher gives 1 semester full tuition fee; TOEFL IBT 90, IELTS 6.5 or higher gives 1 semester half tuition fee.
+Transfers, both tracks: TOPIK LEVEL 5 gives 1 semester half tuition fee; TOPIK LEVEL 6 or Inha University Korean Language Center LEVEL 6 Graduate gives 1 semester full tuition fee. English-score awards (native speakers ineligible): with TOPIK LEVEL 4 or higher, TOEFL IBT 96 or IELTS 7 or higher gives 1 year full tuition fee; with TOPIK LEVEL 4 below or without TOPIK, the same scores give 1 semester full tuition fee. In either TOPIK category TOEFL IBT 90 or IELTS 6.5 or higher gives 1 semester half tuition fee. Certifications must be submitted before admission; final determination follows document screening.
+Global 2, previous-semester GPA:
+| Tuition award | General majors except College of International Studies | College of International Studies |
+| --- | --- | --- |
+| full tuition fee | 4.30 or above | 4.50 |
+| 3/4 tuition fee | 4.00 or above | 4.30 or above |
+| 1/2 tuition fee | 3.75 or above | 4.00 or above |
+| 1/4 tuition fee | 3.20 or above | 3.50 or above |
+Not awarded first semester. From second semester, previous regular semester enrollment at least 16 credits and completion 15 or more required; in 8th semester (10th for Architecture), previous enrollment at least 12 credits and completion 9 or more required.
+Global 1 suspension/loss: acquiring Korean citizenship revokes eligibility. Four-year full tuition/monthly supplement: suspension for previous GPA less than 3.20 or leave in 2nd, 3rd, and/or 4th year; below 3.20 means full tuition payment and no living supplement; below 4.00 means no supplement for 1 month. Loss: GPA of 2 previous semesters less than 3.20, leave in 1st year, or previous GPA less than 2.50. Two-year full tuition: suspension for previous GPA less than 3.20 or leave in 2nd year; loss for GPA of 2 previous semesters less than 3.20, leave in 1st year or previous GPA less than 2.50. One-year full tuition: loss for previous GPA less than 3.20 or leave in 1st year. Guides apply Global 2 standards following suspension/loss or completion of Global 1, with the credit conditions above.
+
+Fall 2027 difference: the Korean-track-only freshman Gaokao/English-score section explicitly excludes College of International Studies students; the English-track-only section explicitly labels College of International Studies students. Spring does not include those parenthetical exclusions/labels.
+The undergraduate scholarship webpage uses SGCS terminology and Key Universities (一本大学) Admission line for Gaokao, while the 2027 guides use Minimum cutoff score (本年度 本科). The webpage additionally lists Second Universities (二本大学) Admission Line + [Key Universities (一本大学) Admission Line - Second Universities (二本大学) Admission Line] / 2 for 1 semester half tuition fee; this row is absent from the guides. The webpage says students are no longer eligible for Global Scholarship 2 after suspension/loss, while the guides say Global 2 standards apply. These statements conflict; obtain confirmation rather than promise eligibility.
+
+
+Graduate scholarships (General Graduate School)
+Jeongseok International Scholarship: automatic selection from official certificates submitted at admission; no separate application. Benefits cover Admission and Tuition Fees.
+| Type | Criteria | Benefit |
+| --- | --- | --- |
+| A TYPE | Korean AND English: TOPIK Level 5~6 or Level 6 at a Korean university language center AND TOEFL iBT 4 (or 71), TOEIC 700, or IELTS 5.5; OR TOEFL iBT 5 (or 92), TOEIC 820, or IELTS 7 AND TOPIK Level 3, Level 4 at a Korean university language center, or Level Intermediate-4A at a Sejong Institute | 100% |
+| B TYPE | Korean OR English: TOPIK Level 5~6 or Level 6 at a Korean university language center; OR TOEFL iBT 5 (or 92), TOEIC 820, or IELTS 7 | 70% |
+| C TYPE | Korean OR English: TOPIK Level 4 or Level 5 at a Korean university language center; OR TOEFL iBT 4.5 (or 78), TOEIC 740, or IELTS 6 | 50% |
+| D TYPE | Korean OR English: TOPIK Level 3, Level 4 at a Korean university language center, or Level Intermediate-4A at a Sejong Institute; OR TOEFL iBT 4 (or 71), TOEIC 700, or IELTS 5.5 | 30% |
+Official certificates must remain valid through the application deadline; Korean university language center certificates must be obtained within two years before that deadline.
+Jeongseok duration: Master's and Doctoral up to the 4th semester; Integrated up to the 8th semester. Maintain CGPA 3.75 or above out of 4.5. Below 3.75 suspends payments the following semester; eligibility returns the semester after CGPA reaches 3.75 or above.
+Enrolled students may apply for upgrades/new awards during the designated period each semester; approved awards take effect the following semester. Graduate School Administration Office manages this; notices appear at the beginning of each semester on the Graduate School Website. Qualifying research: Engineering / Natural Science, 1 SCI(E)-indexed paper as first author; Humanities / Arts & Physical Education, 1 KCI-indexed paper as first author. Non-recipients can submit a first D Type qualifying score for 30%; recipients can submit a higher-level score than at admission. Only research published or officially accepted AFTER admission and scores obtained AFTER admission count.
+Global Vision Scholarship: 100% of Admission and Tuition Fees. Duration and CGPA rules are the same as Jeongseok.
+Global Vision Scholarship 1: prospective Inha advisor recommendation; 50 selected each semester. Master's/Integrated: either advisor appointed within the three years preceding the application deadline (graduates of ANY university), or Inha undergraduate alumni with cumulative GPA 3.5 / 4.5 or higher and advisor recommendation (Up to 10 of the 50 recipients per semester). Doctoral: prospective advisor recommendation. Submit Global Vision Scholarship Application and Recommendation Form with application documents; without advisor recommendation it is invalid. Each advisor can recommend only one student per semester across degree programs and new/current applicants. Eligibility does not guarantee selection; Graduate School Committee ranks excess applicants within quota. Unselected applicants are automatically considered for Jeongseok.
+Global Vision Scholarship 2: graduates recommended by designated partner institutions with formal agreements, e.g. Inha University in Tashkent, Baku Engineering University. Up to 10 per partner institution, subject to Graduate School Committee approval. Submit a recommendation letter from a professor at the original partner institution. Eligibility does not guarantee selection; the Committee ranks excess applicants. Unselected applicants are considered for Global Vision 1 if they applied and qualify; otherwise automatically considered for Jeongseok.
+Global Vision 1 recipients must complete two semesters of TA/LA duties officially arranged through the Academic Affairs Team, without additional Assistant Scholarship payouts for this mandatory duty. Failure makes them ineligible for graduation. Both Global Vision types must maintain CGPA 3.75 or above out of 4.5; suspension/restoration follows the Jeongseok rule above.
+Assistant Scholarship (TA / LA): full-time enrolled students recommended by their department. Master's up to the 6th semester, Doctoral up to the 8th semester, Integrated up to the 12th semester. Apply through the department office before each semester (February for Spring, August for Fall).
+| Type | Master | Ph.D |
+| --- | --- | --- |
+| LA1 | KRW 1,100,000 | KRW 1,450,000 |
+| LA2 | KRW 1,600,000 | KRW 1,950,000 |
+| LA3 | KRW 2,100,000 | KRW 2,450,000 |
+| TA1,2 | KRW 1,100,000 | KRW 1,450,000 |
+Assistant Scholarship amounts are subject to change; contact the department office for selection details.
