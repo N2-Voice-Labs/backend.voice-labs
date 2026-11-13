@@ -6,6 +6,7 @@ from uuid import uuid4
 from sqlalchemy import (
     JSON,
     Boolean,
+    CheckConstraint,
     DateTime,
     ForeignKey,
     Index,
@@ -475,6 +476,27 @@ class ProblemReport(TenantMixin, Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow
     )
+
+
+class Handoff(TenantMixin, Base):
+    __tablename__ = "handoffs"
+    __table_args__ = (
+        UniqueConstraint("from_session_id", name="uq_handoffs_from_session"),
+        CheckConstraint("status IN ('waiting', 'accepted', 'ended', 'expired')", name="ck_handoffs_status"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    from_session_id: Mapped[str | None] = mapped_column(ForeignKey("voice_sessions.id"), nullable=True)
+    from_conversation_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    call_session_id: Mapped[str] = mapped_column(ForeignKey("voice_sessions.id"))
+    invite_code: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(20), default="waiting")
+    requester_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    requester_language: Mapped[str] = mapped_column(String(20))
+    staff_language: Mapped[str] = mapped_column(String(20))
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 from . import tenancy  # noqa: E402,F401  (registers the before_flush stamping hook)
