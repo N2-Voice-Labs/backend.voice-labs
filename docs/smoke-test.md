@@ -1,5 +1,7 @@
 # Real-provider smoke test (human-run)
 
+> UNAI MVP provider runs draw from a budget of **121k extra ElevenLabs credits**. Record each billable run in the [credit ledger](status.md#elevenlabs-credit-ledger).
+
 Written 2026-11-05. **Status:** the *automated ElevenLabs-layer script* (section 1a) has been run; everything else on
 this page (Parts A and B, the checks, section 8) was derived from reading the code and has not been
 run. Section 11 holds the recorded results.
@@ -469,3 +471,27 @@ python scripts/translation_benchmark.py report bench/balanced bench/instant
 Normal benchmarks run against the real Google endpoint (leave `GOOGLE_TRANSLATE_BASE_URL` unset).
 Fault injection is a separate configuration: start `scripts/fake_google.py`, point the Runtime at
 it with `GOOGLE_TRANSLATE_BASE_URL`, and pass `--fake-google http://localhost:9000 --google-mode slow1000`.
+
+## UNAI demo journey checks (real providers, fake microphone)
+
+Billable: record credits in the [ledger](status.md#elevenlabs-credit-ledger). Needs a running Platform + Runtime
+with `PLATFORM_DEMO_AGENTS`, `PLATFORM_STAFF_KEY` and LiveKit set, the seeded agent
+(`scripts/seed_demo_agent.py`), and the portal (`frontend.voice-labs`) built with `NEXT_PUBLIC_PLATFORM_URL`
+pointing at Platform. The WAVs are recordings used as each browser's microphone (lead silence, then the
+sentence(s), then silence); make them with any TTS and keep them out of the repository.
+
+```sh
+# AI voice calls in a row: answered?, cleaned up?, reply latency (end-of-turn → first reply audio)
+PLAYWRIGHT_DIR=../frontend.voice-labs node scripts/portal_voice_check.cjs --portal http://127.0.0.1:3000 \
+  --platform http://127.0.0.1:18000 --admin-key "$ADMIN_KEY" --wav q1.wav --wav q2.wav --wav q3.wav --runs 10
+
+# Whole journey with two browsers: AI call → handoff → /staff pick-up → translated EN↔KO call → hang-up
+STAFF_KEY=… PLAYWRIGHT_DIR=../frontend.voice-labs node scripts/handoff_flow_check.cjs --portal http://127.0.0.1:3000 \
+  --platform http://127.0.0.1:18000 --admin-key "$ADMIN_KEY" --student-wav student_en.wav --staff-wav staff_ko.wav
+
+# FAQ accuracy through chat (Gemini only, no ElevenLabs credits); grade REVIEW rows by hand
+uv run --directory evals --locked python scripts/run_faq_eval.py --platform-url http://127.0.0.1:18000 --delay-s 3
+```
+
+Translation latency per turn: `scripts/live_call_stack.sh summary`-style `utterance_timeline` lines in the Runtime
+log (`RUNTIME_TIMELINE_DIAG=1`). Results of the 2026-11-13 run are in [Status](status.md#unai-mvp-tracker).

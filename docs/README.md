@@ -1,5 +1,7 @@
 # Backend docs
 
+> **UNAI** (formerly Voice Labs) is a B2B AI communication platform: AI voice agents (primary), real-time translation, AI chatbots and developer APIs. First market: university admissions offices. First MVP: the AI Admissions Assistant for international students at Inha University. Calls run in the browser over WebRTC (LiveKit); telephone/SIP calling is deferred.
+
 Docs that describe the Platform, Runtime and Evaluation code live here, next to the code, so a
 change and its documentation go in the same commit. Setup and onboarding (run locally,
 quickstarts, troubleshooting) live in the `stack.voice-labs` docs site. Cleaned up 2026-11-11:
@@ -7,12 +9,12 @@ old plans, studies and superseded copies were deleted (they are in git history).
 
 | Page | What it is |
 | --- | --- |
-| [Goal](goal.md) | What we are building now (the AI voice agent) and the next proofs, in order |
+| [Goal](goal.md) | UNAI product goal, Inha MVP journey and next proofs |
 | [Status](status.md) | What works, at three evidence levels: implemented, mock-tested, real-provider-verified |
 | [Contracts](contracts.md) | API and event contracts: authentication, sessions, translations, providers, events |
 | [Smoke test](smoke-test.md) | Billable real-provider checklist and how to record results |
-| [Calls](calls.md) | Reference: two-person translated calls by shareable link (not the current goal) |
-| [Dubbing](dubbing.md) | Reference: the cinematic dubbing option, off by default (not the current goal) |
+| [Calls](calls.md) | Reference: translated calls by shareable link |
+| [Dubbing](dubbing.md) | Reference: the cinematic dubbing prototype, off by default |
 
 ## Conventions
 

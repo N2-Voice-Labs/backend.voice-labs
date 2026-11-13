@@ -1,5 +1,7 @@
 # Backend status
 
+> **UNAI** (formerly Voice Labs) is a B2B AI communication platform: AI voice agents (primary), real-time translation, AI chatbots and developer APIs. First market: university admissions offices. First MVP: the AI Admissions Assistant for international students at Inha University. Calls run in the browser over WebRTC (LiveKit); telephone/SIP calling is deferred.
+
 Updated 2026-11-11 (rewritten; the long dated run logs that used to be here are in git history,
 see [Run history](#run-history)). Backend only. The goal and what comes next are in
 [Goal](goal.md); API details are in [Contracts](contracts.md).
@@ -18,24 +20,56 @@ see [Run history](#run-history)). Backend only. The goal and what comes next are
 Two services. **Platform** (FastAPI, PostgreSQL) stores agents, voices, conversations,
 organizations and keys, and hands each call to Runtime as a session contract. **Runtime**
 (FastAPI, Pipecat, LiveKit) runs the live audio and reports signed events back. Platform never
-touches audio. The goal is an **AI voice agent** ([Goal](goal.md)). The same Runtime also runs
-two-person translated calls and an agent that translates for its caller.
+touches audio. UNAI’s first MVP is the Inha University AI Admissions Assistant ([Goal](goal.md)); browser voice is primary, with translated browser handoff and chat as planned channels.
 `feature/voice-renovation` was merged into `main` on 2026-11-11 (PR #1).
 
-## Voice agents (the goal)
+## UNAI MVP tracker
+
+Evidence: 🧪 = automated tests with stubbed providers; 🔌 = local run against a real Platform process; ✅ = real providers end to end (ElevenLabs STT/TTS, Gemini, Google Translate, LiveKit Cloud) driven by headless Chromium with a recorded voice as the microphone (`scripts/portal_voice_check.cjs`, `scripts/handoff_flow_check.cjs`). Local stack, SQLite; not yet a deployed server, a real phone, or a human speaker.
+
+| Piece | Code | Evidence (2026-11-13 unless noted) |
+| --- | --- | --- |
+| Public demo agent sessions `POST /demo/agents/{key}/sessions`, `GET /demo/agents/{key}`, 5-min cap via reaper | Done | ✅ 10/10 consecutive AI voice calls answered (3 questions in rotation, incl. "Can I speak with an admissions officer?"). |
+| AI reply latency (end-of-turn detection → first reply audio) | — | ✅ median **2.18 s** over the 10 calls (1.41–4.20 s). FAQ answers 1.4–2.2 s; escalations 2.8–4.2 s (two LLM round trips: tool call, then the spoken reply). Measured from the stored `SpeechStopped`→`AgentSpeechStarted` events: the Runtime does not emit `turn_to_first_audio` in agent mode (the final processor never sees `UserStoppedSpeakingFrame`). Measured from turn detection, not from the last syllable. |
+| Session cleanup | Done | ✅ 10/10 sessions `ended` after "End call"; handoff ends the AI session; both hang-up paths end the call session. |
+| Inline knowledge (≤ `PLATFORM_INLINE_KNOWLEDGE_MAX_CHARS`, default 60000) + Hangul bigram search | Done | 🧪 tests; ✅ inline (42 KB of Inha knowledge in the prompt, ~10.8k prompt tokens per turn). |
+| Inha agent seed (`scripts/seed_demo_agent.py`, `agents/inha-admissions/`) | Done | 🔌 idempotent re-seeds (prompt updates in place, same agent id). |
+| Inha admissions knowledge (12 files from the Spring/Fall 2027 English guidelines + apply.inha.ac.kr, retrieved 2026-11-12) | Done | 167 numbers/dates/emails automatically checked against the sources: all present. |
+| 20-question FAQ eval (`evals/scripts/run_faq_eval.py`, through chat) | Done | ✅ graded by hand: **20/20 factually correct, 0 invented facts**; both unanswerable questions offer an officer (`handoff_suggested`). Strict completeness 18/20 (#14 omits "about four weeks", #17 omits the street address). The automatic `must_include` check under-counts (spoken numbers such as "five or six"). Median chat latency 1.5 s. |
+| Handoff `POST /handoffs` + `/staff/handoffs` (list, accept, transcript) + `/staff` console | Done | ✅ student → "Connect to Admissions Officer" → queue → officer picks up → joined in 5.6 s. |
+| Translated EN↔KO handoff call (reuses `/calls` + private listen rooms) | Done (reuse) | ✅ one 110 s call: **5 EN→KO and 6 KO→EN** translated turns; speech end → first translated audio median **844 ms** (785–917, n=11). One mistranslation from speech recognition ("아포스티유" heard as "아포스티오" → "apostolate"); no glossary is set on handoff calls. Officer hung up; ended for both. |
+| Chat `POST /demo/agents/{key}/chat` | Done | 🔌 real Gemini (see FAQ eval). |
+| Portal (frontend.voice-labs): `/` assistant (voice + chat), `/staff` console | Done | ✅ desktop and emulated iPhone 13 viewport (Chromium, not Safari): no horizontal overflow, voice call works. **A real phone browser is not tested yet** (needs HTTPS). |
+| UNAI marketing site (frontend): Products, Solutions, Developers, Live demo, Contact | Done | Unit tests + build. |
+| Deploy kit (`compose.yml`, `docs/deploy.md`, Dockerfiles, `.env.example`) | Done | `docker compose config` valid; images not built (no Docker socket access); not deployed. |
+
+Findings from the 2026-11-13 real runs (fixed, with regression tests):
+
+- **Voice escalation failed.** Gemini 3 requires the `thought_signature` of every replayed function call; Pipecat's OpenAI-compatible service drops it, so the follow-up request after `transfer_to_human` got 400 and the session went `failed`. The Runtime's Gemini service now adds Google's documented placeholder signature and drops the nameless phantom call Gemini's stream produces (`runtime/src/runtime/speech_providers.py`). Verified against the API (400 → 200) and in 3/3 escalation calls since.
+- **Portal ended every call on the first reply.** `useEffect(() => el.scrollIntoView(...))` returned the Promise current Chromium gives back, and React called it as a cleanup ("i is not a function"), unmounting the panel. jsdom hid it; the test mock now returns a Promise.
+- **Chat rate limit was 60× too strict** (minutes passed where seconds were expected): 20 per hour instead of 20 per minute.
+- **Demo sessions share the `/calls` per-IP limit (6 per hour by default).** A live demo where the audience shares one venue IP will hit it; raise `PLATFORM_CALLS_PER_IP_HOUR` for demo day.
+- Prompt: the agent recited its own instruction ("when asking about deadlines…") and once converted won to US dollars; the prompt now forbids both (5/5 chat and 3/3 voice tuition answers in won only afterwards).
+
+Findings from the 2026-11-12 smoke run (fixed):
+
+- Provider records rejected `max_tokens` ("provider secrets must use secret_reference") because the key contains "token", so no LLM provider could set a reply length. Token-count keys are now exempt (`validation.NON_SECRET_KEYS`).
+- `gemini-2.5-flash` and `gemini-3.5-flash` spend hidden reasoning tokens out of `max_tokens`. With 160 (voice) or 300 (chat), replies were cut off mid-sentence (`finish_reason: length`). `gemini-3.5-flash-lite` finished every reply (`stop`) in 1.15–1.43 s (n=2, direct API), so it is now the default for the Inha agent and the chat. `gemini-2.5-flash-lite` is no longer available to new API users.
+
+## Voice agents (existing platform capability)
 
 | Feature | Status | Notes |
 | --- | --- | --- |
-| Talk to an agent in a browser | ✅ 2026-10 (on older code) | Deepgram → OpenAI → Cartesia through LiveKit, about 1.65 s from end of speech to first reply audio. Not re-run since the 2026-11 provider changes. |
+| Talk to an agent in a browser | ✅ 2026-11-13 | ElevenLabs STT → Gemini (`gemini-3.5-flash-lite`) → ElevenLabs TTS through LiveKit Cloud: median 2.18 s end-of-turn → first reply audio (n=10). Earlier (2026-10) Deepgram → OpenAI → Cartesia: about 1.65 s. |
 | Agent + translator (English agent, Russian caller) | ✅ 2026-10-18, n=2 | About 1.9 s. |
 | Agent settings: prompt, language, model, voice, temperature; templates | ✅ | |
 | Tools: HTTP tools and built-ins `record_outcome`, `transfer_to_human`, `search_knowledge` | 🧪 | Timeouts and logging; mock servers only. |
-| Knowledge documents | 🧪 | Keyword search over assigned documents, no embeddings. Returns a source name, no link. |
+| Knowledge documents | ✅ 2026-11-13 (inline) | Small knowledge bases (≤ `PLATFORM_INLINE_KNOWLEDGE_MAX_CHARS`) are inserted into the prompt; larger ones use `search_knowledge` keyword search (with Hangul bigrams, 🧪). No embeddings. |
 | Interruption (barge-in) | 🧪 | Time to stop never measured. |
-| Handoff to a human | 🧪 | Handoff event and transfer tool. |
+| Handoff intent | ✅ 2026-11-13 | `transfer_to_human` by voice (Gemini) marks the conversation escalated; the portal offers "Connect to Admissions Officer" and the officer joins through `/staff` (see the MVP tracker). |
 | Outcomes, transcripts, signed events | ✅ | Each event stored exactly once (idempotent by event id). |
 
-## Two-person translation (not the goal; keep working)
+## Existing two-person translation capability (supports planned translated handoff)
 
 | Feature | Status | Notes |
 | --- | --- | --- |
@@ -96,6 +130,18 @@ selects them by provider record.
    characters; Runtime refuses ids outside `[A-Za-z0-9_-]{1,128}` at session start.
 5. **Default-provider assumption:** with no TTS provider set, Platform assumes Runtime's default
    `cartesia`; if that default changes, `health.DEFAULT_PROVIDERS` must change with it.
+
+## ElevenLabs credit ledger
+
+Extra credit budget: **121k credits** (10k approved for MVP verification). Record billable runs here. Read the balance before and after each run (`GET https://api.elevenlabs.io/v1/user/subscription`); the counter lags by a few minutes, so small runs are summed. Gemini-only runs (FAQ eval, chat) are not listed.
+
+| date | run | credits before | after | used | notes |
+| --- | --- | --- | --- | --- | --- |
+| 2026-11-12/13 | test-question audio (TTS) + first debugging calls | 0 | 700 | 700 | includes 3 failed calls before the two fixes above |
+| 2026-11-13 | 10 consecutive AI voice calls | 700 | 1,224 | 524 | |
+| 2026-11-13 | translated handoff call (110 s, 11 turns) | 1,224 | 1,449 | 225 | plus ~250 for its two recorded tracks, inside the next row |
+| 2026-11-13 | track audio, 3 tuition re-checks, phone-viewport calls | 1,449 | 1,680 | 231 | |
+| | **total** | | | **1,680** | of 10k approved |
 
 ## Run history
 

@@ -1,5 +1,7 @@
 # Contracts
 
+> **UNAI** (formerly Voice Labs) is a B2B AI communication platform: AI voice agents (primary), real-time translation, AI chatbots and developer APIs. First market: university admissions offices. First MVP: the AI Admissions Assistant for international students at Inha University. Calls run in the browser over WebRTC (LiveKit); telephone/SIP calling is deferred.
+
 Runtime events carry `event_id`, `event_type`, `schema_version`, session/conversation/
 agent IDs, timestamp, optional trace ID, and payload. Platform authenticates Runtime
 requests and ingests events idempotently by event ID.
@@ -7,6 +9,22 @@ requests and ingests events idempotently by event ID.
 Platform-to-Runtime session handoff includes the selected agent/conversation/session
 context and LiveKit room details. Runtime must join the requested room and report
 lifecycle changes; the durable record remains owned by Platform.
+
+## MVP endpoints (implemented 2026-11-12; tested with stubs, not yet with real voice providers)
+
+All are generic: the university lives only in agent data. They run in the calls organisation (`PLATFORM_CALLS_ORG_ID`, default org) like `/calls`.
+
+| Route | Auth | Body → reply |
+| --- | --- | --- |
+| `GET /demo/agents/{key}` | public, rate limited; 404 `demo_disabled` unless `PLATFORM_DEMO_AGENTS` is set | → `{key, name, description, enabled_languages}` |
+| `POST /demo/agents/{key}/sessions` | public, rate limited | `{name?}` → same as `POST /voice/sessions` (incl. `session_token`). Reaped after `PLATFORM_DEMO_MAX_SECONDS` (300). |
+| `POST /demo/agents/{key}/chat` | public, per-IP limit (`PLATFORM_CHAT_PER_IP_MINUTE`) | `{message, conversation_id?}` → `{conversation_id, reply, handoff_suggested}`. 30 user messages per conversation (429 `chat_limit`), 60-minute window; 503 `chat_unavailable` without a key, 502 `chat_failed` upstream. LLM: `PLATFORM_CHAT_LLM_MODEL` (default `gemini-3.5-flash-lite`), key `PLATFORM_CHAT_LLM_API_KEY` or `GEMINI_API_KEY`. |
+| `POST /handoffs` | `Authorization: Bearer vls_…` of the AI session | `{session_id, language="en", staff_language=PLATFORM_HANDOFF_STAFF_LANGUAGE or "ko", name?, reason?}` → ends the AI session, opens a translated call + invite, returns the `POST /calls` reply plus `handoff_id`. One handoff per AI session (409 `handoff_exists`). Requires `PLATFORM_PUBLIC_CALLS=1` for the staff join. |
+| `GET /staff/handoffs` | `X-Staff-Key` = `PLATFORM_STAFF_KEY` (404 when unset, 401 when wrong) | → waiting + accepted handoffs, newest first; never the invite code |
+| `POST /staff/handoffs/{id}/accept` | staff key | → `{invite_code, call_session_id}`; the officer then uses `POST /calls/invites/{code}/join` (the portal opens `/join#c=<code>`). 409 `handoff_not_waiting`. |
+| `GET /staff/handoffs/{id}/transcript` | staff key | → the AI conversation's messages |
+
+Knowledge: when an agent's linked documents total ≤ `PLATFORM_INLINE_KNOWLEDGE_MAX_CHARS` (default 60000; 0 disables), the Platform appends them to the session's `system_prompt` and sends `knowledge_enabled: false` (no `search_knowledge` tool). Larger sets keep the search tool.
 
 ## Authentication
 

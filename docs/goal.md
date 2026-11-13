@@ -1,62 +1,57 @@
-# Goal: an AI voice agent people can actually call
+# UNAI goal: AI Admissions Assistant for Inha University
 
-Status: **draft, 2026-11-11. Confirm with the team, then remove this line.** This page replaces
-the earlier translator goal and the North Star plan (both are in git history). When it changes,
-update the date.
+Status: **current product direction, 2026-11-12.** MVP implementation is in progress.
 
-## The product
+> **UNAI** (formerly Voice Labs) is a B2B AI communication platform: AI voice agents (primary), real-time translation, AI chatbots and developer APIs. First market: university admissions offices. First MVP: the AI Admissions Assistant for international students at Inha University. Calls run in the browser over WebRTC (LiveKit); telephone/SIP calling is deferred.
 
-A caller talks, by voice, to an AI agent that has a prompt, tools and knowledge documents. The
-agent answers out loud, uses its tools during the call, and hands over to a human when it
-should. Every call leaves a transcript, an outcome and latency numbers in Platform.
+## Product and MVP
 
-Voice Labs is the orchestration layer, not a model company. We do not build our own WebRTC,
-SIP, STT, LLM, TTS or VAD. We connect existing ones (LiveKit, Pipecat, Deepgram or ElevenLabs,
-OpenAI or Gemini, Cartesia or ElevenLabs, Silero), make them swappable through the provider
-registries, route the audio correctly, measure every turn, and make the whole thing reliable.
+UNAI is Voice Labs renamed and repositioned, not a separate company. It is an AI-as-a-Service platform designed for multiple industries. AI voice agents are the primary product; real-time translation supports a handoff when a caller and staff member speak different languages. AI chatbots are a secondary channel using the same knowledge. Developer APIs are the commercial direction; today this means the existing Platform HTTP API. Billing, API-key portal and developer dashboard are planned, not built.
 
-## Where it stands (2026-11-11)
+The first demo is for Inha University international admissions. The platform remains industry-neutral: university-specific knowledge and prompts belong in agent data, not runtime code.
 
-Evidence levels are those in [Status](status.md): ✅ real providers, 🧪 mocks only.
+MVP journey: a student opens the Inha portal and starts an AI voice call in the browser. The agent answers from verified admissions information. On “Connect to Admissions Officer,” staff join from a browser `/staff` console; the student can speak English while the officer speaks Korean through the existing `/calls` interpreter and private listen rooms. Either side can end the call. A text chatbot is an alternative channel. No phone number or SIM is needed. Traditional telephone/SIP calling and outbound campaigns are deferred.
 
-| Part of an agent call | Evidence |
+Small knowledge bases are intended to be inserted inline into the agent prompt; larger ones use the existing keyword `search_knowledge` tool. Inline mode is in progress; embeddings RAG is deferred.
+
+## Existing evidence
+
+Evidence below records prior runs and remains historical; it does not establish that the current MVP is complete. See [Status](status.md) for evidence levels.
+
+| Capability | Recorded evidence |
 | --- | --- |
-| Browser call: speech → LLM → speech | ✅ October 2026, about 1.65 s from end of speech to first reply audio. Not re-run on today's `main`. |
-| Agent + translator (English agent, Russian caller) | ✅ October 2026, n=2, about 1.9 s |
-| Prompt, language, model, voice settings; templates | ✅ |
-| Transcripts, outcomes, signed events | ✅ |
-| Tools (HTTP and built-in `record_outcome`, `transfer_to_human`, `search_knowledge`) | 🧪 |
-| Knowledge documents (keyword search) | 🧪 |
-| Interruption (barge-in) | 🧪, time to stop never measured |
-| Handoff to a human | 🧪 |
-| Deployed somewhere a stranger can use it | ❌ |
+| Browser speech → LLM → speech | ✅ October 2026, about 1.65 s from end of speech to first reply audio; not re-run on current code. |
+| Agent + translator (English agent, Russian caller) | ✅ October 2026, n=2, about 1.9 s; historical run. |
+| Agent settings, templates, transcripts and signed events | ✅ previously verified as recorded in Status. |
+| Tools and keyword knowledge search | 🧪 mocks only. |
+| Interruption and handoff | 🧪 mocks only; no human browser handoff. |
 
-## The next proofs, in order
+## Next proofs, in order
 
-Each one is done only when it has been run with real providers and the result is written into
-[Status](status.md) with a date and numbers.
+Record dated outcomes in [Status](status.md). MVP pieces remain in progress until each path has real evidence.
 
-1. **Re-run the browser agent call on today's `main`.** A lot changed since October (provider
-   registry, ElevenLabs, Google/Gemini, routing). Record p50 and p95 reply latency over at least
-   20 turns.
-2. **Tools and knowledge with real providers.** One agent with one HTTP tool and one knowledge
-   document answers questions that need both. Record whether the right tool was called and the
-   answer was correct.
-3. **Interruption, measured.** Time from the caller starting to speak to the agent's audio
-   stopping, p50 and p95.
-4. **Handoff to a human.** In the browser first (a person joins the room); phone transfer waits
-   for a SIP trunk.
-5. **A link a stranger can use.** Platform and Runtime deployed, one agent behind a public page,
-   10 calls in a row without a failure.
+1. **Public demo voice session:** start and end a student browser session with the intended demo agent; verify provider-backed calls and safe session cleanup.
+2. **Inha admissions knowledge:** load verified admissions facts into the agent, confirm inline small-KB behavior or keyword search for larger content, and evaluate the FAQ set.
+3. **Human handoff:** student requests an officer, staff see and accept the handoff in `/staff`, and both join the browser call.
+4. **Translated handoff:** verify English↔Korean speech in both directions through private listen rooms.
+5. **Chat alternative:** answer from the same agent knowledge and verify grounding.
+6. **Demo readiness:** run the acceptance targets below and record evidence; deploy the public demo only when its operating and privacy details are ready.
 
-## Not now
+## Acceptance targets (not yet measured)
 
-These exist in code or in plans, but they are not the goal and do not get work until the
-proofs above are done:
+Every value below is a **target, not yet measured**.
 
-- Two-person translated calls and cinematic dubbing ([Calls](calls.md), [Dubbing](dubbing.md)
-  describe the code that exists; keep it working, do not extend it).
-- Phone (SIP) calls and campaigns: blocked on a SIP account and number anyway.
-- Messenger channels, text chat, voice cloning, live self-cloning.
-- New languages (Kazakh, Uzbek, Kyrgyz) and mixed-language speech: no supported speech
-  provider is wired in.
+| Acceptance measure | Target | Status |
+| --- | --- | --- |
+| Consecutive AI calls | 10 without failure | Target, not yet measured |
+| Verified Inha admissions FAQ answers | ≥18/20 | Target, not yet measured |
+| Median voice reply latency | <3 s after end of speech | Target, not yet measured |
+| Devices connected to one handoff call | 2 | Target, not yet measured |
+| Translated exchanges | 5 each direction (English→Korean and Korean→English) | Target, not yet measured |
+| Clean session terminations | 10 | Target, not yet measured |
+| Real mobile browser | ≥1 successful run | Target, not yet measured |
+| Demo duration | 3 minutes | Target, not yet measured |
+
+## Deferred
+
+Telephone/SIP deployment, phone numbers, SIMs and outbound campaigns; embeddings RAG; billing and developer portal/dashboard; additional vertical-specific runtime logic. Existing SIP code paths are documented as technical reference, not part of the MVP path.

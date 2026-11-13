@@ -1,12 +1,18 @@
 # Translated calls by shareable link
 
+This existing interpreter capability supports the UNAI MVP’s English↔Korean student-to-officer handoff. The flow below documents the interpreter; the integrated handoff and staff console are in progress.
+
 Two people who speak different languages open a web page, one sends the other a link, and they talk
 through the existing Runtime (ElevenLabs STT/TTS, Google Cloud Translation with Gemini fallback, LiveKit).
-No app, no account. This is a test harness for the product, not a distribution channel.
+No app or account is required for this existing interpreter flow. The shareable-link call is a technical reference; the UNAI MVP uses the interpreter after an AI-to-staff handoff.
 
 Status: implemented and tested against a local Platform, LiveKit Cloud and a Chromium/Chrome browser
 (desktop and phone-sized windows). **Not yet verified:** a real spoken Korean-English call, a real phone,
 Safari/iOS, Android. Section 7 lists what to test by hand.
+
+## Human handoff into a translated call (MVP, in progress)
+
+A student starts an AI Admissions Assistant browser call from the Inha portal. When the student asks to connect to an admissions officer, the platform creates a handoff for staff in the browser `/staff` console. After a staff member accepts, the student and officer join a translated call using the existing `/calls` interpreter and private listen rooms: student English is translated to officer Korean, and officer Korean to student English. Either participant can end the call. The integrated handoff, staff console, and student journey are in progress (2026-11-12); the existing `/calls` reference does not itself implement this workflow.
 
 ## 1. What a person does
 
