@@ -240,11 +240,64 @@ def _gemini_llm(config: "PipelineConfig", settings: dict[str, Any]) -> Any:
                 "gemini llm needs a model: set the provider record's model or GEMINI_MODEL"
             )
         settings["model"] = model
-    return OpenAILLMService(
+    return _gemini_service_class()(
         api_key=config.gemini_api_key,
         base_url=gemini_base_url(),
         settings=OpenAILLMService.Settings(**settings),
     )
+
+
+def drop_nameless_function_calls(function_calls: list[Any]) -> list[Any]:
+    """Remove tool calls without a function name.
+
+    Gemini's OpenAI-compatible stream starts its first tool call with an ``index`` Pipecat does not
+    expect, so Pipecat's accumulator records an extra call with an empty name and id. Running it sends
+    a function response with an empty name back, Gemini answers 400, and the LLM service is marked
+    unusable (observed 2026-11-13 on ``transfer_to_human``: the session failed instead of handing off).
+    """
+
+    return [call for call in function_calls if getattr(call, "function_name", "")]
+
+
+# Google's documented placeholder for function calls whose signature the client did not keep
+# (https://ai.google.dev/gemini-api/docs/thought-signatures). Pipecat's OpenAI-compatible service drops
+# the real ``extra_content.google.thought_signature``, and Gemini 3 then rejects the follow-up request
+# after any tool call with 400 "Function call is missing a thought_signature" (observed 2026-11-13).
+GEMINI_PLACEHOLDER_THOUGHT_SIGNATURE = "skip_thought_signature_validator"
+
+
+def add_gemini_thought_signatures(messages: list[Any]) -> list[Any]:
+    """Return ``messages`` with a placeholder signature on every replayed assistant tool call lacking one."""
+
+    out: list[Any] = []
+    for message in messages:
+        if isinstance(message, dict) and message.get("role") == "assistant" and message.get("tool_calls"):
+            calls = []
+            for call in message["tool_calls"]:
+                if isinstance(call, dict) and not (call.get("extra_content") or {}).get("google", {}).get("thought_signature"):
+                    call = {**call, "extra_content": {"google": {"thought_signature": GEMINI_PLACEHOLDER_THOUGHT_SIGNATURE}}}
+                calls.append(call)
+            message = {**message, "tool_calls": calls}
+        out.append(message)
+    return out
+
+
+def _gemini_service_class() -> type:
+    from pipecat.services.openai.llm import OpenAILLMService
+
+    class GeminiOpenAILLMService(OpenAILLMService):
+        async def run_function_calls(self, function_calls):  # type: ignore[override]
+            calls = drop_nameless_function_calls(list(function_calls))
+            if calls:
+                await super().run_function_calls(calls)
+
+        def build_chat_completion_params(self, params_from_context):  # type: ignore[override]
+            params = super().build_chat_completion_params(params_from_context)
+            if isinstance(params.get("messages"), list):
+                params["messages"] = add_gemini_thought_signatures(params["messages"])
+            return params
+
+    return GeminiOpenAILLMService
 
 
 def translation_endpoint(config: "PipelineConfig") -> tuple[str, str | None]:
