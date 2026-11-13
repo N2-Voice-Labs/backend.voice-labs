@@ -1,0 +1,88 @@
+# LiveKit Cloud by default. Copy .env.example to .env and fill required values.
+name: unai-mvp
+x-livekit-env: &livekit-env
+  LIVEKIT_URL: ${LIVEKIT_URL:?Set the LiveKit Cloud wss URL}
+  LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:?Set LiveKit API key}
+  LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:?Set LiveKit API secret}
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-voice_labs}
+      POSTGRES_USER: ${POSTGRES_USER:-voice_labs}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set Postgres password}
+    volumes: [postgres-data:/var/lib/postgresql/data]
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+  platform:
+    build: {context: ., dockerfile: platform/Dockerfile}
+    environment:
+      <<: *livekit-env
+      PORT: "8000"
+      PLATFORM_MIGRATE_ON_START: "1"
+      FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-127.0.0.1}
+      RUNTIME_API_URL: ${RUNTIME_API_URL:-http://runtime:8001}
+      PLATFORM_DATABASE_URL: ${PLATFORM_DATABASE_URL:?Set PLATFORM_DATABASE_URL}
+      PLATFORM_RUNTIME_TOKEN: ${PLATFORM_RUNTIME_TOKEN:?Set PLATFORM_RUNTIME_TOKEN}
+      PLATFORM_API_KEYS: ${PLATFORM_API_KEYS:?Set PLATFORM_API_KEYS}
+      PLATFORM_WEB_ORIGIN: ${PLATFORM_WEB_ORIGIN:-https://unai-inha-demo.workers.dev,https://unai-site.workers.dev}
+      PLATFORM_TRUST_PROXY: ${PLATFORM_TRUST_PROXY:-1}
+      PLATFORM_PUBLIC_CALLS: ${PLATFORM_PUBLIC_CALLS:-1}
+      PLATFORM_CALLS_PROVIDERS: ${PLATFORM_CALLS_PROVIDERS:-stt=elevenlabs,llm=google-translate,tts=elevenlabs}
+      PLATFORM_DEMO_AGENTS: ${PLATFORM_DEMO_AGENTS:-}
+      PLATFORM_DEMO_MAX_SECONDS: ${PLATFORM_DEMO_MAX_SECONDS:-300}
+      PLATFORM_STAFF_KEY: ${PLATFORM_STAFF_KEY:?Set PLATFORM_STAFF_KEY}
+      PLATFORM_HANDOFF_STAFF_LANGUAGE: ${PLATFORM_HANDOFF_STAFF_LANGUAGE:-ko}
+      PLATFORM_INLINE_KNOWLEDGE_MAX_CHARS: ${PLATFORM_INLINE_KNOWLEDGE_MAX_CHARS:-60000}
+      PLATFORM_CHAT_LLM_MODEL: ${PLATFORM_CHAT_LLM_MODEL:-gemini-3.5-flash-lite}
+      PLATFORM_MAX_ACTIVE_SESSIONS_PER_ORG: ${PLATFORM_MAX_ACTIVE_SESSIONS_PER_ORG:-3}
+      PLATFORM_SESSION_CREATE_RATE: ${PLATFORM_SESSION_CREATE_RATE:-10}
+      PLATFORM_CHAT_PER_IP_MINUTE: ${PLATFORM_CHAT_PER_IP_MINUTE:-20}
+      PLATFORM_CALLS_PER_IP_HOUR: ${PLATFORM_CALLS_PER_IP_HOUR:-10}
+      PLATFORM_CALL_OPEN_PER_IP_MINUTE: ${PLATFORM_CALL_OPEN_PER_IP_MINUTE:-30}
+      PLATFORM_CALL_INVITE_TTL_SECS: ${PLATFORM_CALL_INVITE_TTL_SECS:-1800}
+      PLATFORM_REAPER_INTERVAL_SECS: ${PLATFORM_REAPER_INTERVAL_SECS:-30}
+      PLATFORM_STALE_SESSION_SECS: ${PLATFORM_STALE_SESSION_SECS:-900}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      PLATFORM_CHAT_LLM_API_KEY: ${PLATFORM_CHAT_LLM_API_KEY:-}
+      PLATFORM_CHAT_LLM_BASE_URL: ${PLATFORM_CHAT_LLM_BASE_URL:-https://generativelanguage.googleapis.com/v1beta/openai}
+    ports: ["127.0.0.1:8000:8000"]
+    depends_on:
+      postgres: {condition: service_healthy}
+      runtime: {condition: service_healthy}
+    restart: unless-stopped
+  runtime:
+    build: {context: ., dockerfile: runtime/Dockerfile}
+    environment:
+      <<: *livekit-env
+      PORT: "8001"
+      RUNTIME_PLATFORM_URL: ${RUNTIME_PLATFORM_URL:-http://platform:8000}
+      RUNTIME_PLATFORM_TOKEN: ${RUNTIME_PLATFORM_TOKEN:?Set RUNTIME_PLATFORM_TOKEN}
+      ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY:-}
+      ELEVENLABS_VOICE_ID: ${ELEVENLABS_VOICE_ID:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GOOGLE_TRANSLATE_API_KEY: ${GOOGLE_TRANSLATE_API_KEY:-}
+      RUNTIME_MAX_SESSIONS: ${RUNTIME_MAX_SESSIONS:-4}
+      RUNTIME_MAX_SESSION_SECS: ${RUNTIME_MAX_SESSION_SECS:-600}
+      RUNTIME_IDLE_PROMPT_SECS: ${RUNTIME_IDLE_PROMPT_SECS:-30}
+      RUNTIME_IDLE_END_SECS: ${RUNTIME_IDLE_END_SECS:-60}
+      GEMINI_MODEL: ${GEMINI_MODEL:-}
+      GEMINI_TRANSLATION_MODEL: ${GEMINI_TRANSLATION_MODEL:-}
+    # No host port: Platform reaches Runtime over the private Compose network.
+    stop_grace_period: 35s
+    restart: unless-stopped
+  livekit:
+    profiles: [local-livekit]
+    image: livekit/livekit-server:v1.9.0
+    command: ["--config", "/etc/livekit.yaml"]
+    environment:
+      LIVEKIT_KEYS: "${LIVEKIT_API_KEY}: ${LIVEKIT_API_SECRET}"
+    volumes: ["./docker/livekit.yaml:/etc/livekit.yaml:ro"]
+    ports: ["7880:7880", "7881:7881", "7882:7882/udp"]
+    restart: unless-stopped
+volumes:
+  postgres-data:
