@@ -145,7 +145,10 @@ Extra credit budget: **121k credits** (10k approved for MVP verification). Recor
 | 2026-11-13 | track audio, 3 tuition re-checks, phone-viewport calls | 1,449 | 1,680 | 231 | |
 | 2026-11-13 | manual tests by the lead (one laptop, then phone + laptop), HTTPS tunnel check | 1,680 | 2,459 | 779 | includes the 30 s feedback loop |
 | 2026-11-13 | mixed-language EN/RU handoff call (auto detection) + its tracks | 2,459 | 2,587 | 128 | track TTS mostly counted in the previous row |
-| | **total** | | | **2,587** | of 10k approved |
+| 2026-11-14 | voice comparison: 7 call lines × 6 models × 3 stock voices | 2,890 | 4,517 | 1,627 | see [Costs and voice options](costs-and-voice-options.md) |
+| 2026-11-14 | (not a test run) manual voice cloning and a conversation with ElevenLabs' own assistant | 4,517 | 13,419 | 8,902 | spent outside UNAI, recorded so the balance adds up |
+| 2026-11-14 | the team clone "Bekali" on the same 7 lines × 4 models | 13,419 | ~14,400 | ~1,000 | counter lagging when written |
+| | **total** | | | **~14,400** | of 121k |
 
 ## Run history
 

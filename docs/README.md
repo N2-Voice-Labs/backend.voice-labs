@@ -12,6 +12,7 @@ old plans, studies and superseded copies were deleted (they are in git history).
 | [Goal](goal.md) | UNAI product goal, Inha MVP journey and next proofs |
 | [Status](status.md) | What works, at three evidence levels: implemented, mock-tested, real-provider-verified |
 | [Contracts](contracts.md) | API and event contracts: authentication, sessions, translations, providers, events |
+| [Costs and voice options](costs-and-voice-options.md) | For the business plan: measured unit costs and speed, voice quality tests, speech-to-speech market check |
 | [Smoke test](smoke-test.md) | Billable real-provider checklist and how to record results |
 | [Calls](calls.md) | Reference: translated calls by shareable link |
 | [Dubbing](dubbing.md) | Reference: the cinematic dubbing prototype, off by default |
