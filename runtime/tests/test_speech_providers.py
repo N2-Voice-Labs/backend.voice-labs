@@ -612,6 +612,7 @@ def test_elevenlabs_stt_maps_multi_to_auto_detection_and_passes_keyterms(monkeyp
     )
 
     service = build_stt(config, "multi", ["Voice Labs"])
+    assert service.kwargs["include_language_detection"] is True
 
     assert service.kwargs["settings"] == {
         "model": "custom-model",
@@ -700,3 +701,48 @@ def test_gemini_without_a_model_fails_at_session_start_for_translation(monkeypat
         PipelineConfig.from_environment({"providers": _ELEVEN_STACK, **interpreter})
     monkeypatch.setenv("GEMINI_TRANSLATION_MODEL", "env-model")
     assert PipelineConfig.from_environment({"providers": _ELEVEN_STACK, **interpreter}).providers == _ELEVEN_STACK
+
+
+def test_gemini_nameless_tool_calls_are_dropped_before_they_run() -> None:
+    """Gemini's stream yields a phantom call with no name next to the real one; running it 400s the LLM."""
+    import asyncio
+    from types import SimpleNamespace
+
+    real = SimpleNamespace(function_name="transfer_to_human", tool_call_id="call_1", arguments={"reason": "asked"})
+    phantom = SimpleNamespace(function_name="", tool_call_id="", arguments={})
+    assert speech_providers.drop_nameless_function_calls([phantom, real]) == [real]
+
+    cls = speech_providers._gemini_service_class()
+    ran: list[list] = []
+
+    async def fake_super_run(self, calls):
+        ran.append(list(calls))
+
+    parent = cls.__mro__[1]
+    original = parent.run_function_calls
+    parent.run_function_calls = fake_super_run
+    try:
+        service = object.__new__(cls)
+        asyncio.run(service.run_function_calls([phantom, real]))
+        asyncio.run(service.run_function_calls([phantom]))
+    finally:
+        parent.run_function_calls = original
+    assert ran == [[real]]
+
+
+def test_gemini_replayed_tool_calls_get_a_placeholder_thought_signature() -> None:
+    messages = [
+        {"role": "user", "content": "Can I talk to a person?"},
+        {"role": "assistant", "tool_calls": [
+            {"id": "call_1", "type": "function", "function": {"name": "transfer_to_human", "arguments": "{}"}},
+            {"id": "call_2", "type": "function", "function": {"name": "x", "arguments": "{}"},
+             "extra_content": {"google": {"thought_signature": "real"}}},
+        ]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+    ]
+    out = speech_providers.add_gemini_thought_signatures(messages)
+    calls = out[1]["tool_calls"]
+    assert calls[0]["extra_content"] == {"google": {"thought_signature": "skip_thought_signature_validator"}}
+    assert calls[1]["extra_content"]["google"]["thought_signature"] == "real"
+    assert out[0] == messages[0] and out[2] == messages[2]
+    assert "extra_content" not in messages[1]["tool_calls"][0]  # the context itself is not mutated

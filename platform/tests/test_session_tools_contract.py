@@ -48,6 +48,29 @@ def test_contract_without_tools_or_knowledge_has_stable_empty_keys() -> None:
     assert contract["knowledge_enabled"] is False
 
 
+def test_small_knowledge_is_inlined_in_system_prompt(monkeypatch) -> None:
+    monkeypatch.setenv("PLATFORM_INLINE_KNOWLEDGE_MAX_CHARS", "1000")
+    with TestClient(app) as client:
+        agent = client.post("/agents", json={"name": "Inline", "system_prompt": "Be helpful."}).json()
+        doc = client.post("/knowledge/documents", json={"title": "Facts", "content": "Applications open in March."}).json()
+        client.put(f"/agents/{agent['id']}/knowledge", json={"document_ids": [doc["id"]]})
+        contract = start_session(client, agent["id"])
+    assert contract["knowledge_enabled"] is False
+    assert "Be helpful.\n\n## Knowledge base" in contract["system_prompt"]
+    assert "### Facts\nApplications open in March." in contract["system_prompt"]
+
+
+def test_inline_knowledge_threshold_zero_uses_search(monkeypatch) -> None:
+    monkeypatch.setenv("PLATFORM_INLINE_KNOWLEDGE_MAX_CHARS", "0")
+    with TestClient(app) as client:
+        agent = client.post("/agents", json={"name": "Search fallback"}).json()
+        doc = client.post("/knowledge/documents", json={"title": "Facts", "content": "Verified."}).json()
+        client.put(f"/agents/{agent['id']}/knowledge", json={"document_ids": [doc["id"]]})
+        contract = start_session(client, agent["id"])
+    assert contract["knowledge_enabled"] is True
+    assert "## Knowledge base" not in contract["system_prompt"]
+
+
 def test_contract_carries_assigned_enabled_tools_and_knowledge() -> None:
     with TestClient(app) as client:
         agent = client.post("/agents", json={"name": "Equipped"}).json()
@@ -73,7 +96,8 @@ def test_contract_carries_assigned_enabled_tools_and_knowledge() -> None:
 
         contract = start_session(client, agent["id"])
 
-        assert contract["knowledge_enabled"] is True
+        assert contract["knowledge_enabled"] is False
+        assert "### FAQ\nOpen 9 to 5." in contract["system_prompt"]
         assert contract["tools"] == sorted(
             [
                 {

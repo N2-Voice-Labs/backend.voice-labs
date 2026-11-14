@@ -19,7 +19,9 @@ from . import (
     campaigns,
     conversations,
     debug,
+    demo,
     deployments,
+    handoffs,
     knowledge,
     organizations,
     reaper,
@@ -72,6 +74,7 @@ app.add_middleware(
         "authorization",
         "x-organization-id",
         "x-request-id",
+        "x-staff-key",
     ],
     expose_headers=["x-request-id"],
     # Opt-in for a hosted web origin calling a Platform on the viewer's localhost.
@@ -121,6 +124,8 @@ for router in (
     sessions.router,
     translations.router,
     calls.router,
+    demo.router,
+    handoffs.router,
     conversations.router,
     runtime_ingest.router,
 ):

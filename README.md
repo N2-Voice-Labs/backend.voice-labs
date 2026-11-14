@@ -1,8 +1,10 @@
-# Voice Labs Backend
+# UNAI Backend
 
-Local consolidation of the Voice Labs control plane, realtime runtime, and evaluation
-package. The original sibling repositories remain untouched; this directory is a
-separate staging repository and is not connected to any remote.
+> **UNAI** (formerly Voice Labs) is a B2B AI communication platform: AI voice agents (primary), real-time translation, AI chatbots and developer APIs. First market: university admissions offices. First MVP: the AI Admissions Assistant for international students at Inha University. Calls run in the browser over WebRTC (LiveKit); telephone/SIP calling is deferred.
+
+The UNAI (formerly Voice Labs) control plane, realtime runtime, and evaluation package in one uv
+workspace (GitHub: `N2-Voice-Labs/backend.voice-labs`). Sibling repositories:
+`stack.voice-labs` (Compose, docs site, acceptance tests) and `frontend` (Next.js web app).
 
 ## Projects
 

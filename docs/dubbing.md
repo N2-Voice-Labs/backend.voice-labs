@@ -5,8 +5,9 @@ person's real voice, quiet and delayed a little, ducked further while the transl
 real human stays present under the translator. Whether this makes calls feel more trustworthy is a
 product hypothesis that still needs listeners; nothing here proves it.
 
-Status: working prototype, tested offline and through LiveKit with tones; **not yet heard by people**.
-Design background and rejected options: [dubbing-feasibility.md](dubbing-feasibility.md).
+Status: working prototype, off by default, **not on the roadmap** (see [Goal](goal.md)); tested offline and through
+LiveKit with tones; **not yet heard by people**. The feasibility study and listening-study protocol were deleted on
+2026-11-11 and are in git history.
 
 ## Using it
 
@@ -131,8 +132,8 @@ study itself.
 ## Listening demos and evaluation plan
 
 Rendered comparisons of AI-only, the live prototype and two exploratory replay variants, their
-measured properties, a telephone-codec check and the listening-study protocol are in
-`docs/dubbing-listening.md` (audio in `runtime/bench/dubbing/listening/`).
+measured properties, a telephone-codec check and the listening-study protocol were in
+`docs/dubbing-listening.md` (deleted 2026-11-11, in git history; audio in `runtime/bench/dubbing/listening/`).
 
 **`cinematic` profile.** The `balanced` profile with the original 24 dB down (instead of 20) while the translation speaks. It is what the
 "Audio" switch of the shareable-link calls ([calls](calls.md)) selects, as a starting point for testing, not a result of listening tests.

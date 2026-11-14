@@ -1,0 +1,22 @@
+.git
+.venv
+**/.venv
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+.ruff_cache
+.claude
+**/.env
+**/.env.*
+!**/.env.example
+!**/.env.public.example
+**/*.db
+evals/results
+evals/audio
+**/*.egg-info
+
+# Deployment images need application source, never private recordings or agent packs.
+agents
+**/recordings
+**/*.wav
+!runtime/src/runtime/assets/apology/*.wav

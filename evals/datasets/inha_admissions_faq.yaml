@@ -1,0 +1,196 @@
+- id: inha_faq_01
+  question: When can I apply for Spring 2027 undergraduate admission, and when are documents due?
+  expected_answer: 'Spring 2027 (March intake): online 2026. 09. 30 (Wed) 10:00 ~ 2026. 11. 05 (Thurs)
+    17:00; documents through 2026. 11. 12 (Thurs) 17:00, KST. Official guidelines on apply.inha.ac.kr
+    are authoritative.'
+  must_include:
+  - Spring 2027
+  - 2026. 11. 05
+  - 2026. 11. 12
+  - '17:00'
+  source_file: 02-undergraduate-schedule.md
+- id: inha_faq_02
+  question: What are the Fall 2027 undergraduate application and document deadlines?
+  expected_answer: 'Fall 2027 (September intake): online 2027. 04. 14 (Wed) 10:00 ~ 2027. 05. 11 (Tue)
+    17:00; documents through 2027. 05. 26 (Wed) 17:00, KST. Official guidelines on apply.inha.ac.kr are
+    authoritative.'
+  must_include:
+  - Fall 2027
+  - 2027. 05. 11
+  - 2027. 05. 26
+  - '17:00'
+  source_file: 02-undergraduate-schedule.md
+- id: inha_faq_03
+  question: When are Spring 2027 undergraduate results and tuition payment?
+  expected_answer: 'Results: 2026. 12. 22 (Tue) 14:00; tuition payment: 2026. 12. 23 (Wed) 09:00 ~ 2027.
+    01. 12 (Tue) 16:00. Official guidelines on apply.inha.ac.kr are authoritative.'
+  must_include:
+  - 2026. 12. 22
+  - '14:00'
+  - 2026. 12. 23
+  - 2027. 01. 12
+  - '16:00'
+  source_file: 02-undergraduate-schedule.md
+- id: inha_faq_04
+  question: When are Fall 2027 undergraduate results and tuition payment?
+  expected_answer: 'Results: 2027. 06. 29 (Tue) 14:00; payment: 2027. 06. 30 (Wed) 09:00 ~ 2027. 07. 13
+    (Tue) 16:00. Official guidelines on apply.inha.ac.kr are authoritative.'
+  must_include:
+  - 2027. 06. 29
+  - 2027. 06. 30
+  - 2027. 07. 13
+  - '16:00'
+  source_file: 02-undergraduate-schedule.md
+- id: inha_faq_05
+  question: What TOPIK level do I need as a freshman for the regular Korean track?
+  expected_answer: TOPIK or TOPIK IBT Level 3 or higher; alternatives include Korean university language
+    program Level 4 or higher or King Sejong institute intermediate-4A completion or higher.
+  must_include:
+  - Level 3
+  - Level 4
+  - intermediate-4A
+  source_file: 04-language-requirements.md
+- id: inha_faq_06
+  question: Which freshman programs are taught entirely in English?
+  expected_answer: IBT(International Business & Trade) and ISE(Integrated System Engineering) are English
+    Track with English Lectures 100%.
+  must_include:
+  - IBT
+  - ISE
+  - 100%
+  source_file: 07-majors.md
+- id: inha_faq_07
+  question: What English score do I need, and is TOEFL Home Edition accepted?
+  expected_answer: IELTS 5.5 or above, TOEFL iBT 71 or TOEFL iBT 4 for tests after January 21,2026; TOEFL
+    iBT Home Edition is not accepted.
+  must_include:
+  - '5.5'
+  - '71'
+  - '4'
+  - Home Edition
+  - not accepted
+  source_file: 04-language-requirements.md
+- id: inha_faq_08
+  question: How much is undergraduate tuition by college?
+  expected_answer: '2026 per-semester reference: Engineering ₩5,462,000; Natural Science ₩5,076,000; Consumal/Child/Nursing
+    ₩4,665,000; Liberal Arts & Social Sciences ₩4,253,000. Fees can change; official guidelines on apply.inha.ac.kr
+    are authoritative.'
+  must_include:
+  - '2026'
+  - 5,462,000
+  - 5,076,000
+  - 4,665,000
+  - 4,253,000
+  source_file: 08-tuition.md
+- id: inha_faq_09
+  question: How much is the undergraduate application fee, and is there an interview?
+  expected_answer: 'Application Fee: KRW 150,000; selection is Document evaluation 100%. Official guidelines
+    on apply.inha.ac.kr are authoritative.'
+  must_include:
+  - 150,000
+  - 100%
+  source_file: 06-application-procedure-and-fees.md
+- id: inha_faq_10
+  question: What freshman scholarship can I get with TOPIK Level 4?
+  expected_answer: TOPIK LEVEL 4 gives 1 semester 30% tuition fee, for both Korean and English tracks,
+    subject to scholarship determination after documents are submitted.
+  must_include:
+  - 30%
+  - 1 semester
+  source_file: 09-scholarships.md
+- id: inha_faq_11
+  question: For graduate admission, what does Jeongseok B TYPE cover and what scores qualify?
+  expected_answer: 'B TYPE covers 70% of Admission and Tuition Fees: TOPIK Level 5~6 or Korean university
+    language center Level 6, or TOEFL iBT 5 (or 92), TOEIC 820, or IELTS 7.'
+  must_include:
+  - 70%
+  - 5~6
+  - '92'
+  - '820'
+  - '7'
+  source_file: 09-scholarships.md
+- id: inha_faq_12
+  question: Is a dorm room guaranteed for international freshmen?
+  expected_answer: 100% placement is guaranteed for international freshmen applying within the designated
+    period for the first semester; later placement depends on admission results and dormitory criteria.
+  must_include:
+  - 100%
+  - first semester
+  source_file: 10-dormitory-and-visa.md
+- id: inha_faq_13
+  question: How do I contact undergraduate and graduate admissions?
+  expected_answer: 'Telephone: 032-860-8609; undergraduate: apply@inha.ac.kr; graduate: gradapply@inha.ac.kr.'
+  must_include:
+  - 032-860-8609
+  - apply@inha.ac.kr
+  - gradapply@inha.ac.kr
+  source_file: 01-overview-and-contacts.md
+- id: inha_faq_14
+  question: What is the general graduate school application timeline for each intake?
+  expected_answer: 'Spring March intake: Mid-October – Mid-November; Fall September intake: Mid-April
+    – Mid-May, approximately four weeks each, subject to change. No additional application rounds are
+    offered.'
+  must_include:
+  - Mid-October
+  - Mid-November
+  - Mid-April
+  - Mid-May
+  source_file: 11-graduate-admission.md
+- id: inha_faq_15
+  question: Can I transfer into second year after one year at a foreign four-year university?
+  expected_answer: At an equivalent foreign regular university, at least 1 academic year (2 semesters,
+    excluding summer/winter sessions) and 32 or more credits are required, along with other admission
+    requirements.
+  must_include:
+  - 2 semesters
+  - '32'
+  source_file: 03-eligibility.md
+- id: inha_faq_16
+  question: As a non-Chinese freshman with foreign school documents, do I need an apostille?
+  expected_answer: Apostille-country documents require Apostille; non-Apostille countries require Korean
+    Embassy/Consulate consular confirmation. Original confirmations must be submitted.
+  must_include:
+  - Apostille
+  - consular
+  - Original
+  source_file: 05-required-documents.md
+- id: inha_faq_17
+  question: What documents do freshmen need, and how do I submit them?
+  expected_answer: 'Freshmen need the application, overseas schools information and academic check forms
+    where applicable, language evidence, diploma and transcripts, family/nationality evidence, and applicant/parent
+    passport copies. Submit by post or in person to Global Talent Recruitment Team, Room 502, 5th floor,
+    Kimhyuntae Inha Dream Center, 100 inha-ro, Michuhol-gu, Incheon, Postal code: 22212.'
+  must_include:
+  - transcripts
+  - passport
+  - '502'
+  - '22212'
+  source_file: 05-required-documents.md
+- id: inha_faq_18
+  question: If I cancel graduate enrollment before the semester starts, is tuition refunded?
+  expected_answer: Submit the Application for Enrollment Cancellation and Tuition Refund and supporting
+    documents before the first day of the semester for a full refund of admission fee and tuition fee.
+    Official guidelines on apply.inha.ac.kr are authoritative.
+  must_include:
+  - before the first day
+  - admission fee
+  - tuition fee
+  source_file: 12-after-admission-and-refunds.md
+- id: inha_faq_19
+  question: Will Inha guarantee me a software engineering job after graduation?
+  expected_answer: The supplied sources do not say; say you do not know and offer an admissions officer,
+    calling transfer_to_human.
+  must_include:
+  - admissions officer
+  - transfer_to_human
+  source_file: 01-overview-and-contacts.md
+  answerable: false
+- id: inha_faq_20
+  question: What is the exact Fall 2027 dormitory move-in date?
+  expected_answer: The supplied sources do not give the exact move-in date; say you do not know and offer
+    an admissions officer, calling transfer_to_human.
+  must_include:
+  - admissions officer
+  - transfer_to_human
+  source_file: 10-dormitory-and-visa.md
+  answerable: false

@@ -51,6 +51,12 @@ MISSING = "00000000-0000-4000-8000-0000000000ee"
 # (tests/test_calls.py covers them, including that an organisation never sees another's call).
 PUBLIC = {("GET", "/health")} | set(auth.PUBLIC_CALL_ROUTES)
 
+# Demos/handoffs use the fixed calls organisation, ignoring X-Organization-Id.
+# Their public/session/staff credential and cross-org checks are in test_demo_handoffs.py.
+FIXED_ORG_ROUTES = set(
+    auth.PUBLIC_DEMO_ROUTES | auth.PUBLIC_HANDOFF_ROUTES | auth.STAFF_HANDOFF_ROUTES
+)
+
 # Routes with no tenant data. Each is justified; org-management routes are additionally
 # asserted superadmin-only in test_superadmin_only_routes.
 GLOBAL = {
@@ -72,6 +78,7 @@ GLOBAL = {
 # (method, path) covered by *this* file.
 PARAM_CASES = [
     # agents
+    ("POST", "/agents/{agent_id}/knowledge/reindex"),
     ("GET", "/agents/{agent_id}"),
     ("PATCH", "/agents/{agent_id}"),
     ("DELETE", "/agents/{agent_id}"),
@@ -217,7 +224,7 @@ def path_params(path: str) -> list[str]:
 
 def test_every_api_route_is_covered():
     routes = api_routes()
-    covered = ROUTE_CASES | MODULE_CASES | PUBLIC | GLOBAL
+    covered = ROUTE_CASES | MODULE_CASES | PUBLIC | GLOBAL | FIXED_ORG_ROUTES
     missing = sorted(routes - covered)
     assert not missing, (
         "Routes with no cross-org isolation coverage. Add them to ROUTE_CASES (and a test), "
@@ -228,7 +235,7 @@ def test_every_api_route_is_covered():
 
 def test_coverage_lists_name_real_routes():
     routes = api_routes()
-    stale = sorted((ROUTE_CASES | MODULE_CASES | PUBLIC | GLOBAL) - routes - OPTIONAL_ROUTES)
+    stale = sorted((ROUTE_CASES | MODULE_CASES | PUBLIC | GLOBAL | FIXED_ORG_ROUTES) - routes - OPTIONAL_ROUTES)
     assert not stale, f"cases for routes that no longer exist: {stale}"
 
 
@@ -260,6 +267,7 @@ def test_tenant_id_routes_are_driven_by_the_id_matrix():
         for route in api_routes()
         if any(name not in TENANT_PARAMS for name in path_params(route[1]))
         and route not in GLOBAL
+        and route not in FIXED_ORG_ROUTES
         and route not in RUNTIME_CASES
         and route not in BODY_CASES
     )
@@ -271,7 +279,7 @@ def test_collection_routes_are_driven_by_the_collection_matrix():
         (method, path)
         for method, path in api_routes()
         if method == "GET" and not path_params(path)
-    } - PUBLIC - GLOBAL
+    } - PUBLIC - GLOBAL - FIXED_ORG_ROUTES
     assert collections <= set(COLLECTION_CASES), sorted(collections - set(COLLECTION_CASES))
 
 

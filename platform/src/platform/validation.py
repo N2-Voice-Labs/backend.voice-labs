@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Any
 
 SECRET_KEY_PARTS = ("secret", "password", "token", "api_key", "apikey")
+# Token *counts* are model settings, not credentials (``max_tokens`` is in the Runtime LLM allowlist).
+NON_SECRET_KEYS = frozenset({"max_tokens", "max_output_tokens", "max_completion_tokens"})
 SECRET_CONFIGURATION_MESSAGE = (
     "provider secrets must use secret_reference, not configuration"
 )
@@ -53,7 +55,10 @@ def contains_secret_key(value: Any) -> bool:
     """Return True if any (nested) dict key looks like a secret name."""
     if isinstance(value, dict):
         return any(
-            any(part in str(key).casefold() for part in SECRET_KEY_PARTS)
+            (
+                str(key).casefold() not in NON_SECRET_KEYS
+                and any(part in str(key).casefold() for part in SECRET_KEY_PARTS)
+            )
             or contains_secret_key(nested)
             for key, nested in value.items()
         )

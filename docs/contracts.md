@@ -1,5 +1,7 @@
 # Contracts
 
+> **UNAI** (formerly Voice Labs) is a B2B AI communication platform: AI voice agents (primary), real-time translation, AI chatbots and developer APIs. First market: university admissions offices. First MVP: the AI Admissions Assistant for international students at Inha University. Calls run in the browser over WebRTC (LiveKit); telephone/SIP calling is deferred.
+
 Runtime events carry `event_id`, `event_type`, `schema_version`, session/conversation/
 agent IDs, timestamp, optional trace ID, and payload. Platform authenticates Runtime
 requests and ingests events idempotently by event ID.
@@ -7,6 +9,22 @@ requests and ingests events idempotently by event ID.
 Platform-to-Runtime session handoff includes the selected agent/conversation/session
 context and LiveKit room details. Runtime must join the requested room and report
 lifecycle changes; the durable record remains owned by Platform.
+
+## MVP endpoints (implemented 2026-11-12; tested with stubs, not yet with real voice providers)
+
+All are generic: the university lives only in agent data. They run in the calls organisation (`PLATFORM_CALLS_ORG_ID`, default org) like `/calls`.
+
+| Route | Auth | Body → reply |
+| --- | --- | --- |
+| `GET /demo/agents/{key}` | public, rate limited; 404 `demo_disabled` unless `PLATFORM_DEMO_AGENTS` is set | → `{key, name, description, enabled_languages}` |
+| `POST /demo/agents/{key}/sessions` | public, rate limited | `{name?}` → same as `POST /voice/sessions` (incl. `session_token`). Reaped after `PLATFORM_DEMO_MAX_SECONDS` (300). |
+| `POST /demo/agents/{key}/chat` | public, per-IP limit (`PLATFORM_CHAT_PER_IP_MINUTE`) | `{message, conversation_id?}` → `{conversation_id, reply, handoff_suggested}`. 30 user messages per conversation (429 `chat_limit`), 60-minute window; 503 `chat_unavailable` without a key, 502 `chat_failed` upstream. LLM: `PLATFORM_CHAT_LLM_MODEL` (default `gemini-3.5-flash-lite`), key `PLATFORM_CHAT_LLM_API_KEY` or `GEMINI_API_KEY`. |
+| `POST /handoffs` | `Authorization: Bearer vls_…` of the AI session | `{session_id, language="en", staff_language=PLATFORM_HANDOFF_STAFF_LANGUAGE or "ko", name?, reason?}` → ends the AI session, opens a translated call + invite, returns the `POST /calls` reply plus `handoff_id`. One handoff per AI session (409 `handoff_exists`). Requires `PLATFORM_PUBLIC_CALLS=1` for the staff join. |
+| `GET /staff/handoffs` | `X-Staff-Key` = `PLATFORM_STAFF_KEY` (404 when unset, 401 when wrong) | → waiting + accepted handoffs, newest first; never the invite code |
+| `POST /staff/handoffs/{id}/accept` | staff key | → `{invite_code, call_session_id}`; the officer then uses `POST /calls/invites/{code}/join` (the portal opens `/join#c=<code>`). 409 `handoff_not_waiting`. |
+| `GET /staff/handoffs/{id}/transcript` | staff key | → the AI conversation's messages |
+
+Knowledge: when an agent's linked documents total ≤ `PLATFORM_INLINE_KNOWLEDGE_MAX_CHARS` (default 60000; 0 disables), the Platform appends them to the session's `system_prompt` and sends `knowledge_enabled: false` (no `search_knowledge` tool). Larger sets keep the search tool.
 
 ## Authentication
 
@@ -71,8 +89,7 @@ even while authentication is disabled but are not required.
 preview, PSTN dialing, SIP transfer ...") describes Milestone 8 only. Preview, provisioning,
 dialing and transfer exist now and are described further down.
 
-Backend-only contracts for the **Voice → Agent → Deployment → Call** model (see
-[Backend Milestone 8](../../stack.voice-labs/docs/BACKEND_STUDIO_PLAN.md)). Platform stores durable metadata only: no
+Backend-only contracts for the **Voice → Agent → Deployment → Call** model. Platform stores durable metadata only: no
 audio, no raw voice samples, no provider provisioning, TTS preview, PSTN dialing, SIP
 transfer, embeddings, or LLM summaries. Error bodies are `{"detail": "<code>"}`; request
 shape/format failures (for example a non-E.164 phone number or a secret-looking
@@ -553,7 +570,7 @@ Validation and errors:
 - `409 voice_provider_mismatch`: the voice's TTS provider record names a different provider than the session's TTS provider (checked only when both are known; see [Translation sessions](#choosing-the-tts-provider)).
 - Runtime-side `422 invalid_participant_voice`: the provider voice id is not `^[A-Za-z0-9_-]{1,128}$`.
 
-**Status:** Verified 2026-10-18 with Korean ↔ English (0.8–1.4 s end-to-speech) on Cartesia. Fixed Pipecat shared-resampler crosstalk. *Note 2026-11-05:* per-listener routing (RM-001/002: a private listen room per person, `connection.listen`, track `translation-for-<identity>`, and one TTS per listener) landed after this check, so the line "everyone hears all audio" no longer describes the code. [Status](status.md) records the routing as verified with real providers, but this page holds no date or measurement for it; `smoke-test.md` re-checks it.
+**Status:** Verified 2026-10-18 with Korean ↔ English (0.8–1.4 s end-to-speech) on Cartesia. Fixed Pipecat shared-resampler crosstalk. *Note 2026-11-05:* per-listener routing (RM-001/002: a private listen room per person, `connection.listen`, track `translation-for-<identity>`, and one TTS per listener) landed after this check, so the line "everyone hears all audio" no longer describes the code. The rebuilt routing is mock-tested only (see [Status](status.md)); `smoke-test.md` re-checks it.
 
 #### Agent translation (assistant + translator)
 
@@ -630,6 +647,24 @@ Interpreter and agent+translator pipelines emit additional metrics in `LatencyMe
 | `outbound_translation_first_chunk_ms` | agent+translator | Agent reply start → first translated text (LLM translation step) |
 
 **Status:** Runtime emits these in TR-040 (agent+translator), TR-010 (realtime engine), and TR-004 (cascaded). Platform stores and reports them in analytics. Payload shape is provisional pending Runtime emission.
+
+#### Audio ownership
+
+Every audio track in an interpreter room has one owner and an explicit audience. Enforcement is
+server-side (Runtime and the LiveKit server API), so it holds for any client (browser, phone, API)
+without trusting it.
+
+| Track | Published by | Who may hear it |
+| --- | --- | --- |
+| A's microphone | Participant A | Runtime only |
+| B's microphone | Participant B | Runtime only |
+| A's words in B's language (`translation-for-<B>`) | Runtime | B only |
+| B's words in A's language (`translation-for-<A>`) | Runtime | A only |
+| Agent replies (single-caller modes) | Runtime | the caller |
+
+1. A participant never hears their own microphone or their own translation.
+2. Participants do not hear each other's original audio unless `hear_original` (or `dubbing`) is set.
+3. Single-participant sessions (agent, agent + translator) publish one track that the caller hears.
 
 ### Translation sessions (`/translations`)
 
@@ -1018,3 +1053,27 @@ Opt-in (`PLATFORM_PUBLIC_CALLS=1`, otherwise 404). Full description, configurati
 
 `experience: "cinematic"` sets `interpreter.dubbing = "cinematic"` (the `balanced` profile with the original at -24 dB while the translation speaks).
 Providers come from `PLATFORM_CALLS_PROVIDERS`, never from the request.
+
+Two-person calls use `interpreter.speaker_language`: `declared` fixes recognition and
+translation to the speaker’s declared language (Runtime default when omitted); `auto`
+resolves each utterance from STT detection, with script correction and declared-language
+fallback. Speech already in the listener’s declared language is played as-is, without
+translation. `/calls` and handoffs default to `auto`; set
+`PLATFORM_CALLS_SPEAKER_LANGUAGE=declared` to restore fixed recognition. Invalid environment
+values fall back to `auto`. Listener languages and voice routing stay unchanged.
+
+### Demo chat retrieval and citations
+
+`POST /demo/agents/{key}/chat` additionally returns `sources`, an array of
+`{n, title, heading, url, snippet}`. Only numbered sources cited in `reply` appear;
+`snippet` is at most 240 characters. Unknown numeric citation markers are removed.
+Existing `conversation_id`, `reply`, and `handoff_suggested` fields are unchanged.
+`PLATFORM_CHAT_KNOWLEDGE_MODE=rag` (default) retrieves using the last two user turns;
+`inline` retains the full-knowledge prompt and returns an empty sources array.
+Embedding failures degrade to keyword retrieval.
+
+`POST /agents/{agent_id}/knowledge/reindex` requires admin permission, as does
+setting agent knowledge. It refreshes stale or missing chunks for enabled assigned
+documents and returns `{documents, chunks, embedded}` (current index counts).
+`embedded` counts chunks with stored embeddings; unavailable providers leave
+keyword-searchable chunks. Disabled/unassigned documents are excluded at query time.
