@@ -74,6 +74,12 @@ def seed(base_url: str, api_key: str | None, data: dict[str, Any], dry_run: bool
                 docs.append(created)
                 linked_ids.append(created["id"])
         _request(client, "PUT", f"/agents/{agent_id}/knowledge", json={"document_ids": linked_ids})
+        # Build the chat's search index now, so the first student question doesn't wait for it.
+        try:
+            index = _request(client, "POST", f"/agents/{agent_id}/knowledge/reindex", timeout=120)
+            print(f"knowledge index: {index['chunks']} chunks, {index['embedded']} embedded")
+        except httpx.HTTPError as exc:
+            print(f"knowledge index not built now ({exc.__class__.__name__}); it is built on the first chat")
 
         tools = _request(client, "GET", "/tools")
         tool_ids = []

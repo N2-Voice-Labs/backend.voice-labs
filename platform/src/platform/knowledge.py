@@ -389,3 +389,16 @@ async def search_agent_knowledge_route(
             raise HTTPException(status_code=404, detail="agent_not_found")
 
     return {"results": search_agent_knowledge(db, agent.organization_id, str(agent_id), payload.query, payload.limit)}
+
+
+@router.post("/agents/{agent_id}/knowledge/reindex")
+async def reindex_agent_knowledge(
+    agent_id: UUID,
+    db: Session = Depends(get_scoped_db),
+    ctx: AuthContext = Depends(require("admin")),
+) -> dict[str, int]:
+    from .rag import ensure_index
+    get_agent_or_404(agent_id, db, ctx)
+    result = ensure_index(db, ctx.org_id, str(agent_id))
+    db.commit()
+    return result

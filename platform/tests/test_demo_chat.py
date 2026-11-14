@@ -32,6 +32,7 @@ def test_chat_disabled_unknown_and_no_key(monkeypatch):
 
 
 def test_first_chat_persists_and_followup_includes_history_and_knowledge(monkeypatch):
+    monkeypatch.setenv("PLATFORM_CHAT_KNOWLEDGE_MODE", "inline")
     captured = []
 
     async def completion(messages):

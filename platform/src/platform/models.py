@@ -373,6 +373,19 @@ class KnowledgeDocument(TenantMixin, Base):
     )
 
 
+class KnowledgeChunk(TenantMixin, Base):
+    __tablename__ = "knowledge_chunks"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    document_id: Mapped[str] = mapped_column(String(36), ForeignKey("knowledge_documents.id", ondelete="CASCADE"), index=True)
+    position: Mapped[int] = mapped_column(Integer)
+    heading: Mapped[str] = mapped_column(String(300))
+    text: Mapped[str] = mapped_column(Text)
+    content_hash: Mapped[str] = mapped_column(String(64))
+    embedding_model: Mapped[str] = mapped_column(String(100))
+    embedding: Mapped[list[float] | None] = mapped_column(JSON(none_as_null=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class AgentKnowledgeDocument(Base):
     __tablename__ = "agent_knowledge_documents"
     agent_id: Mapped[str] = mapped_column(ForeignKey("agents.id"), primary_key=True)

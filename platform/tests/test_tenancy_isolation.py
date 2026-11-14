@@ -78,6 +78,7 @@ GLOBAL = {
 # (method, path) covered by *this* file.
 PARAM_CASES = [
     # agents
+    ("POST", "/agents/{agent_id}/knowledge/reindex"),
     ("GET", "/agents/{agent_id}"),
     ("PATCH", "/agents/{agent_id}"),
     ("DELETE", "/agents/{agent_id}"),

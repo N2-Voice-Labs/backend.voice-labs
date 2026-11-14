@@ -1061,3 +1061,19 @@ fallback. Speech already in the listener’s declared language is played as-is, 
 translation. `/calls` and handoffs default to `auto`; set
 `PLATFORM_CALLS_SPEAKER_LANGUAGE=declared` to restore fixed recognition. Invalid environment
 values fall back to `auto`. Listener languages and voice routing stay unchanged.
+
+### Demo chat retrieval and citations
+
+`POST /demo/agents/{key}/chat` additionally returns `sources`, an array of
+`{n, title, heading, url, snippet}`. Only numbered sources cited in `reply` appear;
+`snippet` is at most 240 characters. Unknown numeric citation markers are removed.
+Existing `conversation_id`, `reply`, and `handoff_suggested` fields are unchanged.
+`PLATFORM_CHAT_KNOWLEDGE_MODE=rag` (default) retrieves using the last two user turns;
+`inline` retains the full-knowledge prompt and returns an empty sources array.
+Embedding failures degrade to keyword retrieval.
+
+`POST /agents/{agent_id}/knowledge/reindex` requires admin permission, as does
+setting agent knowledge. It refreshes stale or missing chunks for enabled assigned
+documents and returns `{documents, chunks, embedded}` (current index counts).
+`embedded` counts chunks with stored embeddings; unavailable providers leave
+keyword-searchable chunks. Disabled/unassigned documents are excluded at query time.
