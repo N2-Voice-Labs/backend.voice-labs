@@ -29,7 +29,7 @@ services:
       PLATFORM_DATABASE_URL: ${PLATFORM_DATABASE_URL:?Set PLATFORM_DATABASE_URL}
       PLATFORM_RUNTIME_TOKEN: ${PLATFORM_RUNTIME_TOKEN:?Set PLATFORM_RUNTIME_TOKEN}
       PLATFORM_API_KEYS: ${PLATFORM_API_KEYS:?Set PLATFORM_API_KEYS}
-      PLATFORM_WEB_ORIGIN: ${PLATFORM_WEB_ORIGIN:-https://unai-inha-demo.workers.dev,https://unai-site.workers.dev}
+      PLATFORM_WEB_ORIGIN: ${PLATFORM_WEB_ORIGIN:-https://frontend-voice-labs.<subdomain>.workers.dev,https://voice-labs.<subdomain>.workers.dev}
       PLATFORM_TRUST_PROXY: ${PLATFORM_TRUST_PROXY:-1}
       PLATFORM_PUBLIC_CALLS: ${PLATFORM_PUBLIC_CALLS:-1}
       PLATFORM_CALLS_PROVIDERS: ${PLATFORM_CALLS_PROVIDERS:-stt=elevenlabs,llm=google-translate,tts=elevenlabs}

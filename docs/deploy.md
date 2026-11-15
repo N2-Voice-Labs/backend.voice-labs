@@ -80,10 +80,10 @@ session ownership and throttling include process-local state.
 6. Build/deploy the frontends from their separate checkouts, following each repo's
    existing Cloudflare configuration and authentication:
 
-   - `frontend.voice-labs` (Inha portal), Worker `unai-inha-demo`: configure
+   - `frontend.voice-labs` (Inha portal), Worker `frontend-voice-labs`: configure
      `NEXT_PUBLIC_PLATFORM_URL=<Platform HTTPS URL>` and
      `NEXT_PUBLIC_PORTAL_AGENT_KEY=inha-admissions`, then run `npm run deploy`.
-   - `frontend` (marketing), Worker `unai-site`: configure
+   - `frontend` (marketing), Worker `voice-labs`: configure
      `NEXT_PUBLIC_PORTAL_URL=<deployed portal URL>`, then run `npm run deploy`.
 
    These public variables must be present at build time. Worker names, deploy
@@ -91,7 +91,7 @@ session ownership and throttling include process-local state.
    been checked against the separate frontend repositories here.
 
 7. Set `PLATFORM_WEB_ORIGIN` to the actual portal and marketing origins, e.g.
-   `https://unai-inha-demo.workers.dev,https://unai-site.workers.dev` (use actual
+   `https://frontend-voice-labs.<subdomain>.workers.dev,https://voice-labs.<subdomain>.workers.dev` (use actual
    account subdomains or custom domains). Current Platform splits on commas and
    trims whitespace. Origins include scheme and hostname, without paths or a
    trailing slash. The portal origin is required. Recreate Platform as in step 4
