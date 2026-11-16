@@ -476,6 +476,10 @@ wheels = [
 name = "evals-voice-labs"
 version = "0.1.0"
 source = { virtual = "evals" }
+dependencies = [
+    { name = "httpx" },
+    { name = "pyyaml" },
+]
 
 [package.optional-dependencies]
 test = [
@@ -483,7 +487,11 @@ test = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "pytest", marker = "extra == 'test'", specifier = ">=8.0" }]
+requires-dist = [
+    { name = "httpx", specifier = ">=0.27" },
+    { name = "pytest", marker = "extra == 'test'", specifier = ">=8.0" },
+    { name = "pyyaml", specifier = ">=6.0" },
+]
 provides-extras = ["test"]
 
 [[package]]

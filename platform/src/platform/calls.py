@@ -248,7 +248,11 @@ async def create_call(
     """Open a call and return the creator's connection. The invitation is made separately."""
 
     mine, theirs = (language.strip().lower() for language in payload.languages)
+    speaker_language = os.getenv("PLATFORM_CALLS_SPEAKER_LANGUAGE", "auto")
+    if speaker_language not in ("declared", "auto"):
+        speaker_language = "auto"
     translation = TranslationIn(
+        speaker_language=speaker_language,
         languages=[mine, theirs],
         creator=ParticipantIn(language=mine, display_name=payload.name, voice_profile_id=payload.voice_profile_id),
         latency_mode=payload.latency_mode,

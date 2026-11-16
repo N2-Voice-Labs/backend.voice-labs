@@ -46,6 +46,7 @@ class TranslationIn(BaseModel):
 
     languages: list[str]
     creator: ParticipantIn
+    speaker_language: Literal["declared", "auto"] = "declared"
     latency_mode: str = DEFAULT_LATENCY_MODE
     hear_original: bool = False
     # Cinematic dubbing: the other person's real voice under the translation (default off).
@@ -69,8 +70,8 @@ def interpreter_config(payload: TranslationIn) -> dict[str, Any]:
     """The interpreter block of the hidden agent for ``payload``.
 
     Always the cascaded engine: only it takes a language and a voice per speaker, which two
-    people talking to each other need (the realtime engine is one-way). Each person's lane
-    has its own declared language, so ``direction`` only matters for validation: ``auto``
+    people talking to each other need (the realtime engine is one-way). For these lanes,
+    ``speaker_language`` controls detection; ``direction`` only matters for validation: ``auto``
     where Deepgram can detect both languages, otherwise ``one_way`` (e.g. Korean).
     """
 
@@ -84,6 +85,10 @@ def interpreter_config(payload: TranslationIn) -> dict[str, Any]:
         config = InterpreterConfig(
             languages=languages,
             direction=direction,
+            **(
+                {"speaker_language": payload.speaker_language}
+                if "speaker_language" in payload.model_fields_set else {}
+            ),
             engine="cascaded",
             latency_mode=payload.latency_mode,
             hear_original=payload.hear_original,

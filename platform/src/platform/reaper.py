@@ -9,6 +9,8 @@ at creation) and ``last_event_at`` (set by every accepted Runtime event) is olde
 ``reap_stale_sessions`` is one pass and runs across all organisations (tenant filtering
 bypassed). ``reaper_loop`` repeats it every ``PLATFORM_REAPER_INTERVAL_SECS`` (default 60;
 ``0`` disables; tests/conftest.py does).
+Demo sessions also have an absolute lifetime (PLATFORM_DEMO_MAX_SECONDS, default 300),
+independent of last_event_at. They fail with reason demo_max_duration on the next pass.
 Runs in every Platform process; passes are idempotent, so several workers are harmless.
 """
 
@@ -71,6 +73,10 @@ def reap_stale_sessions(db: Session, now: datetime | None = None) -> list[str]:
 
     now = _aware(now) if now is not None else utcnow()
     cutoff = now - timedelta(seconds=stale_after_secs())
+    try:
+        demo_max = max(1, int(os.getenv("PLATFORM_DEMO_MAX_SECONDS", "300")))
+    except ValueError:
+        demo_max = 300
     reaped: list[str] = []
     with bypass(db):
         rows = db.execute(
@@ -80,18 +86,23 @@ def reap_stale_sessions(db: Session, now: datetime | None = None) -> list[str]:
                 VoiceSession.conversation_id,
                 VoiceSession.started_at,
                 VoiceSession.last_event_at,
+                VoiceSession.runtime_contract,
             ).where(VoiceSession.status.in_(ACTIVE_SESSION_STATUSES))
         ).all()
         db.rollback()  # end the read transaction; each session gets its own below
-        for session_id, org_id, conversation_id, started_at, last_event_at in rows:
+        for session_id, org_id, conversation_id, started_at, last_event_at, contract in rows:
             seen = _aware(started_at)
             if last_event_at is not None:
                 seen = max(seen, _aware(last_event_at))
-            if seen >= cutoff:
+            demo_expired = bool((contract or {}).get("demo")) and (
+                now - _aware(started_at)
+            ).total_seconds() >= demo_max
+            if seen >= cutoff and not demo_expired:
                 continue
             try:
                 if _reap_one(
-                    db, now, session_id, org_id, conversation_id, last_event_at
+                    db, now, session_id, org_id, conversation_id, last_event_at,
+                    demo_expired,
                 ):
                     reaped.append(session_id)
             except Exception:
@@ -107,8 +118,9 @@ def _reap_one(
     org_id: str,
     conversation_id: str,
     observed_last_event_at: datetime | None,
+    max_duration: bool = False,
 ) -> bool:
-    """Fail one session if it is still active and unchanged since it was judged stale."""
+    """Fail an active session; liveness changes only rescue sessions without a hard deadline."""
 
     last_event_guard = (
         VoiceSession.last_event_at.is_(None)
@@ -120,7 +132,7 @@ def _reap_one(
         .where(
             VoiceSession.id == session_id,
             VoiceSession.status.in_(ACTIVE_SESSION_STATUSES),
-            last_event_guard,
+            True if max_duration else last_event_guard,
         )
         .values(status="failed", ended_at=now)
         .execution_options(synchronize_session=False)
@@ -150,7 +162,7 @@ def _reap_one(
                     session_id=session_id,
                     conversation_id=conversation_id,
                     agent_id=agent_id,
-                    payload={"reason": STALE_REASON, "source": "platform_reaper"},
+                    payload={"reason": "demo_max_duration" if max_duration else STALE_REASON, "source": "platform_reaper"},
                 )
             )
     except IntegrityError:

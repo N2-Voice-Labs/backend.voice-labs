@@ -38,6 +38,29 @@ def test_search_requires_runtime_token(monkeypatch) -> None:
         assert response.json()["detail"] == "runtime_auth_not_configured"
 
 
+def test_search_agent_knowledge_helper_and_hangul_bigrams(monkeypatch) -> None:
+    from src.platform.knowledge import _tokenize, search_agent_knowledge
+    from src.platform.models import DEFAULT_ORGANIZATION_ID
+
+    assert "입학" in _tokenize("입학서류는")
+    assert "학서" in _tokenize("입학서류는")
+    with TestClient(app) as client:
+        agent = client.post("/agents", json={"name": "Korean helper"}).json()
+        doc = make_doc(client, title="Admissions", content="입학 서류는 여권 사본입니다.")
+        client.put(f"/agents/{agent['id']}/knowledge", json={"document_ids": [doc["id"]]})
+        with __import__("src.platform.db", fromlist=["SessionLocal"]).SessionLocal() as db:
+            result = search_agent_knowledge(db, DEFAULT_ORGANIZATION_ID, agent["id"], "입학서류", 3)
+        assert result and result[0]["document_id"] == doc["id"]
+        monkeypatch.setenv("PLATFORM_RUNTIME_TOKEN", "secret")
+        response = client.post(
+            f"/runtime/agents/{agent['id']}/knowledge/search",
+            json={"query": "입학서류", "limit": 3},
+            headers={"x-runtime-token": "secret"},
+        )
+        assert response.status_code == 200
+        assert response.json()["results"]
+
+
 def test_search_rejects_invalid_token(monkeypatch) -> None:
     """Test that search endpoint rejects invalid tokens."""
     monkeypatch.setenv("PLATFORM_RUNTIME_TOKEN", "correct-secret")

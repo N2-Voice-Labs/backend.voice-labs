@@ -22,6 +22,7 @@ from .livekit import (
     phone_room_name,
     private_listening_enabled,
 )
+from .knowledge import agent_knowledge_text
 from .models import Agent as AgentRecord
 from .models import (
     AgentKnowledgeDocument,
@@ -435,6 +436,14 @@ async def open_voice_session(
         session.room_name, creator_identity, configured=configured, private=private_listening
     )
     runtime_status = "not_configured"
+    knowledge_text = agent_knowledge_text(db, org_id, agent.id)
+    try:
+        inline_knowledge_max = max(0, int(os.getenv("PLATFORM_INLINE_KNOWLEDGE_MAX_CHARS", "60000")))
+    except ValueError:
+        inline_knowledge_max = 60000
+    inline_knowledge = bool(
+        knowledge_text is not None and inline_knowledge_max > 0 and len(knowledge_text) <= inline_knowledge_max
+    )
     request_payload = {
         "session_id": session.id,
         "conversation_id": conversation.id,
@@ -442,12 +451,18 @@ async def open_voice_session(
         # Informational: the Runtime does not use it for authorisation.
         "organization_id": org_id,
         "room_name": session.room_name,
-        "system_prompt": agent.system_prompt,
+        "system_prompt": (
+            agent.system_prompt
+            + "\n\n## Knowledge base (verified source material — answer only from this; if the answer is not here, say you don't know)\n\n"
+            + knowledge_text
+            if inline_knowledge
+            else agent.system_prompt
+        ),
         "voice_id": runtime_voice_id,
         "mode": agent.mode,
         "interpreter": agent.interpreter,
         "tools": runtime_tools_for_agent(agent.id, db, org_id),
-        "knowledge_enabled": agent_has_knowledge(agent.id, db, org_id),
+        "knowledge_enabled": agent_has_knowledge(agent.id, db, org_id) and not inline_knowledge,
     }
     if agent.translation:
         # Agent + translator (TR-040); absent for ordinary agents.

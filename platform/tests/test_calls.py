@@ -23,6 +23,7 @@ def enabled(monkeypatch):
     monkeypatch.setenv("PLATFORM_PUBLIC_CALLS", "1")
     monkeypatch.delenv("PLATFORM_API_KEYS", raising=False)
     monkeypatch.delenv("PLATFORM_CALL_INVITE_TTL_SECS", raising=False)
+    monkeypatch.delenv("PLATFORM_CALLS_SPEAKER_LANGUAGE", raising=False)
     calls.reset_limits()
     yield
     calls.reset_limits()
@@ -64,6 +65,7 @@ def test_create_returns_the_creators_connection_and_a_session_token(runtime, liv
     assert call["connection"]["url"] == "ws://livekit.test" and call["connection"]["token"]
     contract = contract_for(call["session_id"])
     assert contract["interpreter"]["languages"] == ["ko", "en"]
+    assert contract["interpreter"]["speaker_language"] == "auto"
     assert "dubbing" not in contract["interpreter"]  # AI-only unless chosen
     assert contract["interpreter"].get("hear_original") in (None, False)
 
@@ -260,3 +262,12 @@ class TestWithAuthentication:
             ended = client.post(f"/voice/sessions/{two['session_id']}/end", headers=bearer(one["session_token"]))
             assert ended.status_code == 403
             assert client.post(f"/calls/{two['session_id']}/end", headers=bearer(one["session_token"])).status_code == 403
+
+
+@pytest.mark.parametrize("configured,expected", [("declared", "declared"), ("auto", "auto"), ("invalid", "auto")])
+def test_calls_speaker_language_environment(runtime, livekit, monkeypatch, configured, expected):
+    monkeypatch.setenv("PLATFORM_CALLS_SPEAKER_LANGUAGE", configured)
+    with TestClient(app) as client:
+        response = start(client)
+        assert response.status_code == 201, response.text
+    assert contract_for(response.json()["session_id"])["interpreter"]["speaker_language"] == expected

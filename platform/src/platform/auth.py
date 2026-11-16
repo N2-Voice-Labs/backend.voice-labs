@@ -6,6 +6,8 @@ is set, a global dependency protects every route by default; the only exceptions
 listed explicitly below:
 
 * ``PUBLIC_ROUTES`` need no credentials.
+* Calls and demo routes apply feature gates; handoffs validate session/staff credentials
+  in their handlers. These routes always use the configured calls organisation.
 * ``RUNTIME_TOKEN_ROUTES`` are Runtime callbacks that carry their own ``X-Runtime-Token``.
 * ``SESSION_SCOPED_ROUTES`` accept the admin key or a session token for that session.
 
@@ -60,6 +62,18 @@ PUBLIC_CALL_ROUTES = frozenset(
         ("POST", "/calls/invites/{code}/join"),
     }
 )
+# These handlers apply their own feature gates and credentials, also in the calls org.
+PUBLIC_DEMO_ROUTES = frozenset({
+    ("GET", "/demo/agents/{key}"),
+    ("POST", "/demo/agents/{key}/sessions"),
+    ("POST", "/demo/agents/{key}/chat"),
+})
+PUBLIC_HANDOFF_ROUTES = frozenset({("POST", "/handoffs")})
+STAFF_HANDOFF_ROUTES = frozenset({
+    ("GET", "/staff/handoffs"),
+    ("POST", "/staff/handoffs/{handoff_id}/accept"),
+    ("GET", "/staff/handoffs/{handoff_id}/transcript"),
+})
 RUNTIME_TOKEN_ROUTES = frozenset(
     {
         ("POST", "/runtime/events"),
@@ -264,7 +278,9 @@ async def authenticate(request: Request, db: Session = Depends(get_db)) -> None:
     route_key = (request.method, getattr(route, "path", request.url.path))
     if route_key in PUBLIC_ROUTES:
         return
-    if route_key in PUBLIC_CALL_ROUTES:
+    if route_key in (
+        PUBLIC_CALL_ROUTES | PUBLIC_DEMO_ROUTES | PUBLIC_HANDOFF_ROUTES | STAFF_HANDOFF_ROUTES
+    ):
         from .calls import calls_org_id
 
         request.state.ctx = AuthContext(

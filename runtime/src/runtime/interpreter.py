@@ -43,8 +43,10 @@ Two participants (TR-020)
 With a :class:`~runtime.participants.ParticipantDirectory` each speaker is identified by
 the LiveKit identity (``TranscriptionFrame.user_id``) and the per-speaker lanes in
 ``pipeline.build_interpreter_pipeline`` transcribe each person in their declared
-language. The source language is then the speaker's declared language (no detection, so
-any pair such as ``ko`` <-> ``en`` works), the target is the other participant's
+language by default (``speaker_language="declared"``). With ``speaker_language="auto"``,
+each lane detects the utterance language; an unambiguous script majority can correct the
+detector. Speech already in the listener's language passes through without translation.
+The target is the other participant's
 language, and the translation is spoken in the speaker's own voice (their
 ``voice_id``) or the agent's voice when they have none. Utterance buffering, the
 late-segment grace period and ordering are kept per speaker, so overlapping speech from
@@ -92,6 +94,7 @@ from pipecat.frames.frames import (
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.services.settings import TTSSettings
 
+from .echo_guard import EchoGuard
 from .glossary import Glossary, GlossaryEntry, glossary_prompt, parse_glossary, prompt_has_glossary
 from .latency_modes import (
     DEFAULT_LATENCY_MODE,
@@ -182,6 +185,7 @@ class InterpreterSettings:
     dubbing: Any = None
     # NS-08: required renderings and never-translate terms; see ``glossary``.
     glossary: Glossary = ()
+    speaker_language: str = "declared"
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any] | None) -> "InterpreterSettings":
@@ -200,6 +204,9 @@ class InterpreterSettings:
         direction = raw.get("direction", "auto")
         if direction not in SUPPORTED_DIRECTIONS:
             raise RuntimeError(f"unsupported interpreter direction: {direction}")
+        speaker_language = raw.get("speaker_language", "declared")
+        if speaker_language not in ("declared", "auto"):
+            raise RuntimeError(f"unsupported interpreter speaker_language: {speaker_language}")
         latency_mode = raw.get("latency_mode") or DEFAULT_LATENCY_MODE
         if latency_mode not in LATENCY_MODES:
             raise RuntimeError(f"unsupported interpreter latency_mode: {latency_mode}")
@@ -219,6 +226,7 @@ class InterpreterSettings:
         settings = cls(
             languages=(pair[0], pair[1]),
             direction=direction,
+            speaker_language=speaker_language,
             engine=engine,
             latency_mode=latency_mode,
             hear_original=hear_original,
@@ -253,14 +261,30 @@ def _script_votes(text: str) -> Counter[str]:
     return votes
 
 
-def guess_language_from_script(text: str, pair: Sequence[str]) -> str | None:
-    """Pick the pair language whose script dominates ``text``, or None if unclear."""
+def guess_language_from_script(
+    text: str, pair: Sequence[str], *, clear_vote: bool = False
+) -> str | None:
+    """Pick the pair language whose script dominates ``text``, or None if unclear.
+
+    Two-person auto mode requires a majority and an unambiguous pair candidate;
+    Latin can also identify a language when only one pair member uses that script.
+    The default preserves the single-speaker detection heuristic.
+    """
 
     votes = _script_votes(text)
+    scripts = _SCRIPT_LANGUAGES
+    if clear_vote:
+        latin = sum(unicodedata.name(char, "").startswith("LATIN") for char in text if char.isalpha())
+        votes["LATIN"] = latin
+        scripts = {**scripts, "LATIN": ("en", "es", "fr", "de", "it", "pt", "nl", "tr", "pl")}
     if not votes:
         return None
-    script, _ = votes.most_common(1)[0]
-    candidates = [code for code in _SCRIPT_LANGUAGES[script] if code in pair]
+    script, count = votes.most_common(1)[0]
+    if clear_vote and count <= sum(votes.values()) / 2:
+        return None
+    candidates = [code for code in scripts[script] if code in pair]
+    if clear_vote and len(candidates) != 1:
+        return None
     return candidates[0] if candidates else None
 
 
@@ -725,8 +749,11 @@ class TranslationProcessor(FrameProcessor):
         on_empty_translation: EmptyTranslationHook | None = None,
         provider: str = "openai",
         on_dropped: Callable[[str | None], None] | None = None,
+        echo_guard: EchoGuard | None | bool = True,
     ) -> None:
         super().__init__()
+        # True: from the environment (on by default); None/False: off; or a ready EchoGuard.
+        self._echo = EchoGuard.from_env() if echo_guard is True else (echo_guard or None)
         self._settings = settings
         self._provider = provider
         self._on_dropped = on_dropped
@@ -991,17 +1018,27 @@ class TranslationProcessor(FrameProcessor):
     async def process_utterance(self, utterance: _Utterance) -> None:
         """Translate one utterance and push the TTS frames. Never raises on provider errors."""
 
+        if self._echo is not None and self._echo.is_echo(utterance.text):
+            # Our own translation came back through someone's microphone: translating it again
+            # would loop (see echo_guard). Not stored, not spoken.
+            _logger.info("Interpreter dropped an echo of recent translated speech (%d chars)", len(utterance.text))
+            return
+
         participant = (
             self._participants.get(utterance.user_id) if self._participants else None
         )
         voice: str | None = None
         speaker: dict[str, object] = {}
         if participant is not None:
-            # Two-participant session: the speaker's declared language is the source,
-            # the other participant's language the target, and the speaker's own voice
+            # Two-participant session: source follows speaker_language; the listener's
+            # declared language is the target, and the speaker's own voice
             # (else the agent's) speaks the translation.
             assert self._participants is not None
             source = participant.language
+            if self._settings.speaker_language == "auto":
+                detected = normalize_language(utterance.language)
+                script = guess_language_from_script(utterance.text, self._settings.languages, clear_vote=True)
+                source = script or (detected if detected in self._settings.languages else participant.language)
             target = self._participants.target_for(participant.identity)
             voice = participant.voice_id or self._default_voice_id
             if participant.display_name:
@@ -1042,6 +1079,7 @@ class TranslationProcessor(FrameProcessor):
             self._context_pairs,
             self._settings.glossary,
         )
+        passthrough = participant is not None and self._settings.speaker_language == "auto" and source == target
         started = time.monotonic()
         chunker = SentenceChunker(self._clause_min_chars, FIRST_CLAUSE_MIN_CHARS)
         deltas: list[str] = []
@@ -1065,11 +1103,13 @@ class TranslationProcessor(FrameProcessor):
             if routed and lane is None:
                 return  # nobody else is in the room to hear it
             if not spoken:
-                self._emit_latency(
-                    "translation_first_chunk_ms", time.monotonic() - started
-                )
+                if not passthrough:
+                    self._emit_latency(
+                        "translation_first_chunk_ms", time.monotonic() - started
+                    )
                 if timeline is not None:
-                    timeline.mark(utterance_timeline, "translation_first_chunk")
+                    if not passthrough:
+                        timeline.mark(utterance_timeline, "translation_first_chunk")
                     timeline.enqueue_audio(
                         utterance_timeline,
                         listener_identity,
@@ -1099,6 +1139,8 @@ class TranslationProcessor(FrameProcessor):
                         update.metadata["listener_lane"] = lane
                     await self.push_frame(update)
             spoken.append(chunk)
+            if self._echo is not None:
+                self._echo.record(chunk)
             if timeline is not None:
                 timeline.chunk_pushed(utterance_timeline)
             speak_frame = TTSSpeakFrame(chunk, append_to_context=False)
@@ -1107,6 +1149,16 @@ class TranslationProcessor(FrameProcessor):
             if timeline is not None:
                 timeline.mark(utterance_timeline, "tts_request")
             await self.push_frame(speak_frame)
+
+        if passthrough:
+            try:
+                await speak(utterance.text)
+            finally:
+                if timeline is not None:
+                    timeline.speech_done(utterance_timeline)
+            self._history.append((source, utterance.text, target, utterance.text))
+            self._emit_assistant_transcript(utterance.text, target, translated_for, turn_id)
+            return
 
         if timeline is not None:
             timeline.mark(utterance_timeline, "translation_start")
@@ -1165,6 +1217,8 @@ class TranslationProcessor(FrameProcessor):
                     }
                 )
             return
+        if self._echo is not None and len(spoken) > 1:
+            self._echo.record(translation)
         self._history.append((source, utterance.text, target, translation))
         self._emit_assistant_transcript(translation, target, translated_for, turn_id)
 

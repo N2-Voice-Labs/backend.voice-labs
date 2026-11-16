@@ -14,7 +14,7 @@ per participant inside a native ``ParallelPipeline``::
   audio of its lane's participant (other participants' audio, and audio of unknown
   identities, is dropped for this lane), and keeps the lane's STT language in sync
   with the participant's declared language, including for a participant that joins after
-  the pipeline started.
+  the pipeline started. Auto-detection lanes disable this synchronization.
 * :class:`PerParticipantLiveKitTransport` gives every participant its own audio
   resampler. Pipecat's stock ``LiveKitInputTransport`` shares ONE stateful streaming
   resampler (48 kHz -> 16 kHz) between all participants; interleaved chunks of two
@@ -71,11 +71,13 @@ class ParticipantLaneGate(FunctionFilter):
         *,
         stt: FrameProcessor,
         language: str,
+        sync_language: bool = True,
     ) -> None:
         super().__init__(self._allow, filter_system_frames=True, name=f"ParticipantLane{lane}")
         self._directory = directory
         self._lane = lane
         self._stt = stt
+        self._sync_declared_language = sync_language
         self._language = language
         self._started = False
         directory.add_listener(self._on_participant)
@@ -97,6 +99,8 @@ class ParticipantLaneGate(FunctionFilter):
             await self._sync_language()
 
     async def _sync_language(self) -> None:
+        if not self._sync_declared_language:
+            return
         language = self._directory.language_for_lane(self._lane)
         if language == self._language:
             return

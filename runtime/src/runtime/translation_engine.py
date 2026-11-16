@@ -220,10 +220,13 @@ class CascadedEngine:
             lanes = []
             for lane in range(MAX_PARTICIPANTS):
                 language = directory.language_for_lane(lane)
-                stt = make_stt(language)
+                stt = make_stt("multi" if settings.speaker_language == "auto" else language)
                 lanes.append(
                     [
-                        ParticipantLaneGate(directory, lane, stt=stt, language=language),
+                        ParticipantLaneGate(
+                            directory, lane, stt=stt, language=language,
+                            sync_language=settings.speaker_language == "declared",
+                        ),
                         make_vad(),
                         stt,
                         make_user_turns(),

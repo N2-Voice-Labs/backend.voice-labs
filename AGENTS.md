@@ -1,4 +1,4 @@
-# Backend Voice Labs workspace
+# UNAI backend workspace (repository: backend.voice-labs)
 
 This local repository groups the independently structured Platform, Runtime, and
 Evaluation projects. Their project-specific `AGENTS.md`, `pyproject.toml`, lockfiles,

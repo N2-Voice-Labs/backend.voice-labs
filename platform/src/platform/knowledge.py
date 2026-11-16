@@ -1,6 +1,7 @@
 """Knowledge API."""
 
 import re
+import os
 from datetime import datetime
 from typing import Any
 from uuid import UUID
@@ -243,7 +244,28 @@ class SearchResponse(BaseModel):
 def _tokenize(text: str) -> list[str]:
     """Tokenize text using unicode-aware regex, filtering short tokens."""
     tokens = re.findall(r"\w+", text.lower())
-    return [t for t in tokens if len(t) >= 2]
+    result = [t for t in tokens if len(t) >= 2]
+    for run in re.findall(r"[\uac00-\ud7a3]+", text.lower()):
+        result.extend(run[i : i + 2] for i in range(len(run) - 1))
+    return result
+
+
+def agent_knowledge_text(db: Session, org_id: str, agent_id: str) -> str | None:
+    """Return enabled linked source material in stable title order."""
+    docs = (
+        db.query(KnowledgeDocument)
+        .join(AgentKnowledgeDocument, AgentKnowledgeDocument.document_id == KnowledgeDocument.id)
+        .filter(
+            AgentKnowledgeDocument.agent_id == str(agent_id),
+            KnowledgeDocument.organization_id == str(org_id),
+            KnowledgeDocument.enabled.is_(True),
+        )
+        .order_by(KnowledgeDocument.title, KnowledgeDocument.id)
+        .all()
+    )
+    if not docs:
+        return None
+    return "\n\n".join(f"### {doc.title}\n{doc.content}" for doc in docs)
 
 
 def _split_into_chunks(content: str, chunk_size: int = 800) -> list[str]:
@@ -311,12 +333,42 @@ def _score_chunk(
     return score
 
 
+def search_agent_knowledge(
+    db: Session, org_id: str, agent_id: str, query: str, limit: int
+) -> list[dict[str, Any]]:
+    """Search enabled documents linked to an agent within the supplied organization."""
+    docs = (
+        db.query(KnowledgeDocument)
+        .join(AgentKnowledgeDocument, AgentKnowledgeDocument.document_id == KnowledgeDocument.id)
+        .filter(
+            AgentKnowledgeDocument.agent_id == str(agent_id),
+            KnowledgeDocument.enabled.is_(True),
+            KnowledgeDocument.organization_id == str(org_id),
+        )
+        .order_by(KnowledgeDocument.title, KnowledgeDocument.id)
+        .all()
+    )
+    query_tokens = _tokenize(query)
+    scored_chunks: list[tuple[float, str, UUID, str, str]] = []
+    for doc in docs:
+        title_tokens = _tokenize(doc.title)
+        for chunk in _split_into_chunks(doc.content):
+            score = _score_chunk(chunk, query_tokens, doc.title, title_tokens)
+            if score > 0:
+                scored_chunks.append((score, chunk, doc.id, doc.title, doc.source))
+    scored_chunks.sort(key=lambda item: item[0], reverse=True)
+    return [
+        {"document_id": doc_id, "title": title, "source": source, "snippet": chunk[:800], "score": score}
+        for score, chunk, doc_id, title, source in scored_chunks[:limit]
+    ]
+
+
 @router.post(
     "/runtime/agents/{agent_id}/knowledge/search",
     response_model=SearchResponse,
     dependencies=[Depends(require_runtime_token)],
 )
-async def search_agent_knowledge(
+async def search_agent_knowledge_route(
     agent_id: UUID,
     payload: SearchRequest,
     db: Session = Depends(get_db),
@@ -336,50 +388,17 @@ async def search_agent_knowledge(
         if agent is None:
             raise HTTPException(status_code=404, detail="agent_not_found")
 
-        # Get all enabled documents assigned to this agent
-        docs = (
-            db.query(KnowledgeDocument)
-            .join(
-                AgentKnowledgeDocument,
-                AgentKnowledgeDocument.document_id == KnowledgeDocument.id,
-            )
-            .filter(
-                AgentKnowledgeDocument.agent_id == str(agent_id),
-                KnowledgeDocument.enabled == True,
-                KnowledgeDocument.organization_id == agent.organization_id,
-            )
-            .all()
-        )
+    return {"results": search_agent_knowledge(db, agent.organization_id, str(agent_id), payload.query, payload.limit)}
 
-    # Tokenize query
-    query_tokens = _tokenize(payload.query)
 
-    # Collect and score all chunks
-    scored_chunks: list[tuple[float, str, UUID, str, str]] = []
-
-    for doc in docs:
-        title_tokens = _tokenize(doc.title)
-        chunks = _split_into_chunks(doc.content)
-
-        for chunk in chunks:
-            score = _score_chunk(chunk, query_tokens, doc.title, title_tokens)
-            if score > 0:
-                scored_chunks.append((score, chunk, doc.id, doc.title, doc.source))
-
-    # Sort by score descending and take top limit
-    scored_chunks.sort(key=lambda x: x[0], reverse=True)
-    top_chunks = scored_chunks[: payload.limit]
-
-    # Format response
-    results = [
-        {
-            "document_id": doc_id,
-            "title": title,
-            "source": source,
-            "snippet": chunk[:800],  # Ensure max 800 chars
-            "score": score,
-        }
-        for score, chunk, doc_id, title, source in top_chunks
-    ]
-
-    return {"results": results}
+@router.post("/agents/{agent_id}/knowledge/reindex")
+async def reindex_agent_knowledge(
+    agent_id: UUID,
+    db: Session = Depends(get_scoped_db),
+    ctx: AuthContext = Depends(require("admin")),
+) -> dict[str, int]:
+    from .rag import ensure_index
+    get_agent_or_404(agent_id, db, ctx)
+    result = ensure_index(db, ctx.org_id, str(agent_id))
+    db.commit()
+    return result

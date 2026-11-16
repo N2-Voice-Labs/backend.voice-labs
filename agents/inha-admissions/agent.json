@@ -1,0 +1,11 @@
+{
+  "name": "Inha Admissions Assistant",
+  "demo_key": "inha-admissions",
+  "description": "Answers international student admissions questions using verified Inha University information.",
+  "enabled_languages": ["en"],
+  "stt": {"provider": "elevenlabs", "settings": {"language": "en"}},
+  "llm": {"provider": "gemini", "settings": {"model": "gemini-3.5-flash-lite", "temperature": 0.3, "max_tokens": 160}},
+  "tts": {"provider": "elevenlabs", "settings": {"model": "eleven_flash_v2_5"}},
+  "voice_id": null,
+  "tools": ["transfer_to_human"]
+}

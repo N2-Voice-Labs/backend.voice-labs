@@ -1,168 +1,57 @@
-# Goal: Enable Real Human-to-Human Translated Calls Through Shareable Links
+# UNAI goal: AI Admissions Assistant for Inha University
 
-We are moving from infrastructure development to real-world product testing.
+Status: **current product direction, 2026-11-12.** MVP implementation is in progress.
 
-Our immediate objective is to make our existing real-time translation system usable by two real people through a simple browser-based voice call.
+> **UNAI** (formerly Voice Labs) is a B2B AI communication platform: AI voice agents (primary), real-time translation, AI chatbots and developer APIs. First market: university admissions offices. First MVP: the AI Admissions Assistant for international students at Inha University. Calls run in the browser over WebRTC (LiveKit); telephone/SIP calling is deferred.
 
-This is a prototyping and validation platform, not our final distribution channel. We may eventually integrate carrier calls, messengers, or native applications, but those are out of scope for now.
+## Product and MVP
 
-## Primary objective
+UNAI is Voice Labs renamed and repositioned, not a separate company. It is an AI-as-a-Service platform designed for multiple industries. AI voice agents are the primary product; real-time translation supports a handoff when a caller and staff member speak different languages. AI chatbots are a secondary channel using the same knowledge. Developer APIs are the commercial direction; today this means the existing Platform HTTP API. Billing, API-key portal and developer dashboard are planned, not built.
 
-Two people who speak different languages should be able to establish a real-time translated voice call without installing an application or creating accounts.
+The first demo is for Inha University international admissions. The platform remains industry-neutral: university-specific knowledge and prompts belong in agent data, not runtime code.
 
-The experience should be approximately as simple as joining a Google Meet call.
+MVP journey: a student opens the Inha portal and starts an AI voice call in the browser. The agent answers from verified admissions information. On “Connect to Admissions Officer,” staff join from a browser `/staff` console; the student can speak English while the officer speaks Korean through the existing `/calls` interpreter and private listen rooms. Either side can end the call. A text chatbot is an alternative channel. No phone number or SIM is needed. Traditional telephone/SIP calling and outbound campaigns are deferred.
 
-### Intended user experience
+Small knowledge bases are intended to be inserted inline into the agent prompt; larger ones use the existing keyword `search_knowledge` tool. Inline mode is in progress; embeddings RAG is deferred.
 
-**Person A:**
-1. Opens our website.
-2. Selects their language and the other participant's language.
-3. Clicks Start Call.
-4. Receives a shareable invitation link.
-5. Sends the link through KakaoTalk, WhatsApp, SMS, or another messenger.
+## Existing evidence
 
-**Person B:**
-1. Opens the invitation link.
-2. Confirms their language.
-3. Grants microphone access.
-4. Joins the existing call.
-5. Immediately begins communicating through our translation system.
+Evidence below records prior runs and remains historical; it does not establish that the current MVP is complete. See [Status](status.md) for evidence levels.
 
-Both participants should hear translations in their respective languages.
+| Capability | Recorded evidence |
+| --- | --- |
+| Browser speech → LLM → speech | ✅ October 2026, about 1.65 s from end of speech to first reply audio; not re-run on current code. |
+| Agent + translator (English agent, Russian caller) | ✅ October 2026, n=2, about 1.9 s; historical run. |
+| Agent settings, templates, transcripts and signed events | ✅ previously verified as recorded in Status. |
+| Tools and keyword knowledge search | 🧪 mocks only. |
+| Interruption and handoff | 🧪 mocks only; no human browser handoff. |
 
-## Technical objectives
+## Next proofs, in order
 
-### 1. Reuse existing infrastructure
+Record dated outcomes in [Status](status.md). MVP pieces remain in progress until each path has real evidence.
 
-We already have:
+1. **Public demo voice session:** start and end a student browser session with the intended demo agent; verify provider-backed calls and safe session cleanup.
+2. **Inha admissions knowledge:** load verified admissions facts into the agent, confirm inline small-KB behavior or keyword search for larger content, and evaluate the FAQ set.
+3. **Human handoff:** student requests an officer, staff see and accept the handoff in `/staff`, and both join the browser call.
+4. **Translated handoff:** verify English↔Korean speech in both directions through private listen rooms.
+5. **Chat alternative:** answer from the same agent knowledge and verify grounding.
+6. **Demo readiness:** run the acceptance targets below and record evidence; deploy the public demo only when its operating and privacy details are ready.
 
-- LiveKit.
-- Bidirectional real-time translation.
-- ElevenLabs STT/TTS.
-- Google Cloud Translation with Gemini fallback.
-- Per-call session isolation.
-- Audio routing.
-- Optional cinematic dubbing.
-- Latency instrumentation.
+## Acceptance targets (not yet measured)
 
-Audit the existing application before implementing anything.
+Every value below is a **target, not yet measured**.
 
-Reuse existing components and avoid unnecessary architectural changes.
+| Acceptance measure | Target | Status |
+| --- | --- | --- |
+| Consecutive AI calls | 10 without failure | Target, not yet measured |
+| Verified Inha admissions FAQ answers | ≥18/20 | Target, not yet measured |
+| Median voice reply latency | <3 s after end of speech | Target, not yet measured |
+| Devices connected to one handoff call | 2 | Target, not yet measured |
+| Translated exchanges | 5 each direction (English→Korean and Korean→English) | Target, not yet measured |
+| Clean session terminations | 10 | Target, not yet measured |
+| Real mobile browser | ≥1 successful run | Target, not yet measured |
+| Demo duration | 3 minutes | Target, not yet measured |
 
-### 2. Implement browser-based calls
+## Deferred
 
-Build the minimum frontend and backend functionality required to:
-
-- Create a call.
-- Generate a secure invitation link.
-- Join an existing call.
-- Connect both participants to the same translation session.
-- Display connection status.
-- Mute/unmute the microphone.
-- Hang up.
-- End and clean up abandoned sessions.
-
-Support desktop and mobile browsers.
-
-### 3. Make the experience simple
-
-Prioritize a minimal, functional interface.
-
-Avoid unnecessary onboarding, registration, complex settings, or additional features.
-
-The recipient should be able to join with as few interactions as possible.
-
-Handle microphone permissions, audio playback restrictions, connection failures, and reconnections clearly.
-
-### 4. Translation and dubbing
-
-Both participants must receive the correct translations.
-
-For testing, support two audio experiences:
-
-- AI translation only.
-- Live original voice with cinematic ducking.
-
-Use the existing dubbing implementation.
-
-Make the original voice quieter when the AI translation starts. Start by testing approximately −24 dB during translated playback.
-
-Allow the experience to be selected for testing, but preserve existing production defaults.
-
-Do not introduce additional translation latency.
-
-### 5. Security and reliability
-
-Even though this is a prototype, implement basic safeguards:
-
-- Unpredictable invitation links.
-- Expiring invitations.
-- Short-lived LiveKit access tokens.
-- Maximum two human participants per room.
-- No API credentials exposed to browsers.
-- Session cleanup after calls.
-- Protection against unauthorized joins.
-- Basic limits against resource abuse.
-
-### 6. Real-world testing
-
-The application should allow us to test:
-
-- Korean ↔ English translation.
-- End-to-end conversational latency.
-- Translation accuracy.
-- Sentence splitting.
-- Interruptions and overlapping speech.
-- AI-only versus cinematic dubbing.
-- Audio echo with headphones and speakers.
-- Mobile versus desktop behavior.
-- Connection stability.
-
-Keep existing instrumentation available for debugging.
-
-### Constraints
-
-- Do not implement SIP, carrier calling, or messenger voice-call integrations.
-- Do not build native mobile applications.
-- Do not introduce unnecessary infrastructure.
-- Preserve existing translation architecture.
-- Do not consume ElevenLabs credits or paid calling resources without authorization.
-- Keep the implementation modular enough to support additional calling platforms later.
-
-## Definition of success
-
-I can open our website on one device, create a translated call, copy its invitation link, open it on another device, and establish a real bidirectional conversation.
-
-One person speaks Korean.
-
-The other speaks English.
-
-Both hear accurate translations through our existing Runtime.
-
-The call works on desktop and mobile browsers, and both participants can disconnect normally.
-
-## Development instructions
-
-You have discretion over the technical implementation.
-
-First inspect the repository and determine what already exists.
-
-Implement the smallest maintainable solution that meets the objectives.
-
-Write appropriate automated tests and run the relevant test suites.
-
-Do not claim that browser compatibility or real-call performance has been verified until actual device testing has occurred.
-
-Commit completed and verified work.
-
-At completion, report:
-
-1. What was implemented.
-2. How to start the application locally.
-3. How to create and join a translated call.
-4. What external configuration is required.
-5. What has been tested automatically.
-6. What requires manual testing on real devices.
-7. Any limitations affecting real-world use.
-
-Prioritize getting two real people into a working translated conversation over adding features.
+Telephone/SIP deployment, phone numbers, SIMs and outbound campaigns; embeddings RAG; billing and developer portal/dashboard; additional vertical-specific runtime logic. Existing SIP code paths are documented as technical reference, not part of the MVP path.
