@@ -27,7 +27,12 @@ from .tenancy import get_scoped_db, scoped
 router = APIRouter(tags=["demo"])
 _chat_bucket = limits.TokenBucket()
 CHAT_INSTRUCTION = (
-    "This is a text chat, not a voice call. Reply in plain text, up to 4 short sentences. "
+    "This is a text chat, not a voice call: the voice-only rules above about reply length, lists and not "
+    "reading web addresses do not apply here. Write like a friendly, knowledgeable admissions advisor: "
+    "answer the actual question directly first, then add the details the student will need next "
+    "(requirements, deadlines, fees, documents, next steps) from the sources. Use short paragraphs, and "
+    "a simple '- ' list when there are several items. Keep it focused: usually 2-6 sentences or a short list. "
+    "When useful, end with one brief follow-up question or suggestion (for example which intake they mean). "
     "If the user needs a person, say they can ask to be connected to a staff member. "
     "Append [HANDOFF] when the user asks for a person or the answer is not in the knowledge."
 )
@@ -75,17 +80,45 @@ def limit_chat(request: Request) -> None:
         )
 
 
+async def anthropic_completion(messages: list[dict[str, str]]) -> str:
+    """Claude via the Anthropic SDK (PLATFORM_CHAT_LLM_PROVIDER=anthropic, e.g. for demo day)."""
+    import anthropic  # optional dependency: only needed when this provider is selected
+
+    key = os.getenv("ANTHROPIC_API_KEY")
+    if not key:
+        raise HTTPException(status_code=503, detail="chat_unavailable")
+    system = "\n\n".join(m["content"] for m in messages if m["role"] == "system")
+    turns = [m for m in messages if m["role"] in ("user", "assistant")]
+    try:
+        async with anthropic.AsyncAnthropic(api_key=key, timeout=30.0) as client:
+            response = await client.messages.create(
+                model=os.getenv("PLATFORM_CHAT_LLM_MODEL", "claude-haiku-5-5"),
+                max_tokens=int(os.getenv("PLATFORM_CHAT_LLM_MAX_TOKENS", "2000")),
+                output_config={"effort": os.getenv("PLATFORM_CHAT_LLM_EFFORT", "low")},
+                system=system, messages=turns,
+            )
+    except anthropic.APIError:
+        raise HTTPException(status_code=502, detail="chat_failed") from None
+    text = "".join(block.text for block in response.content if block.type == "text").strip()
+    if response.stop_reason == "refusal" or not text:
+        raise HTTPException(status_code=502, detail="chat_failed")
+    return text
+
+
 async def chat_completion(messages: list[dict[str, str]]) -> str:
     """Send a chat completion request to the configured OpenAI-compatible endpoint."""
-    key = os.getenv("PLATFORM_CHAT_LLM_API_KEY") or os.getenv("GEMINI_API_KEY")
+    if os.getenv("PLATFORM_CHAT_LLM_PROVIDER", "openai_compatible").lower() == "anthropic":
+        return await anthropic_completion(messages)
+    key =os.getenv("PLATFORM_CHAT_LLM_API_KEY") or os.getenv("GEMINI_API_KEY")
     if not key:
         raise HTTPException(status_code=503, detail="chat_unavailable")
     base_url = os.getenv("PLATFORM_CHAT_LLM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai").rstrip("/")
     url = f"{base_url}/chat/completions"
     payload = {"model": os.getenv("PLATFORM_CHAT_LLM_MODEL", "gemini-3.5-flash-lite"), "messages": messages,
-               "temperature": 0.3, "max_tokens": 300}
+               "temperature": float(os.getenv("PLATFORM_CHAT_LLM_TEMPERATURE", "0.4")),
+               "max_tokens": int(os.getenv("PLATFORM_CHAT_LLM_MAX_TOKENS", "700"))}
     try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
+        async with httpx.AsyncClient(timeout=float(os.getenv("PLATFORM_CHAT_LLM_TIMEOUT", "20"))) as client:
             response = await client.post(url, json=payload, headers={"Authorization": f"Bearer {key}"})
             response.raise_for_status()
             return response.json()["choices"][0]["message"]["content"]
