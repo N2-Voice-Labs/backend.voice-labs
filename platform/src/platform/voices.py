@@ -69,7 +69,11 @@ class VoiceBase(BaseModel):
 
 class VoiceIn(VoiceBase):
     tts_provider_id: UUID
-    provider_voice_id: str = Field(min_length=1, max_length=200)
+    provider_voice_id: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9_-]+$"
+    )
 
 
 class VoiceCloneIn(VoiceBase):
@@ -97,7 +101,12 @@ class VoicePatch(BaseModel):
 
 class VoiceStatusIn(BaseModel):
     status: VoiceStatus
-    provider_voice_id: str | None = Field(default=None, min_length=1, max_length=200)
+    provider_voice_id: str | None = Field(
+    default=None,
+    min_length=1,
+    max_length=128,
+    pattern=r"^[A-Za-z0-9_-]+$"
+)
     failure_reason: str | None = None
 
 
