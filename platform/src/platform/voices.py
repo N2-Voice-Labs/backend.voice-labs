@@ -70,10 +70,10 @@ class VoiceBase(BaseModel):
 class VoiceIn(VoiceBase):
     tts_provider_id: UUID
     provider_voice_id: str = Field(
-    min_length=1,
-    max_length=128,
-    pattern=r"^[A-Za-z0-9_-]+$"
-)
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9_-]+$"
+    )
 
 
 class VoiceCloneIn(VoiceBase):
