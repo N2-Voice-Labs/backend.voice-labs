@@ -1,3 +1,5 @@
+import asyncio
+
 import httpx
 import pytest
 from fastapi.testclient import TestClient
@@ -9,6 +11,8 @@ KEY = "cartesia-secret-key"
 URL = "https://samples.example.com/me.wav"
 BODY = {"provider": "cartesia", "name": "My voice", "language": "en", "sample_url": URL}
 PUBLIC_IP = "93.184.216.34"
+EL_KEY = "xi-secret-key"
+EL_BODY = {**BODY, "provider": "elevenlabs"}
 
 
 class FakeStream:
@@ -31,9 +35,10 @@ class FakeStream:
 
 
 class FakePostResponse:
-    def __init__(self, status=200, payload=None):
+    def __init__(self, status=200, payload=None, error_body=None):
         self.status_code = status
         self._payload = {"id": "voice-123"} if payload is None else payload
+        self._error_body = error_body
 
     def raise_for_status(self):
         if self.status_code >= 400:
@@ -41,7 +46,9 @@ class FakePostResponse:
             raise httpx.HTTPStatusError(
                 f"upstream body {KEY}",
                 request=request,
-                response=httpx.Response(self.status_code, request=request),
+                response=httpx.Response(
+                    self.status_code, request=request, json=self._error_body
+                ),
             )
 
     def json(self):
@@ -86,6 +93,7 @@ def install(monkeypatch, streams=None, post=None, post_error=None, resolve=None)
 def env(monkeypatch):
     monkeypatch.setenv("RUNTIME_PLATFORM_TOKEN", "clone-token")
     monkeypatch.setenv("CARTESIA_API_KEY", KEY)
+    monkeypatch.setenv("ELEVENLABS_API_KEY", EL_KEY)
 
 
 def post(body=BODY, headers=TOKEN):
@@ -127,7 +135,10 @@ def test_clone_success_downloads_then_uploads(monkeypatch) -> None:
     stream = next(c for c in calls if "stream" in c)
     # Connects to the validated IP, keeping the hostname for Host header and TLS SNI.
     assert stream["stream"] == ("GET", f"https://{PUBLIC_IP}/me.wav")
-    assert stream["kwargs"]["headers"] == {"Host": "samples.example.com"}
+    assert stream["kwargs"]["headers"] == {
+        "User-Agent": "VoiceLabs/1.0 (voice sample fetch)",
+        "Host": "samples.example.com",
+    }
     assert stream["kwargs"]["extensions"] == {"sni_hostname": "samples.example.com"}
     assert {"client": {"timeout": 20.0, "follow_redirects": False}} in calls
     upload = next(c for c in calls if "post" in c)
@@ -366,3 +377,194 @@ def test_pinned_request_real_httpx_transport_targets_ip() -> None:
     assert request.url.host == PUBLIC_IP
     assert request.headers["host"] == "samples.example.com"
     assert request.extensions["sni_hostname"] == "samples.example.com"
+
+
+# -- User-Agent on sample downloads -------------------------------------------------------
+
+
+def test_sample_download_sends_user_agent(monkeypatch) -> None:
+    calls = install(monkeypatch)
+    assert post().status_code == 200
+    stream = next(c for c in calls if "stream" in c)
+    assert stream["kwargs"]["headers"]["User-Agent"] == "VoiceLabs/1.0 (voice sample fetch)"
+    assert stream["kwargs"]["headers"]["Host"] == "samples.example.com"
+
+
+# -- plan errors --------------------------------------------------------------------------
+
+
+def test_cartesia_402_is_plan_upgrade_required(monkeypatch) -> None:
+    install(monkeypatch, post=FakePostResponse(402, error_body={"error": f"pay {KEY}"}))
+    response = post()
+    assert response.status_code == 502
+    assert response.json() == {"detail": "clone_plan_upgrade_required"}
+    assert KEY not in response.text
+
+
+def test_plan_required_is_a_clone_provider_error() -> None:
+    assert issubclass(voice_cloning.ClonePlanRequired, voice_cloning.CloneProviderError)
+
+
+# -- ElevenLabs ---------------------------------------------------------------------------
+
+REAL_CLIENT = httpx.AsyncClient
+
+
+def mock_transport(monkeypatch, handler):
+    requests: list[httpx.Request] = []
+
+    def recording(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return handler(request)
+
+    def factory(**kwargs):
+        return REAL_CLIENT(transport=httpx.MockTransport(recording), **kwargs)
+
+    monkeypatch.setattr("src.runtime.voice_cloning.httpx.AsyncClient", factory)
+    return requests
+
+
+def eleven_clone(description="calm"):
+    return asyncio.run(
+        voice_cloning.clone_voice(
+            provider="elevenlabs",
+            api_key=EL_KEY,
+            name="My voice",
+            language="en",
+            sample=b"RIFFaudio",
+            content_type="audio/wav",
+            filename="me.wav",
+            description=description,
+        )
+    )
+
+
+def test_elevenlabs_clone_request_shape_and_result(monkeypatch) -> None:
+    requests = mock_transport(
+        monkeypatch,
+        lambda r: httpx.Response(200, json={"voice_id": "el-voice-1", "requires_verification": False}),
+    )
+    assert eleven_clone() == "el-voice-1"
+    (request,) = requests
+    assert request.method == "POST"
+    assert str(request.url) == "https://api.elevenlabs.io/v1/voices/add"
+    assert request.headers["xi-api-key"] == EL_KEY
+    assert request.headers["content-type"].startswith("multipart/form-data; boundary=")
+    body = request.read()
+    assert b'name="name"\r\n\r\nMy voice' in body
+    assert b'name="description"\r\n\r\ncalm' in body
+    assert b'name="files"; filename="me.wav"' in body
+    assert b"Content-Type: audio/wav" in body
+    assert b"RIFFaudio" in body
+    assert b'name="language"' not in body  # not an IVC field
+
+
+def test_elevenlabs_clone_omits_empty_description(monkeypatch) -> None:
+    requests = mock_transport(monkeypatch, lambda r: httpx.Response(200, json={"voice_id": "v"}))
+    eleven_clone(description=None)
+    assert b'name="description"' not in requests[0].read()
+
+
+def test_elevenlabs_clone_via_api_success(monkeypatch) -> None:
+    calls = install(monkeypatch, post=FakePostResponse(200, {"voice_id": "el-voice-1"}))
+    response = post(EL_BODY)
+    assert response.status_code == 200
+    assert response.json() == {"provider_voice_id": "el-voice-1"}
+    upload = next(c for c in calls if "post" in c)
+    assert upload["post"] == "https://api.elevenlabs.io/v1/voices/add"
+    assert upload["headers"] == {"xi-api-key": EL_KEY}
+    assert upload["data"] == {"name": "My voice"}
+    assert upload["files"]["files"] == ("me.wav", b"RIFFaudio", "audio/wav")
+
+
+def test_elevenlabs_clone_requires_its_own_key(monkeypatch) -> None:
+    install(monkeypatch)
+    monkeypatch.delenv("ELEVENLABS_API_KEY")
+    response = post(EL_BODY)
+    assert response.status_code == 503
+    assert response.json() == {"detail": "tts_not_configured"}
+    # the other provider's key is not used as a substitute
+    assert post().status_code == 200
+
+
+def test_elevenlabs_402_is_plan_upgrade_required(monkeypatch) -> None:
+    install(monkeypatch, post=FakePostResponse(402))
+    response = post(EL_BODY)
+    assert response.status_code == 502
+    assert response.json() == {"detail": "clone_plan_upgrade_required"}
+
+
+@pytest.mark.parametrize("status", [401, 403])
+@pytest.mark.parametrize(
+    "error_body",
+    [
+        {"detail": {"status": "can_not_use_instant_voice_cloning", "message": "nope"}},
+        {"detail": {"status": "forbidden", "message": "Your subscription plan does not allow voice cloning."}},
+        {"detail": "Instant voice cloning requires a paid subscription"},
+    ],
+)
+def test_elevenlabs_plan_blocked_auth_errors_map_to_plan_required(
+    monkeypatch, status, error_body
+) -> None:
+    install(monkeypatch, post=FakePostResponse(status, error_body=error_body))
+    response = post(EL_BODY)
+    assert response.status_code == 502
+    assert response.json() == {"detail": "clone_plan_upgrade_required"}
+    assert EL_KEY not in response.text
+
+
+@pytest.mark.parametrize(
+    ("status", "error_body"),
+    [
+        (401, {"detail": {"status": "invalid_api_key", "message": "Invalid API key"}}),
+        (401, None),
+        (403, {"detail": "forbidden"}),
+        (403, ["not", "a", "dict"]),
+        (400, {"detail": {"status": "can_not_use_instant_voice_cloning"}}),
+        (422, {"detail": [{"loc": ["body"], "msg": "bad", "type": "x"}]}),
+        (429, None),
+        (500, None),
+    ],
+)
+def test_elevenlabs_other_errors_are_clone_provider_error(monkeypatch, status, error_body) -> None:
+    install(monkeypatch, post=FakePostResponse(status, error_body=error_body))
+    response = post(EL_BODY)
+    assert response.status_code == 502
+    assert response.json() == {"detail": "clone_provider_error"}
+    assert EL_KEY not in response.text
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"post": FakePostResponse(200, {"id": "wrong-field"})},
+        {"post": FakePostResponse(200, ["x"])},
+        {"post_error": httpx.ReadTimeout("boom")},
+    ],
+)
+def test_elevenlabs_bad_success_or_transport_error(monkeypatch, kwargs) -> None:
+    install(monkeypatch, **kwargs)
+    response = post(EL_BODY)
+    assert response.status_code == 502
+    assert response.json() == {"detail": "clone_provider_error"}
+
+
+def test_elevenlabs_error_messages_are_safe_to_log(monkeypatch) -> None:
+    mock_transport(
+        monkeypatch,
+        lambda r: httpx.Response(403, json={"detail": {"message": f"plan {EL_KEY} upstream blocks cloning"}}),
+    )
+    with pytest.raises(voice_cloning.ClonePlanRequired) as caught:
+        eleven_clone()
+    assert EL_KEY not in str(caught.value) and "upstream" not in str(caught.value)
+    assert caught.value.__cause__ is None and caught.value.__suppress_context__
+
+
+def test_clone_voice_unknown_provider_raises() -> None:
+    with pytest.raises(voice_cloning.UnknownVoiceProvider):
+        asyncio.run(
+            voice_cloning.clone_voice(
+                provider="nope", api_key="k", name="n", language="en",
+                sample=b"x", content_type="audio/wav", filename="a.wav",
+            )
+        )

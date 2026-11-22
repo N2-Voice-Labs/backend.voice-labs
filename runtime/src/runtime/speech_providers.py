@@ -23,6 +23,7 @@ keyword arguments for the service constructor (e.g. ``transport_destination``).
 
 from __future__ import annotations
 
+import logging
 import os
 from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
@@ -31,6 +32,8 @@ from .capabilities import ProviderCapabilities, ProviderKind
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .pipeline import PipelineConfig
+
+logger = logging.getLogger(__name__)
 
 STTFactory = Callable[..., Any]  # (config, settings[, keyterms=]) -> pipecat STT service
 LLMFactory = Callable[..., Any]  # (config, settings) -> pipecat LLM service
@@ -489,10 +492,20 @@ def _elevenlabs_tts(config: "PipelineConfig", settings: dict[str, Any], **extra:
     from .voice_cloning import PROVIDER_VOICE_ID_PATTERN
 
     settings.setdefault("model", ELEVENLABS_DEFAULT_MODEL)
-    settings["voice"] = config.tts_voice_id
+    voice = config.tts_voice_id
     # Pipecat interpolates the voice id unescaped into the WebSocket URL path.
-    if not re.fullmatch(PROVIDER_VOICE_ID_PATTERN, settings["voice"] or ""):
-        raise RuntimeError("invalid elevenlabs voice id")
+    if not re.fullmatch(PROVIDER_VOICE_ID_PATTERN, voice or ""):
+        # A missing or unusable voice id (e.g. a stale cloned voice) falls back to the
+        # deployment's stock voice (ELEVENLABS_VOICE_ID) instead of failing the session.
+        default = os.getenv("ELEVENLABS_VOICE_ID") or ""
+        if not re.fullmatch(PROVIDER_VOICE_ID_PATTERN, default):
+            raise RuntimeError("invalid elevenlabs voice id")
+        logger.warning(
+            "elevenlabs voice id is %s; falling back to the default voice",
+            "missing" if not voice else "invalid",
+        )
+        voice = default
+    settings["voice"] = voice
     service_class = _elevenlabs_service_class()
     return service_class(
         api_key=config.tts_api_key,

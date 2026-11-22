@@ -8,6 +8,7 @@ from src.runtime import api, voice_cloning
 
 TOKEN = {"X-Runtime-Token": "delete-token"}
 KEY = "cartesia-secret-key"
+EL_KEY = "xi-secret-key"
 VOICE_ID = "a1b2c3d4-0000-4000-8000-123456789abc"
 REAL_CLIENT = httpx.AsyncClient
 
@@ -31,6 +32,7 @@ def install(monkeypatch, handler):
 def env(monkeypatch):
     monkeypatch.setenv("RUNTIME_PLATFORM_TOKEN", "delete-token")
     monkeypatch.setenv("CARTESIA_API_KEY", KEY)
+    monkeypatch.setenv("ELEVENLABS_API_KEY", EL_KEY)
 
 
 def delete(provider="cartesia", voice_id=VOICE_ID, headers=TOKEN):
@@ -90,7 +92,7 @@ def test_delete_timeout_or_transport_error_is_retryable(monkeypatch, error) -> N
 
 def test_delete_unknown_provider(monkeypatch) -> None:
     requests = install(monkeypatch, lambda r: httpx.Response(200))
-    response = delete(provider="elevenlabs")
+    response = delete(provider="nope")
     assert response.status_code == 404
     assert response.json() == {"code": "unknown_provider"}
     assert requests == []
@@ -143,3 +145,63 @@ def test_delete_without_api_key_is_503(monkeypatch) -> None:
 def test_delete_voice_unknown_provider_raises() -> None:
     with pytest.raises(voice_cloning.UnknownVoiceProvider):
         asyncio.run(voice_cloning.delete_voice("nope", VOICE_ID, api_key=KEY))
+
+
+# -- ElevenLabs ---------------------------------------------------------------------------
+
+
+def test_elevenlabs_delete_calls_provider_and_returns_204(monkeypatch) -> None:
+    requests = install(monkeypatch, lambda r: httpx.Response(200, json={"status": "ok"}))
+    response = delete(provider="elevenlabs")
+    assert response.status_code == 204
+    assert response.content == b""
+    (request,) = requests
+    assert request.method == "DELETE"
+    assert str(request.url) == f"https://api.elevenlabs.io/v1/voices/{VOICE_ID}"
+    assert request.headers["xi-api-key"] == EL_KEY
+    assert "x-api-key" not in request.headers
+
+
+def test_elevenlabs_delete_404_is_success(monkeypatch) -> None:
+    install(monkeypatch, lambda r: httpx.Response(404, text="voice not found"))
+    response = delete(provider="elevenlabs")
+    assert response.status_code == 204
+    assert response.content == b""
+
+
+@pytest.mark.parametrize(
+    ("status_code", "retryable"),
+    [(401, False), (403, False), (400, False), (422, False), (500, True), (503, True), (429, True), (408, True)],
+)
+def test_elevenlabs_delete_errors_match_cartesia_classification(
+    monkeypatch, status_code, retryable
+) -> None:
+    install(monkeypatch, lambda r: httpx.Response(status_code, text=f"upstream body {EL_KEY}"))
+    response = delete(provider="elevenlabs")
+    assert response.status_code == 502
+    assert response.json() == {"code": "voice_provider_delete_failed", "retryable": retryable}
+    assert EL_KEY not in response.text and "upstream" not in response.text
+
+
+@pytest.mark.parametrize("error", [httpx.ReadTimeout("slow"), httpx.ConnectError("down")])
+def test_elevenlabs_delete_transport_error_is_retryable(monkeypatch, error) -> None:
+    def boom(request):
+        raise error
+
+    install(monkeypatch, boom)
+    response = delete(provider="elevenlabs")
+    assert response.status_code == 502
+    assert response.json() == {"code": "voice_provider_delete_failed", "retryable": True}
+
+
+def test_elevenlabs_delete_without_api_key_is_503(monkeypatch) -> None:
+    monkeypatch.delenv("ELEVENLABS_API_KEY")
+    requests = install(monkeypatch, lambda r: httpx.Response(200))
+    assert delete(provider="elevenlabs").status_code == 503
+    assert requests == []
+
+
+def test_supports_voice_delete_lists_both_providers() -> None:
+    assert voice_cloning.supports_voice_delete("elevenlabs")
+    assert voice_cloning.supports_voice_delete("cartesia")
+    assert not voice_cloning.supports_voice_delete("nope")

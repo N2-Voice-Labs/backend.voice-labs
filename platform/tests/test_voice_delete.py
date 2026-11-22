@@ -19,7 +19,7 @@ from sqlalchemy import create_engine, inspect, text
 from src.platform import auth, storage
 from src.platform.db import Base, SessionLocal, engine
 from src.platform.main import app
-from src.platform.models import ApiKey, AuditLog, Organization, Voice
+from src.platform.models import ApiKey, AuditLog, Organization, Voice, VoiceSession
 from src.platform.organizations import ensure_default_org
 
 SUPER_KEY = "voice-delete-super"
@@ -345,7 +345,10 @@ def test_other_orgs_agent_does_not_block_nor_leak(client, world, runtime):
     assert client.delete(f"/voices/{voice_id}", headers=hdr(world["a"])).status_code == 204
 
 
-def test_session_with_deleted_voice_is_unavailable(client, world, runtime):
+def test_session_with_deleted_voice_falls_back_to_default_voice(
+    client, world, runtime, caplog, monkeypatch
+):
+    monkeypatch.delenv("RUNTIME_API_URL")  # store the contract without a live Runtime
     voice_id = seed_voice(world["a_id"], source="library", consent=None, sample_reference=None)
     agent = make_agent(client, hdr(world["a"]), voice_profile_id=voice_id)
     client.delete(f"/agents/{agent['id']}", headers=hdr(world["a"]))
@@ -358,8 +361,13 @@ def test_session_with_deleted_voice_is_unavailable(client, world, runtime):
     session = client.post(
         "/voice/sessions", json={"agent_id": agent["id"]}, headers=hdr(world["a"])
     )
-    assert session.status_code == 409
-    assert session.json()["detail"] == "selected_voice_unavailable"
+    # The agent's voice died after it was attached: the session starts with Runtime's
+    # default voice (no voice id) instead of failing or sending a dead id.
+    assert session.status_code == 201, session.text
+    with SessionLocal() as db:
+        contract = db.get(VoiceSession, session.json()["session_id"]).runtime_contract
+    assert contract["voice_id"] is None
+    assert "falling back to the default voice" in caplog.text
 
 
 def test_delete_is_idempotent(client, world, runtime):

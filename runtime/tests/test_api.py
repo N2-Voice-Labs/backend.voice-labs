@@ -413,3 +413,224 @@ def test_shutdown_is_bounded_when_a_session_will_not_stop(
             api._active_sessions.pop(key, None)
 
     asyncio.run(asyncio.wait_for(scenario(), 3))
+
+
+# -- POST /voices/clone-upload ----------------------------------------------------------------
+
+UPLOAD_TOKEN = {"X-Runtime-Token": "upload-token"}
+UPLOAD_FIELDS = {"provider": "elevenlabs", "name": "Anna", "language": "en"}
+
+
+@pytest.fixture
+def upload_env(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("RUNTIME_PLATFORM_TOKEN", "upload-token")
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "el-key")
+    monkeypatch.setenv("CARTESIA_API_KEY", "ct-key")
+    calls: list[dict] = []
+
+    async def fake_clone(**kwargs):
+        calls.append(kwargs)
+        if kwargs.get("fail") is not None:
+            raise kwargs["fail"]
+        return "provider-voice-1"
+
+    monkeypatch.setattr(api, "clone_voice", fake_clone)
+    return calls
+
+
+def upload(
+    fields=None,
+    *,
+    content=b"RIFFaudio",
+    content_type="audio/webm;codecs=opus",
+    filename="rec.webm",
+    headers=UPLOAD_TOKEN,
+    with_file=True,
+):
+    files = {"file": (filename, content, content_type)} if with_file else None
+    with TestClient(api.app) as client:
+        return client.post(
+            "/voices/clone-upload",
+            data={**UPLOAD_FIELDS, **(fields or {})},
+            files=files,
+            headers=headers,
+        )
+
+
+def test_clone_upload_success_forwards_bytes_without_storing(upload_env) -> None:
+    response = upload({"description": "calm"})
+    assert response.status_code == 200
+    assert response.json() == {"provider_voice_id": "provider-voice-1"}
+    (call,) = upload_env
+    assert call == {
+        "provider": "elevenlabs",
+        "api_key": "el-key",
+        "name": "Anna",
+        "language": "en",
+        "sample": b"RIFFaudio",
+        "content_type": "audio/webm",
+        "filename": "rec.webm",
+        "description": "calm",
+    }
+
+
+def test_clone_upload_cartesia_uses_its_own_key_and_octet_stream_is_accepted(upload_env) -> None:
+    response = upload({"provider": "cartesia"}, content_type="application/octet-stream")
+    assert response.status_code == 200
+    assert upload_env[0]["provider"] == "cartesia"
+    assert upload_env[0]["api_key"] == "ct-key"
+    assert upload_env[0]["description"] is None
+
+
+@pytest.mark.parametrize("headers", [{}, {"X-Runtime-Token": "wrong"}])
+def test_clone_upload_requires_runtime_token(upload_env, headers) -> None:
+    response = upload(headers=headers)
+    assert response.status_code == 401
+    assert response.json() == {"detail": "invalid_runtime_token"}
+    assert upload_env == []
+
+
+def test_clone_upload_fails_closed_without_configured_token(upload_env, monkeypatch) -> None:
+    monkeypatch.delenv("RUNTIME_PLATFORM_TOKEN")
+    assert upload().status_code == 401
+    assert upload_env == []
+
+
+def test_clone_upload_unknown_provider(upload_env) -> None:
+    response = upload({"provider": "other"})
+    assert response.status_code == 422
+    assert response.json() == {"detail": "unsupported_tts_provider"}
+    assert upload_env == []
+
+
+@pytest.mark.parametrize("provider", ["elevenlabs", "cartesia"])
+def test_clone_upload_missing_key(upload_env, monkeypatch, provider) -> None:
+    monkeypatch.delenv("ELEVENLABS_API_KEY" if provider == "elevenlabs" else "CARTESIA_API_KEY")
+    response = upload({"provider": provider})
+    assert response.status_code == 503
+    assert response.json() == {"detail": "tts_not_configured"}
+    assert upload_env == []
+
+
+def test_clone_upload_empty_file(upload_env) -> None:
+    response = upload(content=b"")
+    assert response.status_code == 422
+    assert response.json() == {"detail": "invalid_sample"}
+    assert upload_env == []
+
+
+def test_clone_upload_missing_file_part(upload_env) -> None:
+    response = upload(with_file=False)
+    assert response.status_code == 422
+    assert upload_env == []
+
+
+@pytest.mark.parametrize("content_type", ["text/plain", "application/json", "image/png", "video/webm"])
+def test_clone_upload_wrong_content_type(upload_env, content_type) -> None:
+    response = upload(content_type=content_type)
+    assert response.status_code == 422
+    assert response.json() == {"detail": "invalid_sample"}
+    assert upload_env == []
+
+
+def test_clone_upload_exactly_max_size_is_accepted(upload_env) -> None:
+    from src.runtime.voice_cloning import MAX_SAMPLE_BYTES
+
+    assert upload(content=b"a" * MAX_SAMPLE_BYTES).status_code == 200
+
+
+def test_clone_upload_oversized_is_rejected(upload_env) -> None:
+    from src.runtime.voice_cloning import MAX_SAMPLE_BYTES
+
+    response = upload(content=b"a" * (MAX_SAMPLE_BYTES + 1))
+    assert response.status_code == 422
+    assert response.json() == {"detail": "invalid_sample"}
+    assert upload_env == []
+
+
+def test_clone_upload_stream_is_cut_off_without_content_length(upload_env) -> None:
+    """The cap applies while streaming, so a body with no Content-Length stops early."""
+    from fastapi import HTTPException
+
+    from src.runtime.voice_cloning import MAX_SAMPLE_BYTES
+
+    consumed = 0
+
+    class FakeRequest:
+        headers: dict[str, str] = {}
+
+        async def stream(self):
+            nonlocal consumed
+            for _ in range(1000):  # ~64 MiB if fully consumed
+                consumed += 1
+                yield b"a" * 65536
+
+    async def drain():
+        async for _ in api._bounded_upload_stream(FakeRequest()):
+            pass
+
+    with pytest.raises(HTTPException) as caught:
+        asyncio.run(drain())
+    assert caught.value.status_code == 422 and caught.value.detail == "invalid_sample"
+    assert consumed * 65536 <= MAX_SAMPLE_BYTES + api._UPLOAD_OVERHEAD_BYTES + 65536
+
+
+def test_clone_upload_oversized_content_length_is_rejected_before_reading(upload_env) -> None:
+    """A declared Content-Length over the cap is refused without parsing the body."""
+    from src.runtime.voice_cloning import MAX_SAMPLE_BYTES
+
+    big = b"a" * (MAX_SAMPLE_BYTES + 1024 * 1024)
+    response = upload(content=big)
+    assert response.status_code == 422
+    assert response.json() == {"detail": "invalid_sample"}
+    assert upload_env == []
+
+
+def test_clone_upload_rejects_non_multipart_and_bad_fields(upload_env) -> None:
+    with TestClient(api.app) as client:
+        plain = client.post("/voices/clone-upload", json={}, headers=UPLOAD_TOKEN)
+    assert plain.status_code == 422
+    assert upload({"name": ""}).status_code == 422
+    assert upload({"name": "x" * 201}).status_code == 422
+    assert upload({"language": ""}).status_code == 422
+    assert upload_env == []
+
+
+@pytest.mark.parametrize(
+    ("error", "detail"),
+    [
+        (api.ClonePlanRequired("plan"), "clone_plan_upgrade_required"),
+        (api.CloneProviderError("boom"), "clone_provider_error"),
+    ],
+)
+def test_clone_upload_provider_errors(upload_env, monkeypatch, error, detail) -> None:
+    async def failing(**kwargs):
+        raise error
+
+    monkeypatch.setattr(api, "clone_voice", failing)
+    response = upload()
+    assert response.status_code == 502
+    assert response.json() == {"detail": detail}
+
+
+def test_clone_upload_end_to_end_against_mocked_elevenlabs(monkeypatch) -> None:
+    import httpx
+
+    monkeypatch.setenv("RUNTIME_PLATFORM_TOKEN", "upload-token")
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "el-key")
+    real = httpx.AsyncClient
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"voice_id": "el-1"})
+
+    monkeypatch.setattr(
+        "src.runtime.voice_cloning.httpx.AsyncClient",
+        lambda **kw: real(transport=httpx.MockTransport(handler), **kw),
+    )
+    response = upload(content=b"recorded-bytes")
+    assert response.status_code == 200
+    assert response.json() == {"provider_voice_id": "el-1"}
+    assert seen[0].headers["xi-api-key"] == "el-key"
+    assert b"recorded-bytes" in seen[0].read()
