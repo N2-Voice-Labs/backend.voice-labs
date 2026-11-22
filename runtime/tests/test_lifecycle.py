@@ -129,6 +129,7 @@ class RecordingClient:
 def run_session_with(monkeypatch, run, *, setup=None):
     """Run RuntimeSession.run_pipeline with a fake worker; ``run(session)`` is the pipeline."""
 
+    pytest.importorskip("pipecat")
     import pipecat.workers.runner
 
     import src.runtime.pipeline as pipeline
@@ -621,3 +622,16 @@ def test_max_duration_secs_is_part_of_the_start_contract() -> None:
     assert api.SessionStart(**base, max_duration_secs=600).model_dump(mode="json")["max_duration_secs"] == 600
     with pytest.raises(ValueError):
         api.SessionStart(**base, max_duration_secs=0)
+
+
+def test_pipeline_failure_is_logged_with_the_session_id(monkeypatch, caplog) -> None:
+    async def run(session):
+        raise ValueError("bad")
+
+    session, _, _, config = run_session_with(monkeypatch, run)
+    with caplog.at_level("ERROR", logger="src.runtime.session"):
+        with pytest.raises(ValueError):
+            asyncio.run(session.run_pipeline(config))
+
+    record = next(r for r in caplog.records if str(session.session_id) in r.getMessage())
+    assert record.exc_info and record.exc_info[0] is ValueError

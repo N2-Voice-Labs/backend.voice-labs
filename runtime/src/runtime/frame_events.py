@@ -1,5 +1,6 @@
 """Translate native Pipecat frames into the platform's versioned events."""
 
+import logging
 import math
 import time
 
@@ -24,6 +25,8 @@ from .session import RuntimeSession, SessionState
 from .timeline import TimelineTracker
 from .turn_debug import stt_confidence
 from .turn_ids import turn_state
+
+_logger = logging.getLogger(__name__)
 
 
 def latency_stage(processor_name: str) -> str:
@@ -208,4 +211,10 @@ class RuntimeEventProcessor(FrameProcessor):
         payload: dict[str, object] | None = None,
     ) -> None:
         if self._session.event_client:
-            self._session.enqueue_event(self._session.event(event_type, payload))
+            try:
+                self._session.enqueue_event(self._session.event(event_type, payload))
+            except RuntimeError:
+                # Event delivery is closed/failed: that must never stop the media frame.
+                _logger.warning(
+                    "Dropped %s event for session %s", event_type, self._session.session_id
+                )

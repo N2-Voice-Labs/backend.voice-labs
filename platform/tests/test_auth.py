@@ -183,6 +183,137 @@ def test_startup_warns_once_when_disabled(monkeypatch, caplog) -> None:
     assert sum("PLATFORM_API_KEYS is not set" in r.message for r in caplog.records) == 1
 
 
+# -- fail closed without keys ------------------------------------------------------------
+
+
+@pytest.fixture
+def closed(monkeypatch):
+    """No admin keys and no ``PLATFORM_AUTH_DISABLED``: the API must refuse, not open up."""
+
+    monkeypatch.delenv("PLATFORM_API_KEYS", raising=False)
+    monkeypatch.delenv("PLATFORM_AUTH_DISABLED", raising=False)
+    monkeypatch.delenv("RUNTIME_API_URL", raising=False)
+    with TestClient(app) as test_client:
+        yield test_client
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [{}, {"Authorization": "Bearer anything"}, {"Authorization": "Basic abc"}, {"X-Organization-Id": "x"}],
+)
+def test_no_keys_and_no_flag_is_401_auth_not_configured(closed, headers) -> None:
+    for method, path in (("GET", "/agents"), ("POST", "/voice/sessions"), ("GET", "/organizations")):
+        response = closed.request(method, path, headers=headers)
+        assert response.status_code == 401, (method, path, response.text)
+        assert response.json() == {"detail": "auth_not_configured"}
+
+
+def test_no_keys_and_no_flag_leaves_public_routes_and_session_tokens_working(
+    closed, monkeypatch
+) -> None:
+    assert closed.get("/health").status_code == 200
+    # Public routes keep their own gates (feature flags), not the admin check.
+    monkeypatch.delenv("PLATFORM_PUBLIC_CALLS", raising=False)
+    monkeypatch.delenv("PLATFORM_DEMO_AGENTS", raising=False)
+    assert closed.post("/calls", json={"languages": ["en", "ko"]}).json() == {"detail": "calls_disabled"}
+    assert closed.get("/demo/agents/x").json() == {"detail": "demo_disabled"}
+    # Runtime callbacks reach their own X-Runtime-Token check, not the admin one.
+    assert closed.post("/runtime/events", json={}).json() != {"detail": "auth_not_configured"}
+    # A session token still opens its own session (made while auth was explicitly off).
+    monkeypatch.setenv("PLATFORM_AUTH_DISABLED", "1")
+    agent = make_interpreter_agent_dev(closed)
+    session = closed.post(
+        "/voice/sessions", json={"agent_id": agent["id"], "participant": {"language": "en"}}
+    ).json()
+    monkeypatch.delenv("PLATFORM_AUTH_DISABLED")
+    token = bearer(session["session_token"])
+    assert closed.get(f"/voice/sessions/{session['session_id']}", headers=token).status_code == 200
+    assert closed.get("/agents", headers=token).json() == {"detail": "forbidden"}  # not an admin credential
+    assert closed.get(f"/voice/sessions/{uuid4()}", headers=token).status_code == 403
+
+
+def make_interpreter_agent_dev(client: TestClient) -> dict:
+    return client.post(
+        "/agents",
+        json={
+            "name": f"interp-{uuid4()}",
+            "mode": "interpreter",
+            "interpreter": {"languages": ["en", "ko"], "direction": "one_way"},
+        },
+    ).json()
+
+
+def test_flag_alone_does_not_override_configured_keys(client, monkeypatch) -> None:
+    monkeypatch.setenv("PLATFORM_AUTH_DISABLED", "1")
+    assert client.get("/agents").status_code == 401
+    assert client.get("/agents", headers=ADMIN).status_code == 200
+
+
+def test_startup_warns_when_keys_missing_and_auth_not_disabled(monkeypatch, caplog) -> None:
+    monkeypatch.delenv("PLATFORM_API_KEYS", raising=False)
+    monkeypatch.delenv("PLATFORM_AUTH_DISABLED", raising=False)
+    with caplog.at_level("WARNING", logger="src.platform.auth"):
+        with TestClient(app):
+            pass
+    messages = [r.message for r in caplog.records if r.name == "src.platform.auth"]
+    assert len(messages) == 1 and "auth_not_configured" in messages[0]
+
+
+def test_dev_principal_is_superadmin_only_while_auth_is_disabled(monkeypatch) -> None:
+    from fastapi import HTTPException
+
+    from src.platform import organizations, voices
+    from src.platform.context import AuthContext, is_superadmin
+
+    dev = AuthContext(org_id="o", principal="dev", role="owner")
+    root = AuthContext(org_id="o", principal="superadmin", role="owner")
+    monkeypatch.setenv("PLATFORM_AUTH_DISABLED", "1")
+    assert is_superadmin(dev) and voices.require_superadmin(dev) is dev
+    assert organizations._is_superadmin(dev)
+    monkeypatch.delenv("PLATFORM_AUTH_DISABLED")
+    assert not is_superadmin(dev) and is_superadmin(root)
+    with pytest.raises(HTTPException) as refused:
+        voices.require_superadmin(dev)
+    assert refused.value.status_code == 403
+    assert not organizations._is_superadmin(dev)
+    assert voices.require_superadmin(root) is root
+
+
+# -- X-Request-Id ------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("value", ["req-1.2_3", "a" * 64])
+def test_valid_request_id_is_echoed(client, value) -> None:
+    response = client.get("/agents", headers={**ADMIN, "X-Request-Id": value})
+    assert response.headers["x-request-id"] == value
+
+
+@pytest.mark.parametrize("value", ["a" * 65, "has space", "semi;colon", "x" * 200])
+def test_invalid_request_id_is_replaced(client, value) -> None:
+    response = client.get("/agents", headers={**ADMIN, "X-Request-Id": value})
+    echoed = response.headers["x-request-id"]
+    assert echoed != value and len(echoed) == 36  # a fresh uuid
+
+
+def test_missing_request_id_is_generated(client) -> None:
+    assert len(client.get("/agents", headers=ADMIN).headers["x-request-id"]) == 36
+
+
+# -- phone dialling is not for session tokens ----------------------------------------------
+
+
+def test_session_token_cannot_dial_a_phone_but_an_api_key_can(client, monkeypatch) -> None:
+    monkeypatch.delenv("LIVEKIT_SIP_TRUNK_ID", raising=False)
+    session = make_session(client)
+    url = f"/voice/sessions/{session['session_id']}/phone-participants"
+    body = {"language": "ko", "phone_number": "+821012345678"}
+    refused = client.post(url, json=body, headers=bearer(session["session_token"]))
+    assert (refused.status_code, refused.json()) == (403, {"detail": "forbidden"})
+    # The admin key gets past authorisation (and stops later, at the missing trunk).
+    allowed = client.post(url, json=body, headers=ADMIN)
+    assert (allowed.status_code, allowed.json()["detail"]) == (409, "sip_not_configured")
+
+
 # -- session tokens ----------------------------------------------------------------------
 
 

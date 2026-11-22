@@ -1,6 +1,7 @@
 """Voice session routes: create, participants, phone participants, runtime handoff."""
 
 import hashlib
+import logging
 import os
 from typing import Any
 from uuid import UUID, uuid4
@@ -21,6 +22,7 @@ from .livekit import (
     listen_room_name,
     phone_room_name,
     private_listening_enabled,
+    public_livekit_url,
 )
 from .knowledge import agent_knowledge_text
 from .models import Agent as AgentRecord
@@ -39,6 +41,7 @@ from .models import (
 from .tenancy import get_owned, get_public_agent, get_scoped_db, scoped
 from .validation import validate_e164
 
+_logger = logging.getLogger(__name__)
 router = APIRouter()
 
 RUNTIME_PROVIDER_SETTINGS = {
@@ -147,6 +150,39 @@ def ready_voice(db: Session, ctx: AuthContext, voice_id: str) -> Voice:
     return voice
 
 
+# Agent voice statuses that never come back on their own: the voice is gone or its
+# provisioning failed. Sessions fall back to Runtime's default voice for these. A
+# pending/processing/disabled voice may still be (re)enabled by an admin, so an agent
+# pointing at one keeps getting an explicit 409 rather than a silently different voice.
+DEAD_VOICE_STATUSES = {"deleted", "deleting", "failed"}
+
+
+def usable_agent_voice(db: Session, ctx: AuthContext, voice_id: str) -> Voice | None:
+    """The agent's attached voice profile, or ``None`` when it died after being attached.
+
+    An agent's voice can become permanently unusable after it was attached (deleted, or
+    provisioning failed, or ``ready`` without a provider id). The session then omits the
+    voice id so Runtime speaks with its default voice, and a warning is logged; the
+    session still starts. Every other unusable state (pending, processing, disabled) and
+    any id that is not a voice of this organisation (another org's, or never existing)
+    stays a 409 ``selected_voice_unavailable``, so a foreign id remains indistinguishable
+    from a missing one.
+    """
+
+    voice = db.scalars(scoped(db, ctx, Voice).where(Voice.id == str(voice_id))).first()
+    if voice is not None and (
+        voice.status in DEAD_VOICE_STATUSES
+        or (voice.status == "ready" and not voice.provider_voice_id)
+    ):
+        _logger.warning(
+            "agent voice profile %s is unusable (status=%s); falling back to the default voice",
+            voice_id,
+            voice.status,
+        )
+        return None
+    return ready_voice(db, ctx, voice_id)
+
+
 def assert_voice_matches_tts(
     db: Session, ctx: AuthContext, voice: Voice, tts_provider: str | None
 ) -> None:
@@ -230,7 +266,7 @@ def participant_connection(
     """
 
     connection: dict[str, Any] = {
-        "url": os.getenv("LIVEKIT_URL", ""),
+        "url": public_livekit_url(),
         "token": (
             create_participant_token(room_name, identity, can_subscribe=not private)
             if configured
@@ -372,9 +408,12 @@ async def open_voice_session(
     runtime_voice_id = agent.voice_id
     used_voices: dict[str, Voice] = {}
     if agent.voice_profile_id:
-        voice = ready_voice(db, ctx, agent.voice_profile_id)
-        runtime_voice_id = voice.provider_voice_id
-        used_voices[voice.id] = voice
+        voice = usable_agent_voice(db, ctx, agent.voice_profile_id)
+        if voice is None:
+            runtime_voice_id = None  # Runtime's default voice, not the dead profile's id
+        else:
+            runtime_voice_id = voice.provider_voice_id
+            used_voices[voice.id] = voice
     if participant is not None and participant.voice_profile_id is not None:
         # Already validated by participant_entry; loaded again only to audit its use.
         voice = ready_voice(db, ctx, str(participant.voice_profile_id))
@@ -783,7 +822,9 @@ async def withdraw_runtime_participant(session_id: str, identity: str) -> None:
 async def add_voice_session_phone_participant(
     session_id: UUID,
     payload: PhoneParticipantIn,
-    ctx: AuthContext = Depends(member_or_session),
+    # Dialling costs money and reaches any number: never a session token (the anonymous
+    # creator of a public call holds one), only an org principal with a member+ role.
+    ctx: AuthContext = Depends(require("member")),
     db: Session = Depends(get_scoped_db),
 ) -> dict[str, Any]:
     """Dial the second person of a two-person interpreter call by phone.
@@ -820,6 +861,7 @@ async def add_voice_session_phone_participant(
     dial_room = (
         phone_room_name(session.room_name, identity) if private else session.room_name
     )
+    limits.check_dial_rate(ctx)
 
     await notify_runtime_participant(session.id, identity, entry)
     try:

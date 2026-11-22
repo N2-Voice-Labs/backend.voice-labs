@@ -1,20 +1,31 @@
-"""Consent-gated voice cloning: fetch a consented sample and register it at Cartesia.
+"""Consent-gated voice cloning: fetch a consented sample and register it at the provider.
 
-The Platform never touches audio; it only sends the sample URL. This module downloads the
-sample (https only, no private network targets) and uploads it to Cartesia's clone API.
-Verified against https://docs.cartesia.ai/api-reference/voices/clone :
+The Platform never touches audio; it sends either a sample URL (downloaded here: https only,
+no private network targets) or, for browser recordings, the bytes themselves (never stored).
+Providers: ``cartesia`` and ``elevenlabs``.
+
+Cartesia, verified against https://docs.cartesia.ai/api-reference/voices/clone :
 ``POST https://api.cartesia.ai/voices/clone`` multipart form with ``clip`` (file, <=16 MB),
 ``name``, ``language`` (ISO 639-1), optional ``description``; response JSON ``{"id": ...}``.
+
+ElevenLabs Instant Voice Cloning, checked against
+https://elevenlabs.io/docs/api-reference/voices/ivc/create :
+``POST https://api.elevenlabs.io/v1/voices/add`` multipart form with ``name``, optional
+``description`` and ``files`` (one or more audio files); response JSON ``{"voice_id": ...}``.
+The auth header ``xi-api-key`` is not on that page (it is ElevenLabs' standard header). The
+plan-restriction 401/403 body shape is not documented there either; see
+``_elevenlabs_plan_blocked``. Neither provider's request was exercised against the real API.
 """
 
-import asyncio
-import ipaddress
-import socket
 from urllib.parse import urljoin, urlsplit
 
 import httpx
 
+from . import net_guard
+
 CARTESIA_BASE_URL = "https://api.cartesia.ai"
+ELEVENLABS_BASE_URL = "https://api.elevenlabs.io"
+SAMPLE_USER_AGENT = "VoiceLabs/1.0 (voice sample fetch)"
 # The clone endpoint documents a single supported version value (2026-08-14); the TTS
 # preview/live path uses 2026-03-01. Change here if Cartesia rejects it.
 CLONE_CARTESIA_VERSION = "2026-08-14"
@@ -34,30 +45,23 @@ class SampleUnavailable(Exception):
 
 
 class CloneProviderError(Exception):
-    """Cartesia call failed. The message is safe to log (no key, no upstream body)."""
+    """Provider clone call failed. The message is safe to log (no key, no upstream body)."""
+
+
+class ClonePlanRequired(CloneProviderError):
+    """The provider account's plan does not include voice cloning (HTTP 402, or an
+    ElevenLabs 401/403 that says so)."""
 
 
 async def _resolve_host(host: str) -> list[str]:
-    loop = asyncio.get_running_loop()
     try:
-        infos = await loop.getaddrinfo(host, None, type=socket.SOCK_STREAM)
-    except OSError as exc:
+        return await net_guard.resolve_host(host)
+    except net_guard.HostUnresolvable as exc:
         raise SampleUnavailable("sample host did not resolve") from exc
-    return sorted({info[4][0] for info in infos})
 
 
-def _is_public(address: str) -> bool:
-    try:
-        ip = ipaddress.ip_address(address.split("%", 1)[0])
-    except ValueError:
-        return False
-    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
-        ip = ip.ipv4_mapped
-    # is_global is False for private, loopback, link-local, reserved, unspecified and
-    # shared (CGNAT 100.64.0.0/10) space, so one allow-list check covers every
-    # non-routable range, including metadata addresses such as 100.100.100.200.
-    # Multicast is not covered by is_global for IPv4, so exclude it explicitly.
-    return ip.is_global and not ip.is_multicast
+_is_public = net_guard.is_public
+_pinned_request = net_guard.pinned_request
 
 
 async def validate_sample_url(url: str) -> list[str]:
@@ -69,48 +73,11 @@ async def validate_sample_url(url: str) -> list[str]:
     """
 
     try:
-        parts = urlsplit(url)
-        host = parts.hostname
-        parts.port  # noqa: B018 - raises ValueError on an invalid port
-    except ValueError as exc:
-        raise UnsupportedSampleURL("invalid sample url") from exc
-    if parts.scheme != "https" or not host or parts.username or parts.password:
-        raise UnsupportedSampleURL("sample url must be https without credentials")
-    try:
-        literal = ipaddress.ip_address(host)
-        addresses = [str(literal)]
-    except ValueError:
-        addresses = await _resolve_host(host)
-    if not addresses or not all(_is_public(address) for address in addresses):
-        raise UnsupportedSampleURL("sample host is not a public address")
-    return addresses
-
-
-def _pinned_request(url: str, addresses: list[str]) -> tuple[str, dict[str, str], dict]:
-    """Build (url, headers, extensions) that connect to a validated IP for url's host.
-
-    TLS still verifies the certificate against the original hostname via the SNI
-    extension, and the Host header keeps virtual hosting working.
-    """
-
-    parts = urlsplit(url)
-    host = parts.hostname or ""
-    try:
-        ipaddress.ip_address(host)
-    except ValueError:
-        pass
-    else:
-        return url, {}, {}  # literal IP: nothing to pin, certificate is checked against it
-    # Prefer IPv4 (stable ordering) over IPv6 when both were validated.
-    ordered = sorted(addresses, key=lambda a: (":" in a, a))
-    address = ordered[0].split("%", 1)[0]
-    netloc = f"[{address}]" if ":" in address else address
-    host_header = host
-    if parts.port:
-        netloc += f":{parts.port}"
-        host_header += f":{parts.port}"
-    pinned = parts._replace(netloc=netloc).geturl()
-    return pinned, {"Host": host_header}, {"sni_hostname": host}
+        return await net_guard.validate_public_url(
+            url, schemes=("https",), resolver=lambda host: _resolve_host(host)
+        )
+    except net_guard.UnsafeURL as exc:
+        raise UnsupportedSampleURL(str(exc)) from exc
 
 
 def _content_type_ok(content_type: str) -> bool:
@@ -134,7 +101,10 @@ async def download_sample(url: str) -> tuple[bytes, str, str]:
                 timeout=SAMPLE_DOWNLOAD_TIMEOUT_SECONDS, follow_redirects=False
             ) as client:
                 async with client.stream(
-                    "GET", pinned_url, headers=headers, extensions=extensions
+                    "GET",
+                    pinned_url,
+                    headers={"User-Agent": SAMPLE_USER_AGENT, **headers},
+                    extensions=extensions,
                 ) as response:
                     if response.status_code in _REDIRECT_STATUSES:
                         location = response.headers.get("location")
@@ -174,7 +144,33 @@ async def download_sample(url: str) -> tuple[bytes, str, str]:
         raise SampleUnavailable(f"sample download failed: {type(exc).__name__}") from None
 
 
-async def clone_voice(
+def _elevenlabs_plan_blocked(response: httpx.Response) -> bool:
+    """True when an ElevenLabs 401/403 says the plan/subscription does not allow cloning.
+
+    Only a short detail code/message is inspected, for plan keywords; the body is never
+    logged or returned. ElevenLabs reports e.g. ``{"detail": {"status":
+    "can_not_use_instant_voice_cloning", "message": "..."}}`` (shape from ElevenLabs'
+    public error behaviour, not from the API reference; unverified here).
+    """
+
+    try:
+        body = response.json()
+    except ValueError:
+        return False
+    detail = body.get("detail") if isinstance(body, dict) else None
+    if isinstance(detail, dict):
+        code = str(detail.get("status") or "").lower()[:100]
+        message = str(detail.get("message") or "").lower()[:300]
+    elif isinstance(detail, str):
+        code, message = "", detail.lower()[:300]
+    else:
+        return False
+    if "voice_cloning" in code or "subscription" in code or "plan" in code:
+        return True
+    return ("subscription" in message or "plan" in message) and "clon" in message
+
+
+async def _clone_cartesia_voice(
     *,
     api_key: str,
     name: str,
@@ -182,10 +178,8 @@ async def clone_voice(
     sample: bytes,
     content_type: str,
     filename: str,
-    description: str | None = None,
+    description: str | None,
 ) -> str:
-    """Upload the sample to Cartesia and return the new provider voice id."""
-
     data = {"name": name, "language": language}
     if description:
         data["description"] = description
@@ -205,6 +199,8 @@ async def clone_voice(
             response.raise_for_status()
             body = response.json()
     except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 402:
+            raise ClonePlanRequired("cartesia plan does not include cloning") from None
         raise CloneProviderError(
             f"cartesia returned status {exc.response.status_code}"
         ) from None
@@ -216,6 +212,84 @@ async def clone_voice(
     if not isinstance(voice_id, str) or not voice_id:
         raise CloneProviderError("cartesia response missing voice id")
     return voice_id
+
+
+async def _clone_elevenlabs_voice(
+    *,
+    api_key: str,
+    name: str,
+    language: str,
+    sample: bytes,
+    content_type: str,
+    filename: str,
+    description: str | None,
+) -> str:
+    # ``language`` is not an Instant Voice Cloning field (ElevenLabs voices are
+    # multilingual); it is accepted for a uniform signature and not sent.
+    data = {"name": name}
+    if description:
+        data["description"] = description
+    try:
+        async with httpx.AsyncClient(timeout=CLONE_UPLOAD_TIMEOUT_SECONDS) as client:
+            response = await client.post(
+                f"{ELEVENLABS_BASE_URL}/v1/voices/add",
+                headers={"xi-api-key": api_key},
+                data=data,
+                files={"files": (filename, sample, content_type)},
+            )
+            response.raise_for_status()
+            body = response.json()
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code
+        if status == 402 or (status in (401, 403) and _elevenlabs_plan_blocked(exc.response)):
+            raise ClonePlanRequired("elevenlabs plan does not include cloning") from None
+        raise CloneProviderError(f"elevenlabs returned status {status}") from None
+    except httpx.HTTPError as exc:
+        raise CloneProviderError(f"elevenlabs request failed: {type(exc).__name__}") from None
+    except ValueError:
+        raise CloneProviderError("elevenlabs returned invalid json") from None
+    voice_id = body.get("voice_id") if isinstance(body, dict) else None
+    if not isinstance(voice_id, str) or not voice_id:
+        raise CloneProviderError("elevenlabs response missing voice id")
+    return voice_id
+
+
+_VOICE_CLONERS = {
+    "cartesia": _clone_cartesia_voice,
+    "elevenlabs": _clone_elevenlabs_voice,
+}
+CLONE_PROVIDER_API_KEY_ENV = {"cartesia": "CARTESIA_API_KEY", "elevenlabs": "ELEVENLABS_API_KEY"}
+
+
+def supports_voice_clone(provider: str) -> bool:
+    return provider in _VOICE_CLONERS
+
+
+async def clone_voice(
+    *,
+    api_key: str,
+    name: str,
+    language: str,
+    sample: bytes,
+    content_type: str,
+    filename: str,
+    description: str | None = None,
+    provider: str = "cartesia",
+) -> str:
+    """Upload the sample to the provider and return the new provider voice id."""
+
+    cloner = _VOICE_CLONERS.get(provider)
+    if cloner is None:
+        raise UnknownVoiceProvider(provider)
+    return await cloner(
+        api_key=api_key,
+        name=name,
+        language=language,
+        sample=sample,
+        content_type=content_type,
+        filename=filename,
+        description=description,
+    )
 
 
 DELETE_TIMEOUT_SECONDS = 15.0
@@ -261,7 +335,30 @@ async def _delete_cartesia_voice(api_key: str, provider_voice_id: str) -> None:
     )
 
 
-_VOICE_DELETERS = {"cartesia": _delete_cartesia_voice}
+async def _delete_elevenlabs_voice(api_key: str, provider_voice_id: str) -> None:
+    try:
+        async with httpx.AsyncClient(timeout=DELETE_TIMEOUT_SECONDS) as client:
+            response = await client.delete(
+                f"{ELEVENLABS_BASE_URL}/v1/voices/{provider_voice_id}",
+                headers={"xi-api-key": api_key},
+            )
+    except httpx.HTTPError as exc:
+        raise VoiceDeleteError(
+            f"elevenlabs request failed: {type(exc).__name__}", retryable=True
+        ) from None
+    status = response.status_code
+    if status == 404 or 200 <= status < 300:
+        return  # 404: already gone, which is the state the caller wants.
+    raise VoiceDeleteError(
+        f"elevenlabs returned status {status}",
+        retryable=status >= 500 or status in _RETRYABLE_STATUSES,
+    )
+
+
+_VOICE_DELETERS = {
+    "cartesia": _delete_cartesia_voice,
+    "elevenlabs": _delete_elevenlabs_voice,
+}
 
 
 def supports_voice_delete(provider: str) -> bool:

@@ -683,6 +683,28 @@ def test_bridge_call_dials_both_numbers_into_one_room(sip_env, monkeypatch):
     assert deployment["agent_id"].encode() in posts[0]
 
 
+def test_bridge_calls_share_the_per_org_dial_limit(sip_env, monkeypatch):
+    from src.platform import limits
+
+    fake = FakeLiveKit()
+    platform = FakePlatform()
+    platform.install(monkeypatch)
+    monkeypatch.setattr(sip, "_new_client", fake.factory())
+    monkeypatch.setenv("PLATFORM_DIAL_PER_ORG_HOUR", "1")
+    limits.dial_bucket.reset()
+    try:
+        with TestClient(app) as client:
+            deployment = make_interpreter_deployment(client)
+            assert bridge(client, deployment["id"]).status_code == 201
+            refused = bridge(client, deployment["id"])
+    finally:
+        limits.dial_bucket.reset()
+    assert refused.status_code == 429
+    assert refused.json()["detail"]["code"] == "rate_limited"
+    assert int(refused.headers["retry-after"]) >= 1
+    assert platform.sessions == 1 and len(fake.created) == 2  # nothing was created or dialled
+
+
 def test_bridge_call_validation(sip_env, monkeypatch):
     FakePlatform().install(monkeypatch)
     monkeypatch.setattr(sip, "_new_client", FakeLiveKit().factory())

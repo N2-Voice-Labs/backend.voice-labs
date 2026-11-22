@@ -127,3 +127,64 @@ def test_chat_ip_rate_limit_refills_per_minute(monkeypatch):
         assert limited.status_code == 429 and limited.headers["Retry-After"] in {"3", "4"}
         clock[0] += 3.1
         assert client.post("/demo/agents/sample/chat", json={"message": "Hi"}).status_code == 200
+
+
+def test_missing_anthropic_package_is_503_chat_unavailable_and_logged_once(monkeypatch, caplog):
+    import sys
+
+    monkeypatch.setenv("PLATFORM_CHAT_LLM_PROVIDER", "anthropic")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+    monkeypatch.setitem(sys.modules, "anthropic", None)  # makes ``import anthropic`` raise ImportError
+    monkeypatch.setattr(demo_module, "_anthropic_missing_logged", False)
+    with TestClient(app) as client:
+        demo(client, monkeypatch)
+        with caplog.at_level("ERROR", logger="src.platform.demo"):
+            first = client.post("/demo/agents/sample/chat", json={"message": "Hi"})
+            second = client.post("/demo/agents/sample/chat", json={"message": "Hi again"})
+    assert (first.status_code, first.json()) == (503, {"detail": "chat_unavailable"})
+    assert second.status_code == 503
+    assert sum("anthropic package is not installed" in r.message for r in caplog.records) == 1
+
+
+def test_malformed_numeric_env_falls_back_to_defaults(monkeypatch):
+    captured = {}
+
+    class Client:
+        def __init__(self, *, timeout):
+            captured["timeout"] = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        async def post(self, url, json, headers):
+            captured["payload"] = json
+
+            class Response:
+                def raise_for_status(self):
+                    return None
+
+                def json(self):
+                    return {"choices": [{"message": {"content": "ok"}}]}
+
+            return Response()
+
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    monkeypatch.setattr(demo_module.httpx, "AsyncClient", Client)
+    for name in (
+        "PLATFORM_CHAT_PER_IP_MINUTE",
+        "PLATFORM_CHAT_LLM_MAX_TOKENS",
+        "PLATFORM_CHAT_LLM_TEMPERATURE",
+        "PLATFORM_CHAT_LLM_TIMEOUT",
+        "PLATFORM_INLINE_KNOWLEDGE_MAX_CHARS",
+    ):
+        monkeypatch.setenv(name, "abc")
+    monkeypatch.setenv("PLATFORM_CHAT_KNOWLEDGE_MODE", "inline")
+    with TestClient(app) as client:
+        demo(client, monkeypatch)
+        response = client.post("/demo/agents/sample/chat", json={"message": "Hi"})
+    assert response.status_code == 200, response.text
+    assert captured["timeout"] == 20.0
+    assert captured["payload"]["max_tokens"] == 700 and captured["payload"]["temperature"] == 0.4

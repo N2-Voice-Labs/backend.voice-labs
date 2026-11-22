@@ -1,5 +1,6 @@
 """Native Pipecat pipeline factory for the LiveKit runtime."""
 
+import dataclasses
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -7,7 +8,6 @@ from datetime import timedelta
 from typing import Any
 
 from .provider_failures import watch_provider_failures
-from .turn_debug import watch_turn_debug
 from .speech_providers import (
     build_llm,
     build_stt,
@@ -32,6 +32,14 @@ _LLM_CREDENTIALS: dict[str, tuple[str, ...]] = {
     "gemini": ("gemini_api_key",),
     "google-translate": ("google_translate_api_key",),
 }
+
+
+def watch_turn_debug(worker: Any, session: Any, providers: Mapping[str, str]) -> None:
+    """Attach the TurnDebug observer; turn_debug imports Pipecat, so it loads lazily."""
+
+    from .turn_debug import watch_turn_debug as attach
+
+    attach(worker, session, providers)
 
 
 def register_stt_credentials(name: str, fields: tuple[str, ...] = ()) -> None:
@@ -73,11 +81,11 @@ def register_tts_credentials(name: str, fields: tuple[str, ...] = ()) -> None:
 @dataclass(frozen=True)
 class PipelineConfig:
     livekit_url: str
-    livekit_token: str
+    livekit_token: str = field(repr=False)
     room_name: str
-    deepgram_api_key: str
-    openai_api_key: str
-    cartesia_api_key: str
+    deepgram_api_key: str = field(repr=False)
+    openai_api_key: str = field(repr=False)
+    cartesia_api_key: str = field(repr=False)
     cartesia_voice_id: str
     system_instruction: str
     providers: dict[str, str] = field(
@@ -104,12 +112,15 @@ class PipelineConfig:
     # ElevenLabs credentials/default voice (ELEVENLABS_API_KEY / ELEVENLABS_VOICE_ID). Only
     # required when providers["tts"] == "elevenlabs"; the cartesia_* fields keep their names
     # and env vars so existing constructors and stored contracts do not change.
-    elevenlabs_api_key: str = ""
+    elevenlabs_api_key: str = field(default="", repr=False)
     elevenlabs_voice_id: str = ""
     # Gemini (GEMINI_API_KEY): only required when providers["llm"] == "gemini".
-    gemini_api_key: str = ""
+    gemini_api_key: str = field(default="", repr=False)
     # Google Cloud Translation (GOOGLE_TRANSLATE_API_KEY): only when providers["llm"] == "google-translate".
-    google_translate_api_key: str = ""
+    google_translate_api_key: str = field(default="", repr=False)
+    # True when the runtime minted ``livekit_token`` itself (the Platform supplied none): the
+    # token is short-lived, so a fallback restart mints a fresh one (see ``refreshed_livekit_token``).
+    livekit_token_minted: bool = False
 
     @property
     def stt_api_key(self) -> str:
@@ -239,8 +250,10 @@ class PipelineConfig:
                 raise RuntimeError("translation is only supported for agent sessions")
             AgentTranslationSettings.from_mapping(translation)
             translation = dict(translation)
+        token_minted = False
         if not values["livekit_token"]:
             values["livekit_token"] = create_runtime_token(values["room_name"])
+            token_minted = bool(values["livekit_token"])
         # An engine that speaks with the provider's voice (realtime) needs only LiveKit and
         # OpenAI: no STT/TTS credentials. Otherwise only the selected STT, LLM and TTS
         # providers' credentials are required.
@@ -272,6 +285,7 @@ class PipelineConfig:
             participants=participants,
             private_listening=private_listening,
             translation=translation,
+            livekit_token_minted=token_minted,
         )
         # Gemini has no built-in model: fail at session start, not on the first utterance.
         if providers["llm"] == "gemini":
@@ -280,6 +294,22 @@ class PipelineConfig:
             elif engine is not None and engine.uses_own_voice:
                 resolve_translation_model(config)
         return config
+
+
+def refreshed_livekit_token(config: PipelineConfig) -> PipelineConfig:
+    """Return config with a fresh LiveKit token when the runtime minted the current one.
+
+    The minted token lives 10 minutes, so a pipeline restart later in a long call (engine
+    fallback) must not reuse it. A token supplied by the Platform is kept as is. If minting
+    is no longer possible the existing token is kept.
+    """
+
+    if not config.livekit_token_minted:
+        return config
+    token = create_runtime_token(config.room_name)
+    if not token:
+        return config
+    return dataclasses.replace(config, livekit_token=token)
 
 
 def create_runtime_token(room_name: str) -> str:

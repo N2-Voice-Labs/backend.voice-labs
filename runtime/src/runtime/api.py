@@ -4,11 +4,14 @@ import logging
 import os
 import re
 from collections import OrderedDict
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import Any
 from uuid import UUID
 
-from fastapi import FastAPI, Header, HTTPException, Response, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, status
+from starlette.datastructures import FormData, UploadFile
+from starlette.formparsers import MultiPartException, MultiPartParser
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, model_serializer
 
@@ -20,6 +23,9 @@ from .lifecycle import EndReason, max_sessions, terminal_payload
 from .session import RuntimeSession, SessionState
 from .tts_preview import PREVIEW_PROVIDERS, TTSPreviewError, get_preview_provider
 from .voice_cloning import (
+    CLONE_PROVIDER_API_KEY_ENV,
+    MAX_SAMPLE_BYTES,
+    ClonePlanRequired,
     CloneProviderError,
     SampleUnavailable,
     UnsupportedSampleURL,
@@ -29,6 +35,8 @@ from .voice_cloning import (
     delete_voice,
     download_sample,
     PROVIDER_VOICE_ID_PATTERN,
+    _content_type_ok,
+    supports_voice_clone,
     supports_voice_delete,
 )
 
@@ -40,6 +48,11 @@ _participant_directories: dict[str, ParticipantDirectory] = {}
 _terminal_session_order: OrderedDict[str, None] = OrderedDict()
 _TERMINAL_SESSION_STATES = {"ended", "failed", "cancelled"}
 _MAX_TERMINAL_SESSION_HISTORY = 1024
+# Bounded waits: /end answers within the Platform's patience-plus-margin even when a session
+# is slow to stop (the session keeps stopping in the background), and shutdown never hangs
+# on a stuck session.
+END_WAIT_TIMEOUT_SECONDS = 40.0
+SHUTDOWN_WAIT_TIMEOUT_SECONDS = 30.0
 
 
 def _remember_terminal_session(session_key: str) -> None:
@@ -73,7 +86,12 @@ async def lifespan(_: FastAPI):
         if runtime_session is None or not await runtime_session.request_end():
             task.cancel()
     if tasks:
-        await asyncio.gather(*(task for _, task in tasks), return_exceptions=True)
+        _, pending = await asyncio.wait(
+            {task for _, task in tasks}, timeout=SHUTDOWN_WAIT_TIMEOUT_SECONDS
+        )
+        for task in pending:
+            logger.warning("Session task %s did not stop before shutdown; cancelling", task.get_name())
+            task.cancel()
 
 
 logger = logging.getLogger(__name__)
@@ -196,6 +214,8 @@ async def run_session(request: SessionStart) -> None:
         _session_states[session_key] = (
             "failed" if event_delivery_failed else "cancelled"
         )
+        if event_delivery_failed:
+            logger.exception("Session %s failed: Platform event delivery failed", session_key)
         if runtime_session and event_client and not pipeline_managed_lifecycle:
             await event_client.emit(
                 runtime_session.event(
@@ -212,6 +232,7 @@ async def run_session(request: SessionStart) -> None:
         raise
     except Exception as exc:
         _session_states[session_key] = "failed"
+        logger.exception("Session %s failed (%s)", session_key, type(exc).__name__)
         if runtime_session and event_client and not pipeline_managed_lifecycle:
             await event_client.emit(
                 runtime_session.event(
@@ -346,8 +367,11 @@ def _build_participant_directory(payload: SessionStart) -> ParticipantDirectory:
 
 
 def _consume_session_result(task: asyncio.Task[None]) -> None:
-    if not task.cancelled():
-        task.exception()
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error("Session task %s ended with an error", task.get_name(), exc_info=exc)
 
 
 @app.get("/sessions/{session_id}")
@@ -393,9 +417,13 @@ async def end_session(
         runtime_session = _runtime_sessions.get(key)
         if runtime_session is None or not await runtime_session.request_end():
             task.cancel()
-        results = await asyncio.gather(task, return_exceptions=True)
-        failed = _session_states.get(key) == "failed" or any(
-            isinstance(result, Exception) for result in results
+        # asyncio.wait neither cancels the session on timeout nor re-raises its error.
+        done, _ = await asyncio.wait({task}, timeout=END_WAIT_TIMEOUT_SECONDS)
+        if not done:
+            logger.warning("Session %s is still stopping after %.0fs", key, END_WAIT_TIMEOUT_SECONDS)
+            return {"status": "ending"}
+        failed = _session_states.get(key) == "failed" or (
+            not task.cancelled() and task.exception() is not None
         )
         _session_states[key] = "failed" if failed else "ended"
     elif _session_states.get(key) != "failed":
@@ -513,11 +541,7 @@ class VoiceCloneRequest(BaseModel):
     description: str | None = Field(default=None, max_length=500)
 
 
-@app.post("/voices/clone")
-async def voices_clone(
-    payload: VoiceCloneRequest,
-    x_runtime_token: str | None = Header(default=None),
-) -> dict[str, str]:
+def _require_runtime_token(x_runtime_token: str | None = Header(default=None)) -> None:
     expected = os.getenv("RUNTIME_PLATFORM_TOKEN")
     if (
         not expected
@@ -525,14 +549,35 @@ async def voices_clone(
         or not hmac.compare_digest(x_runtime_token, expected)
     ):
         raise HTTPException(status_code=401, detail="invalid_runtime_token")
-    if payload.provider != "cartesia":
+
+
+def _clone_api_key(provider: str) -> str:
+    """The provider's clone API key; 422 for an unsupported provider, 503 when unset."""
+
+    if not supports_voice_clone(provider):
         raise HTTPException(status_code=422, detail="unsupported_tts_provider")
-    api_key = os.getenv("CARTESIA_API_KEY")
+    api_key = os.getenv(CLONE_PROVIDER_API_KEY_ENV[provider])
     if not api_key:
         raise HTTPException(status_code=503, detail="tts_not_configured")
+    return api_key
+
+
+def _clone_provider_http_error(exc: CloneProviderError) -> HTTPException:
+    detail = (
+        "clone_plan_upgrade_required"
+        if isinstance(exc, ClonePlanRequired)
+        else "clone_provider_error"
+    )
+    return HTTPException(status_code=502, detail=detail)
+
+
+@app.post("/voices/clone", dependencies=[Depends(_require_runtime_token)])
+async def voices_clone(payload: VoiceCloneRequest) -> dict[str, str]:
+    api_key = _clone_api_key(payload.provider)
     try:
         sample, content_type, filename = await download_sample(payload.sample_url)
         provider_voice_id = await clone_voice(
+            provider=payload.provider,
             api_key=api_key,
             name=payload.name,
             language=payload.language,
@@ -546,11 +591,96 @@ async def voices_clone(
     except SampleUnavailable as exc:
         raise HTTPException(status_code=422, detail="sample_unavailable") from exc
     except CloneProviderError as exc:
-        raise HTTPException(status_code=502, detail="clone_provider_error") from exc
+        raise _clone_provider_http_error(exc) from exc
     return {"provider_voice_id": provider_voice_id}
 
 
-_PROVIDER_API_KEY_ENV = {"cartesia": "CARTESIA_API_KEY"}
+# Room for the multipart envelope and the small text fields around the audio part.
+_UPLOAD_OVERHEAD_BYTES = 256 * 1024
+
+
+async def _bounded_upload_stream(request: Request) -> AsyncGenerator[bytes, None]:
+    """The request body, aborted once it exceeds the audio limit plus envelope overhead.
+
+    Starlette spools multipart file parts to disk without any size limit, so the cap is
+    enforced on the raw stream before the parser sees the excess.
+    """
+
+    limit = MAX_SAMPLE_BYTES + _UPLOAD_OVERHEAD_BYTES
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > limit:
+        raise HTTPException(status_code=422, detail="invalid_sample")
+    size = 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > limit:
+            raise HTTPException(status_code=422, detail="invalid_sample")
+        yield chunk
+
+
+def _form_text(form: FormData, field: str, *, min_length: int, max_length: int) -> str | None:
+    value = form.get(field)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not min_length <= len(value) <= max_length:
+        raise HTTPException(status_code=422, detail="invalid_request")
+    return value
+
+
+@app.post("/voices/clone-upload", dependencies=[Depends(_require_runtime_token)])
+async def voices_clone_upload(request: Request) -> dict[str, str]:
+    """Clone from recorded audio forwarded by Platform; the bytes are never stored.
+
+    multipart/form-data: ``provider``, ``name`` (1-200), ``language``, optional
+    ``description``, ``file``. The form is parsed by hand (not as FastAPI ``Form``/``File``
+    parameters) so the upload size is limited while it streams in.
+    """
+
+    if not request.headers.get("content-type", "").lower().startswith("multipart/form-data"):
+        raise HTTPException(status_code=422, detail="invalid_request")
+    try:
+        form = await MultiPartParser(
+            request.headers, _bounded_upload_stream(request), max_files=1, max_fields=10
+        ).parse()
+    except MultiPartException as exc:
+        raise HTTPException(status_code=422, detail="invalid_request") from exc
+    try:
+        provider = _form_text(form, "provider", min_length=1, max_length=100)
+        name = _form_text(form, "name", min_length=1, max_length=200)
+        language = _form_text(form, "language", min_length=1, max_length=50)
+        description = _form_text(form, "description", min_length=0, max_length=500)
+        if provider is None or name is None or language is None:
+            raise HTTPException(status_code=422, detail="invalid_request")
+        api_key = _clone_api_key(provider)
+        upload = form.get("file")
+        if not isinstance(upload, UploadFile):
+            raise HTTPException(status_code=422, detail="invalid_sample")
+        content_type = (upload.content_type or "").split(";", 1)[0].strip().lower()
+        if not _content_type_ok(content_type):
+            raise HTTPException(status_code=422, detail="invalid_sample")
+        sample = await upload.read()
+        filename = upload.filename or "sample"
+    finally:
+        await form.close()
+    if not sample or len(sample) > MAX_SAMPLE_BYTES:
+        raise HTTPException(status_code=422, detail="invalid_sample")
+    try:
+        provider_voice_id = await clone_voice(
+            provider=provider,
+            api_key=api_key,
+            name=name,
+            language=language,
+            sample=sample,
+            content_type=content_type,
+            filename=filename,
+            description=description or None,
+        )
+    except CloneProviderError as exc:
+        raise _clone_provider_http_error(exc) from exc
+    return {"provider_voice_id": provider_voice_id}
+
+
+_PROVIDER_API_KEY_ENV = CLONE_PROVIDER_API_KEY_ENV
 _VOICE_ID_RE = re.compile(PROVIDER_VOICE_ID_PATTERN)
 
 

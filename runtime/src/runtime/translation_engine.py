@@ -41,6 +41,17 @@ from .speech_providers import (
 
 _logger = logging.getLogger(__name__)
 
+
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _background_done(task: asyncio.Task) -> None:
+    """Drop the finished task and log what went wrong (nothing else awaits it)."""
+
+    _background_tasks.discard(task)
+    if not task.cancelled() and task.exception() is not None:
+        _logger.error("Background task failed", exc_info=task.exception())
+
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from pipecat.processors.frame_processor import FrameProcessor
 
@@ -86,7 +97,8 @@ def dropped_utterance_hook(session):
         if play is None or not speaker_identity:
             return
         task = asyncio.ensure_future(play(speaker_identity=speaker_identity))
-        task.add_done_callback(lambda t: t.cancelled() or t.exception())
+        _background_tasks.add(task)  # keep a reference so the task is not garbage collected
+        task.add_done_callback(_background_done)
 
     return notify
 

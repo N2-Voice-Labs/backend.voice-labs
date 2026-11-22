@@ -23,7 +23,7 @@ COPY runtime/pyproject.toml runtime/pyproject.toml
 COPY evals/pyproject.toml evals/pyproject.toml
 
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --locked --no-dev --no-install-workspace --package platform-voice-labs
+    uv sync --locked --no-dev --no-install-workspace --package platform-voice-labs --extra anthropic
 
 # ---- final: venv + platform source only ----
 FROM python:3.11-slim-bookworm AS final

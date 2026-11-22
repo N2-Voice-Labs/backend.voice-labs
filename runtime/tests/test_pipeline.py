@@ -112,6 +112,7 @@ def test_pipeline_config_rejects_unsupported_provider_settings(
 def test_pipeline_config_mints_runtime_token_from_livekit_credentials(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    pytest.importorskip("livekit")
     requested_room = "requested-room-83"
     values = {
         "LIVEKIT_URL": "ws://localhost:7880",
@@ -135,6 +136,73 @@ def test_pipeline_config_mints_runtime_token_from_livekit_credentials(
     assert claims["video"]["room"] == requested_room
     assert claims["video"]["canPublish"] is True
     assert claims["video"]["canSubscribe"] is True
+
+
+def _provider_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for key, value in {
+        "LIVEKIT_URL": "ws://localhost:7880",
+        "DEEPGRAM_API_KEY": "deepgram",
+        "OPENAI_API_KEY": "openai",
+        "CARTESIA_API_KEY": "cartesia",
+        "CARTESIA_VOICE_ID": "voice",
+    }.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.delenv("RUNTIME_LIVEKIT_TOKEN", raising=False)
+
+
+def test_livekit_token_minted_flag_tracks_who_supplied_the_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.runtime import pipeline
+
+    _provider_env(monkeypatch)
+    monkeypatch.setattr(pipeline, "create_runtime_token", lambda room: "minted-token")
+    minted = PipelineConfig.from_environment({"room_name": "room-1"})
+    assert minted.livekit_token == "minted-token" and minted.livekit_token_minted is True
+    supplied = PipelineConfig.from_environment(
+        {"room_name": "room-1", "livekit_token": "platform-token"}
+    )
+    assert (supplied.livekit_token, supplied.livekit_token_minted) == ("platform-token", False)
+
+
+def test_refreshed_livekit_token_only_replaces_a_minted_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.runtime import pipeline
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        pipeline, "create_runtime_token", lambda room: calls.append(room) or "fresh"
+    )
+    base = PipelineConfig("ws://l", "old", "room-9", "dg", "oa", "ca", "voice", "prompt")
+    assert pipeline.refreshed_livekit_token(base) is base and calls == []
+    minted = PipelineConfig(
+        "ws://l", "old", "room-9", "dg", "oa", "ca", "voice", "prompt", livekit_token_minted=True
+    )
+    refreshed = pipeline.refreshed_livekit_token(minted)
+    assert refreshed.livekit_token == "fresh" and calls == ["room-9"]
+    assert minted.livekit_token == "old"  # frozen original untouched
+    monkeypatch.setattr(pipeline, "create_runtime_token", lambda room: "")
+    assert pipeline.refreshed_livekit_token(minted) is minted  # cannot mint: keep what we have
+
+
+def test_pipeline_config_repr_hides_credentials() -> None:
+    config = PipelineConfig(
+        "ws://l",
+        "lk-SECRET",
+        "room",
+        "dg-SECRET",
+        "oa-SECRET",
+        "ca-SECRET",
+        "voice",
+        "prompt",
+        elevenlabs_api_key="el-SECRET",
+        gemini_api_key="ge-SECRET",
+        google_translate_api_key="gt-SECRET",
+    )
+    assert "SECRET" not in repr(config)
+    assert "SECRET" not in str(config)
+    assert "room" in repr(config)
 
 
 def test_livekit_transport_receives_requested_room_name(

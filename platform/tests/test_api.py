@@ -1432,3 +1432,51 @@ def test_ensure_running_recovers_runtime_process_loss_after_session_started(
     }
     assert len(start_contracts) == 2
     assert start_contracts[0] == start_contracts[1]
+
+
+def test_logging_is_configured_from_env_only_when_unconfigured(monkeypatch) -> None:
+    import logging
+
+    from src.platform.main import configure_logging
+
+    root = logging.getLogger()
+    saved_handlers, saved_level = root.handlers[:], root.level
+    try:
+        # Already configured (uvicorn's, pytest's): left alone.
+        configure_logging()
+        assert root.handlers == saved_handlers and root.level == saved_level
+        root.handlers.clear()
+        monkeypatch.setenv("PLATFORM_LOG_LEVEL", "debug")
+        configure_logging()
+        assert root.level == logging.DEBUG and len(root.handlers) == 1
+        fmt = root.handlers[0].formatter._fmt
+        assert "%(asctime)s" in fmt and "%(levelname)s" in fmt
+        root.handlers.clear()
+        monkeypatch.setenv("PLATFORM_LOG_LEVEL", "nonsense")
+        configure_logging()
+        assert root.level == logging.INFO  # default, INFO logs are no longer dropped
+        root.handlers.clear()
+        monkeypatch.delenv("PLATFORM_LOG_LEVEL")
+        configure_logging()
+        assert root.level == logging.INFO
+    finally:
+        root.handlers[:] = saved_handlers
+        root.setLevel(saved_level)
+
+
+def test_public_livekit_url_is_handed_to_clients_but_api_calls_keep_the_internal_one(monkeypatch) -> None:
+    from src.platform.livekit import public_livekit_url
+    from src.platform.sessions import participant_connection
+
+    monkeypatch.setenv("LIVEKIT_URL", "ws://livekit:7880")
+    monkeypatch.delenv("LIVEKIT_PUBLIC_URL", raising=False)
+    assert public_livekit_url() == "ws://livekit:7880"
+    assert participant_connection("room", "id", configured=False, private=False)["url"] == "ws://livekit:7880"
+    monkeypatch.setenv("LIVEKIT_PUBLIC_URL", "wss://lk.example.com")
+    assert public_livekit_url() == "wss://lk.example.com"
+    connection = participant_connection("room", "id", configured=False, private=False)
+    assert connection["url"] == "wss://lk.example.com"
+    monkeypatch.delenv("LIVEKIT_URL")
+    assert public_livekit_url() == "wss://lk.example.com"
+    monkeypatch.delenv("LIVEKIT_PUBLIC_URL")
+    assert public_livekit_url() == ""

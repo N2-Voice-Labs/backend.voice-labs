@@ -1,18 +1,30 @@
 """Authenticated HTTP transport for runtime events."""
 
 import asyncio
+import time
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 
 import httpx
 
-from .events import RuntimeEvent
+from .events import RuntimeEvent, is_critical_event
+
+# Best-effort telemetry gets a short retry; critical events keep retrying with exponential
+# backoff for about a minute before delivery is reported as failed.
+BEST_EFFORT_ATTEMPTS = 3
+CRITICAL_RETRY_BUDGET_SECONDS = 60.0
+_MAX_BACKOFF_SECONDS = 8.0
+_RETRYABLE_STATUSES = frozenset({408, 425, 429})
+
+
+def is_retryable_status(status_code: int) -> bool:
+    return status_code in _RETRYABLE_STATUSES or status_code >= 500
 
 
 def _retry_delay(retry_after: str | None, attempt: int) -> float:
     """Choose a bounded delay from Retry-After or the local backoff schedule."""
 
-    fallback = 0.1 * (2**attempt)
+    fallback = min(0.1 * (2 ** min(attempt, 10)), _MAX_BACKOFF_SECONDS)
     if not retry_after:
         return fallback
     try:
@@ -25,7 +37,7 @@ def _retry_delay(retry_after: str | None, attempt: int) -> float:
         if retry_at.tzinfo is None:
             retry_at = retry_at.replace(tzinfo=timezone.utc)
         delay = (retry_at - datetime.now(timezone.utc)).total_seconds()
-    return min(max(delay, 0.0), 1.0)
+    return max(min(max(delay, 0.0), 1.0), fallback)
 
 
 class PlatformEventClient:
@@ -34,8 +46,19 @@ class PlatformEventClient:
         self._runtime_token = runtime_token
 
     async def emit(self, event: RuntimeEvent) -> dict[str, str]:
+        """Deliver one event.
+
+        A non-retryable status (4xx other than 408/425/429) is raised immediately as
+        ``httpx.HTTPStatusError``. Transient failures are retried: best-effort events a few
+        times, critical events (see ``events.CRITICAL_EVENT_TYPES``) with exponential backoff
+        until ``CRITICAL_RETRY_BUDGET_SECONDS`` have elapsed; then the last error is raised.
+        """
+
         payload = event.model_dump(mode="json")
-        for attempt in range(3):
+        critical = is_critical_event(event.event_type)
+        started = time.monotonic()
+        attempt = 0
+        while True:
             try:
                 response = await self._client.post(
                     "/runtime/events",
@@ -44,18 +67,23 @@ class PlatformEventClient:
                 )
                 response.raise_for_status()
             except httpx.HTTPStatusError as exc:
-                retryable = exc.response.status_code in {408, 425, 429} or exc.response.status_code >= 500
-                if not retryable or attempt == 2:
+                if not is_retryable_status(exc.response.status_code):
                     raise
                 retry_after = exc.response.headers.get("Retry-After")
-            except httpx.TransportError:
-                if attempt == 2:
-                    raise
+                error: Exception = exc
+            except httpx.TransportError as exc:
                 retry_after = None
+                error = exc
             else:
                 return response.json()
-            await asyncio.sleep(_retry_delay(retry_after, attempt))
-        raise RuntimeError("runtime event delivery exhausted retries")
+            delay = _retry_delay(retry_after, attempt)
+            attempt += 1
+            if critical:
+                if time.monotonic() - started + delay > CRITICAL_RETRY_BUDGET_SECONDS:
+                    raise error
+            elif attempt >= BEST_EFFORT_ATTEMPTS:
+                raise error
+            await asyncio.sleep(delay)
 
     async def aclose(self) -> None:
         await self._client.aclose()

@@ -105,6 +105,8 @@ def test_handoff_auth_staff_accept_transcript(monkeypatch, runtime, livekit, adm
         with SessionLocal() as db:
             assert db.get(VoiceSession, result["session_id"]).runtime_contract["interpreter"]["speaker_language"] == (speaker_language or "auto")
         assert "invite_code" not in result and result["session_token"].startswith("vls_")
+        with SessionLocal() as db:  # the human call is capped like any public call
+            assert db.get(VoiceSession, result["session_id"]).runtime_contract["public_call"] is True
         assert handoff(client, session).status_code == 409
         assert client.get("/staff/handoffs").status_code == 404
         monkeypatch.setenv("PLATFORM_STAFF_KEY", "staff-secret")

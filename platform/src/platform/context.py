@@ -9,6 +9,7 @@ shared ``X-Runtime-Token`` and no tenant, so the routes resolve the organisation
 from the VoiceSession (never from the caller).
 """
 
+import os
 from dataclasses import dataclass
 from typing import Literal
 
@@ -24,6 +25,12 @@ _ALWAYS_PASS = frozenset({"superadmin", "dev", "system"})
 _NEVER_PASS = frozenset({"session", "runtime"})
 
 
+def auth_disabled() -> bool:
+    """``PLATFORM_AUTH_DISABLED=1``: the explicit local-development switch (see ``auth.py``)."""
+
+    return os.getenv("PLATFORM_AUTH_DISABLED", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 @dataclass(frozen=True)
 class AuthContext:
     org_id: str | None
@@ -33,6 +40,12 @@ class AuthContext:
     session_id: str | None = None
     is_guest: bool = False
     request_id: str | None = None
+
+
+def is_superadmin(ctx: AuthContext) -> bool:
+    """A ``PLATFORM_API_KEYS`` caller, or ``dev`` while auth is explicitly disabled."""
+
+    return ctx.principal == "superadmin" or (ctx.principal == "dev" and auth_disabled())
 
 
 def role_at_least(role: str | None, minimum: str) -> bool:

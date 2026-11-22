@@ -18,13 +18,12 @@ from sqlalchemy.orm import Session
 
 from . import audit
 from .auth import generate_api_key
-from .context import AuthContext, require, role_at_least
+from .context import AuthContext, is_superadmin, require, role_at_least
 from .db import get_db
 from .models import DEFAULT_ORGANIZATION_ID, ApiKey, Organization
 
 router = APIRouter(tags=["organizations"])
 
-_SUPERADMIN_PRINCIPALS = frozenset({"superadmin", "dev"})
 _SLUG_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
 
 Name = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)]
@@ -105,7 +104,7 @@ class ApiKeyCreate(BaseModel):
 
 
 def _is_superadmin(ctx: AuthContext) -> bool:
-    return ctx.principal in _SUPERADMIN_PRINCIPALS
+    return is_superadmin(ctx)
 
 
 def require_superadmin(ctx: AuthContext = Depends(require("member"))) -> AuthContext:

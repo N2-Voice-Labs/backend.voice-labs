@@ -3,6 +3,7 @@
 Routes live in per-area routers; this module builds the app and wires them in.
 """
 
+import logging
 import os
 from contextlib import asynccontextmanager
 
@@ -37,9 +38,27 @@ from .agents import resolve_interpreter_engine  # noqa: F401  (re-exported)
 from .db import Base, SessionLocal, engine
 
 
+def configure_logging() -> None:
+    """Root logger from ``PLATFORM_LOG_LEVEL`` (default INFO) so INFO logs are not dropped.
+
+    Leaves an existing configuration alone (uvicorn's, a test harness's, ...).
+    """
+
+    root = logging.getLogger()
+    if root.handlers:
+        return
+    level = logging.getLevelName(os.getenv("PLATFORM_LOG_LEVEL", "INFO").strip().upper())
+    logging.basicConfig(
+        level=level if isinstance(level, int) else logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    configure_logging()
     auth.log_auth_status()
+    calls.warn_trust_proxy_deprecated()
     if os.getenv("PLATFORM_AUTO_CREATE_SCHEMA") == "1":
         Base.metadata.create_all(bind=engine)
         # Migrated databases get the default org from 0008; create_all does not.

@@ -5,9 +5,23 @@ from uuid import uuid4
 import httpx
 import pytest
 
-from src.runtime import tool_runtime
+from src.runtime import net_guard, tool_runtime
 from src.runtime.session import RuntimeSession
 from src.runtime.tool_runtime import build_tool_runtime
+
+
+PUBLIC_IP = "93.184.216.34"
+
+
+@pytest.fixture(autouse=True)
+def public_dns(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every tool host resolves to a public address; no test touches real DNS."""
+
+    async def resolve(host: str) -> list[str]:
+        return [PUBLIC_IP]
+
+    monkeypatch.setattr(net_guard, "resolve_host", resolve)
+    monkeypatch.delenv(tool_runtime.ALLOW_PRIVATE_ENV, raising=False)
 
 
 def make_session() -> tuple[RuntimeSession, list]:
@@ -169,6 +183,124 @@ def test_http_connection_failure_returns_error() -> None:
 
     runtime = build_tool_runtime([http_tool()], False, session, http_transport=httpx.MockTransport(handler))
     assert run(runtime, "lookup_order", {"order_id": "A1"})["error"] == "request_failed"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://127.0.0.1/admin",
+        "http://localhost:8000/admin",
+        "http://169.254.169.254/latest/meta-data/",
+        "http://10.0.0.5/internal",
+        "https://192.168.0.10/internal",
+        "http://[::1]/admin",
+    ],
+)
+def test_http_tool_blocks_private_and_metadata_targets(url, monkeypatch) -> None:
+    async def resolve(host: str) -> list[str]:
+        return ["127.0.0.1"]  # localhost
+
+    monkeypatch.setattr(net_guard, "resolve_host", resolve)
+    session, events = make_session()
+    seen: list[httpx.Request] = []
+    transport = httpx.MockTransport(lambda r: seen.append(r) or httpx.Response(200, json={}))
+    tool = http_tool(configuration={"url": url})
+    runtime = build_tool_runtime([tool], False, session, http_transport=transport)
+    result = run(runtime, "lookup_order", {"order_id": "A1"})
+
+    assert result == {"status": "error", "error": "url_not_allowed"}
+    assert seen == []
+    assert events[0].payload["status"] == "error"
+
+
+def test_http_tool_blocks_hostname_resolving_to_private(monkeypatch) -> None:
+    async def resolve(host: str) -> list[str]:
+        return ["10.0.0.7"]
+
+    monkeypatch.setattr(net_guard, "resolve_host", resolve)
+    session, _ = make_session()
+    seen: list[httpx.Request] = []
+    transport = httpx.MockTransport(lambda r: seen.append(r) or httpx.Response(200, json={}))
+    runtime = build_tool_runtime([http_tool()], False, session, http_transport=transport)
+
+    assert run(runtime, "lookup_order", {"order_id": "A1"})["error"] == "url_not_allowed"
+    assert seen == []
+
+
+def test_http_tool_allows_public_host_and_pins_the_validated_ip() -> None:
+    session, _ = make_session()
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"ok": True})
+
+    runtime = build_tool_runtime(
+        [http_tool(configuration={"url": "http://orders.test:8080/lookup"})],
+        False,
+        session,
+        http_transport=httpx.MockTransport(handler),
+    )
+    assert run(runtime, "lookup_order", {"order_id": "A1"}) == {"status": "ok", "data": {"ok": True}}
+    assert seen[0].url.host == PUBLIC_IP and seen[0].url.port == 8080
+    assert seen[0].headers["host"] == "orders.test:8080"
+    assert seen[0].extensions["sni_hostname"] == "orders.test"
+
+
+def test_http_tool_unresolvable_host_is_a_request_failure(monkeypatch) -> None:
+    async def resolve(host: str) -> list[str]:
+        raise net_guard.HostUnresolvable("nope")
+
+    monkeypatch.setattr(net_guard, "resolve_host", resolve)
+    session, _ = make_session()
+    runtime = build_tool_runtime([http_tool()], False, session)
+    assert run(runtime, "lookup_order", {"order_id": "A1"})["error"] == "request_failed"
+
+
+def test_allow_private_env_is_the_local_dev_escape_hatch(monkeypatch) -> None:
+    monkeypatch.setenv(tool_runtime.ALLOW_PRIVATE_ENV, "1")
+    session, _ = make_session()
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"ok": True})
+
+    runtime = build_tool_runtime(
+        [http_tool(configuration={"url": "http://127.0.0.1:9000/x"})],
+        False,
+        session,
+        http_transport=httpx.MockTransport(handler),
+    )
+    assert run(runtime, "lookup_order", {"order_id": "A1"})["status"] == "ok"
+    assert str(seen[0].url) == "http://127.0.0.1:9000/x"
+
+
+def test_http_tool_does_not_follow_redirects_to_internal_hosts() -> None:
+    session, _ = make_session()
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(302, headers={"Location": "http://169.254.169.254/latest/meta-data/"})
+
+    runtime = build_tool_runtime([http_tool()], False, session, http_transport=httpx.MockTransport(handler))
+    result = run(runtime, "lookup_order", {"order_id": "A1"})
+
+    assert result == {"status": "error", "error": "redirect_not_followed"}
+    assert len(seen) == 1  # the Location was never requested
+
+
+def test_tool_called_arguments_are_capped_but_stay_an_object() -> None:
+    session, events = make_session()
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, json={}))
+    runtime = build_tool_runtime([http_tool()], False, session, http_transport=transport)
+    huge = "z" * 50_000
+    assert run(runtime, "lookup_order", {"order_id": huge})["status"] == "ok"
+
+    arguments = events[0].payload["arguments"]
+    assert isinstance(arguments, dict) and arguments["truncated"] is True
+    assert len(json.dumps(arguments)) < tool_runtime.MAX_EVENT_ARGUMENT_CHARS + 100
 
 
 def test_missing_required_argument_returns_error_without_calling() -> None:

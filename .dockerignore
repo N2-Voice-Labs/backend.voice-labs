@@ -20,3 +20,8 @@ agents
 **/recordings
 **/*.wav
 !runtime/src/runtime/assets/apology/*.wav
+
+# Operator files that never belong in an image.
+backups
+.github
+docs
