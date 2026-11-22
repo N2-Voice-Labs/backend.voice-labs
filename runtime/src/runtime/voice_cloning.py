@@ -7,12 +7,11 @@ Verified against https://docs.cartesia.ai/api-reference/voices/clone :
 ``name``, ``language`` (ISO 639-1), optional ``description``; response JSON ``{"id": ...}``.
 """
 
-import asyncio
-import ipaddress
-import socket
 from urllib.parse import urljoin, urlsplit
 
 import httpx
+
+from . import net_guard
 
 CARTESIA_BASE_URL = "https://api.cartesia.ai"
 # The clone endpoint documents a single supported version value (2026-08-14); the TTS
@@ -38,26 +37,14 @@ class CloneProviderError(Exception):
 
 
 async def _resolve_host(host: str) -> list[str]:
-    loop = asyncio.get_running_loop()
     try:
-        infos = await loop.getaddrinfo(host, None, type=socket.SOCK_STREAM)
-    except OSError as exc:
+        return await net_guard.resolve_host(host)
+    except net_guard.HostUnresolvable as exc:
         raise SampleUnavailable("sample host did not resolve") from exc
-    return sorted({info[4][0] for info in infos})
 
 
-def _is_public(address: str) -> bool:
-    try:
-        ip = ipaddress.ip_address(address.split("%", 1)[0])
-    except ValueError:
-        return False
-    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
-        ip = ip.ipv4_mapped
-    # is_global is False for private, loopback, link-local, reserved, unspecified and
-    # shared (CGNAT 100.64.0.0/10) space, so one allow-list check covers every
-    # non-routable range, including metadata addresses such as 100.100.100.200.
-    # Multicast is not covered by is_global for IPv4, so exclude it explicitly.
-    return ip.is_global and not ip.is_multicast
+_is_public = net_guard.is_public
+_pinned_request = net_guard.pinned_request
 
 
 async def validate_sample_url(url: str) -> list[str]:
@@ -69,48 +56,11 @@ async def validate_sample_url(url: str) -> list[str]:
     """
 
     try:
-        parts = urlsplit(url)
-        host = parts.hostname
-        parts.port  # noqa: B018 - raises ValueError on an invalid port
-    except ValueError as exc:
-        raise UnsupportedSampleURL("invalid sample url") from exc
-    if parts.scheme != "https" or not host or parts.username or parts.password:
-        raise UnsupportedSampleURL("sample url must be https without credentials")
-    try:
-        literal = ipaddress.ip_address(host)
-        addresses = [str(literal)]
-    except ValueError:
-        addresses = await _resolve_host(host)
-    if not addresses or not all(_is_public(address) for address in addresses):
-        raise UnsupportedSampleURL("sample host is not a public address")
-    return addresses
-
-
-def _pinned_request(url: str, addresses: list[str]) -> tuple[str, dict[str, str], dict]:
-    """Build (url, headers, extensions) that connect to a validated IP for url's host.
-
-    TLS still verifies the certificate against the original hostname via the SNI
-    extension, and the Host header keeps virtual hosting working.
-    """
-
-    parts = urlsplit(url)
-    host = parts.hostname or ""
-    try:
-        ipaddress.ip_address(host)
-    except ValueError:
-        pass
-    else:
-        return url, {}, {}  # literal IP: nothing to pin, certificate is checked against it
-    # Prefer IPv4 (stable ordering) over IPv6 when both were validated.
-    ordered = sorted(addresses, key=lambda a: (":" in a, a))
-    address = ordered[0].split("%", 1)[0]
-    netloc = f"[{address}]" if ":" in address else address
-    host_header = host
-    if parts.port:
-        netloc += f":{parts.port}"
-        host_header += f":{parts.port}"
-    pinned = parts._replace(netloc=netloc).geturl()
-    return pinned, {"Host": host_header}, {"sni_hostname": host}
+        return await net_guard.validate_public_url(
+            url, schemes=("https",), resolver=lambda host: _resolve_host(host)
+        )
+    except net_guard.UnsafeURL as exc:
+        raise UnsupportedSampleURL(str(exc)) from exc
 
 
 def _content_type_ok(content_type: str) -> bool:

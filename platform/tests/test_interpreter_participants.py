@@ -675,7 +675,7 @@ def test_phone_participant_validations(runtime, livekit, monkeypatch) -> None:
         assert client.post(phone_url(str(uuid4())), json=PHONE).status_code == 404
 
 
-def test_phone_participant_needs_an_open_slot_and_a_creator_token(
+def test_phone_participant_needs_an_open_slot_and_no_session_token(
     runtime, livekit, sip_trunk
 ) -> None:
     with TestClient(app) as client:
@@ -685,8 +685,44 @@ def test_phone_participant_needs_an_open_slot_and_a_creator_token(
         assert (full.status_code, full.json()["detail"]) == (409, "session_full")
     from src.platform import auth
 
-    assert ("POST", "/voice/sessions/{session_id}/phone-participants") in auth.SESSION_SCOPED_ROUTES
-    assert auth.SESSION_SCOPED_ROUTES[("POST", "/voice/sessions/{session_id}/phone-participants")].creator_only
+    # Dialling is for org principals only: a session token (the anonymous creator of a
+    # public call has one) must never reach it.
+    assert ("POST", "/voice/sessions/{session_id}/phone-participants") not in auth.SESSION_SCOPED_ROUTES
+
+
+def test_phone_participant_handler_refuses_a_session_principal() -> None:
+    from types import SimpleNamespace
+
+    from fastapi import HTTPException
+
+    from src.platform.context import AuthContext, require
+
+    ctx = AuthContext(org_id="o", principal="session", role=None, session_id="s")
+    with pytest.raises(HTTPException) as refused:
+        require("member")(SimpleNamespace(state=SimpleNamespace(ctx=ctx)))
+    assert (refused.value.status_code, refused.value.detail) == (403, {"code": "insufficient_role"})
+
+
+def test_phone_dials_are_rate_limited_per_org(runtime, livekit, sip_trunk, monkeypatch) -> None:
+    from src.platform import limits
+
+    dials, _, _ = sip_trunk
+    monkeypatch.setenv("PLATFORM_DIAL_PER_ORG_HOUR", "2")
+    limits.dial_bucket.reset()
+    try:
+        with TestClient(app) as client:
+            agent = make_agent(client)
+            codes = []
+            for _ in range(3):
+                session_id = create_session(client, agent, language="en").json()["session_id"]
+                response = client.post(phone_url(session_id), json=PHONE)
+                codes.append(response.status_code)
+        assert codes == [201, 201, 429]
+        assert len(dials) == 2  # the refused request never reached the trunk
+        assert response.json()["detail"]["code"] == "rate_limited"
+        assert int(response.headers["retry-after"]) >= 1
+    finally:
+        limits.dial_bucket.reset()
 
 
 def test_phone_room_name_convention() -> None:

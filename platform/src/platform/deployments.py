@@ -9,7 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from . import sip
+from . import limits, sip
 from .context import AuthContext, require
 from .models import Agent as AgentRecord
 from .models import Deployment as DeploymentRecord
@@ -268,6 +268,7 @@ async def bridge_call(
         raise HTTPException(status_code=422, detail="bridge_numbers_must_differ")
     if not sip.sip_configured():
         raise HTTPException(status_code=409, detail="sip_not_configured")
+    limits.check_dial_rate(ctx)
     try:
         session = await sip.create_voice_session(
             record.agent_id, record.id, org_id=ctx.org_id, db=db

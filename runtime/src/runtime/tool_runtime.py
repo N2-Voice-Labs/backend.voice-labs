@@ -21,6 +21,7 @@ from urllib.parse import urlparse
 
 import httpx
 
+from . import net_guard
 from .events import RuntimeEventType
 
 if TYPE_CHECKING:
@@ -39,6 +40,10 @@ OUTCOMES = (
     "other",
 )
 MAX_RESULT_CHARS = 4000
+# ToolCalled carries the LLM-supplied arguments; cap them so one call cannot bloat the event.
+MAX_EVENT_ARGUMENT_CHARS = 2000
+# Local dev/tests only: allow HTTP tools to reach private/loopback/link-local hosts.
+ALLOW_PRIVATE_ENV = "RUNTIME_TOOL_ALLOW_PRIVATE"
 DEFAULT_HTTP_TIMEOUT_S = 5.0
 MAX_HTTP_TIMEOUT_S = 10.0
 KNOWLEDGE_SEARCH_LIMIT = 3
@@ -102,6 +107,22 @@ def _truncate_data(value: Any) -> Any:
     if len(encoded) <= MAX_RESULT_CHARS:
         return value
     return encoded[:MAX_RESULT_CHARS]
+
+
+def _cap_event_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
+    """Bound the arguments echoed into ToolCalled; the Platform requires an object."""
+
+    try:
+        encoded = json.dumps(arguments, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        encoded = str(arguments)
+    if len(encoded) <= MAX_EVENT_ARGUMENT_CHARS:
+        return arguments
+    return {"truncated": True, "json": encoded[:MAX_EVENT_ARGUMENT_CHARS]}
+
+
+def _allow_private_targets() -> bool:
+    return os.getenv(ALLOW_PRIVATE_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _missing_required(
@@ -170,7 +191,7 @@ class ToolRuntime:
                         result = _error("tool_failed")
         payload: dict[str, object] = {
             "tool_name": name,
-            "arguments": arguments,
+            "arguments": _cap_event_arguments(arguments),
             "status": "ok" if result.get("status") == "ok" else "error",
         }
         if payload["status"] == "error":
@@ -264,7 +285,22 @@ def _http_tool(
     transport: httpx.AsyncBaseTransport | None,
 ) -> ToolFunction:
     async def run(arguments: dict[str, Any]) -> dict[str, Any]:
+        # SSRF guard: the URL is tenant-configured, so resolve it, require every address to
+        # be public and connect to the validated IP (no second DNS lookup).
+        target, headers, extensions = config.url, {}, {}
+        if not _allow_private_targets():
+            try:
+                addresses = await net_guard.validate_public_url(
+                    config.url, schemes=("http", "https")
+                )
+            except net_guard.UnsafeURL:
+                _logger.warning("HTTP tool blocked: %s", urlparse(config.url).hostname)
+                return _error("url_not_allowed")
+            except net_guard.HostUnresolvable:
+                return _error("request_failed")
+            target, headers, extensions = net_guard.pinned_request(config.url, addresses)
         try:
+            # Redirects are never followed: a 3xx could point at an internal address.
             async with httpx.AsyncClient(
                 timeout=config.timeout_s, transport=transport, follow_redirects=False
             ) as client:
@@ -275,13 +311,19 @@ def _http_tool(
                         else json.dumps(value)
                         for key, value in arguments.items()
                     }
-                    response = await client.get(config.url, params=query)
+                    response = await client.get(
+                        target, params=query, headers=headers, extensions=extensions
+                    )
                 else:
-                    response = await client.post(config.url, json=arguments)
+                    response = await client.post(
+                        target, json=arguments, headers=headers, extensions=extensions
+                    )
         except httpx.TimeoutException:
             return _error("timeout")
         except httpx.HTTPError:
             return _error("request_failed")
+        if 300 <= response.status_code < 400:
+            return _error("redirect_not_followed")
         if response.status_code >= 400:
             return _error(f"http_{response.status_code}")
         try:

@@ -1,9 +1,10 @@
 """Platform API authentication and authorization (RM-004).
 
-Admin API keys come from ``PLATFORM_API_KEYS`` (comma-separated). When the variable is
-unset or empty, authentication is disabled so local development keeps working. When it
-is set, a global dependency protects every route by default; the only exceptions are
-listed explicitly below:
+Admin API keys come from ``PLATFORM_API_KEYS`` (comma-separated). A global dependency
+protects every route by default; the only exceptions are listed explicitly below. When the
+variable is unset or empty the API fails closed: every authenticated route answers 401
+``auth_not_configured`` (organisation ``vlk_`` keys and session tokens still work). Local
+development opts out explicitly with ``PLATFORM_AUTH_DISABLED=1``.
 
 * ``PUBLIC_ROUTES`` need no credentials.
 * Calls and demo routes apply feature gates; handoffs validate session/staff credentials
@@ -22,14 +23,16 @@ Every authenticated request also gets an ``AuthContext`` on ``request.state.ctx`
 3. ``vls_`` bearer -> session token, scoped by ``SESSION_SCOPED_ROUTES``.
 4. Anything else -> 401 ``invalid_api_key``.
 
-With ``PLATFORM_API_KEYS`` unset auth is disabled (principal ``dev``, default org, owner),
-but a presented ``vlk_`` key is still validated and honoured.
+With ``PLATFORM_API_KEYS`` unset and ``PLATFORM_AUTH_DISABLED=1`` auth is disabled
+(principal ``dev``, default org, owner), but a presented ``vlk_`` key is still validated and
+honoured. The ``dev`` principal only exists in that mode.
 """
 
 import hashlib
 import hmac
 import logging
 import os
+import re
 import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -41,7 +44,7 @@ from fastapi import Depends, HTTPException, Request
 from sqlalchemy import or_, update
 from sqlalchemy.orm import Session
 
-from .context import AuthContext
+from .context import AuthContext, auth_disabled
 from .db import get_db
 from .models import DEFAULT_ORGANIZATION_ID, ApiKey, Organization, VoiceSession
 
@@ -50,6 +53,7 @@ logger = logging.getLogger(__name__)
 SESSION_TOKEN_PREFIX = "vls_"
 API_KEY_PREFIX = "vlk_"
 ORGANIZATION_HEADER = "x-organization-id"
+REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")  # audit_log.request_id is String(64)
 LAST_USED_THROTTLE = timedelta(minutes=1)
 
 PUBLIC_ROUTES = frozenset({("GET", "/health")})
@@ -103,9 +107,7 @@ SESSION_SCOPED_ROUTES: dict[tuple[str, str], SessionScope] = {
     ("POST", "/voice/sessions/{session_id}/participants"): SessionScope(
         "session_id", "session", creator_only=True
     ),
-    ("POST", "/voice/sessions/{session_id}/phone-participants"): SessionScope(
-        "session_id", "session", creator_only=True
-    ),
+    # Not here on purpose: ``/phone-participants`` dials a phone, so session tokens never reach it.
     # The creator's shareable code (calls.py); a guest token cannot mint invitations.
     ("POST", "/calls/{session_id}/invite"): SessionScope(
         "session_id", "session", creator_only=True
@@ -157,10 +159,16 @@ def api_key_digests() -> tuple[str, ...]:
 def log_auth_status() -> None:
     if api_key_digests():
         logger.info("Platform API authentication enabled (%d key(s))", len(api_key_digests()))
+    elif auth_disabled():
+        logger.warning(
+            "PLATFORM_AUTH_DISABLED=1 and PLATFORM_API_KEYS is not set: Platform API "
+            "authentication is DISABLED and every caller is an owner. Local development only."
+        )
     else:
         logger.warning(
-            "PLATFORM_API_KEYS is not set: Platform API authentication is DISABLED. "
-            "Set it before exposing the API beyond local development."
+            "PLATFORM_API_KEYS is not set: authenticated Platform routes will answer 401 "
+            "auth_not_configured. Set PLATFORM_API_KEYS, or PLATFORM_AUTH_DISABLED=1 for "
+            "local development only."
         )
 
 
@@ -272,7 +280,9 @@ def _api_key_context(
 async def authenticate(request: Request, db: Session = Depends(get_db)) -> None:
     """Global dependency enforcing the route policy and building ``request.state.ctx``."""
 
-    request_id = request.headers.get("x-request-id") or str(uuid4())
+    request_id = request.headers.get("x-request-id", "")
+    if not REQUEST_ID_RE.fullmatch(request_id):  # also guards audit_log.request_id (64 chars)
+        request_id = str(uuid4())
     request.state.request_id = request_id
     route = request.scope.get("route")
     route_key = (request.method, getattr(route, "path", request.url.path))
@@ -300,8 +310,8 @@ async def authenticate(request: Request, db: Session = Depends(get_db)) -> None:
     token = token.strip()
     bearer = scheme.lower() == "bearer" and bool(token)
 
-    if not digests:
-        # Auth disabled for local development; an explicit org key is still honoured.
+    if not digests and auth_disabled():
+        # Auth explicitly disabled for local development; an explicit org key is still honoured.
         if bearer and token.startswith(API_KEY_PREFIX):
             request.state.ctx = _api_key_context(db, request, token, request_id)
         else:
@@ -313,12 +323,14 @@ async def authenticate(request: Request, db: Session = Depends(get_db)) -> None:
             )
         return
 
+    # Without admin keys (and without the explicit disable flag) there is no superadmin
+    # path: only org keys and session tokens can authenticate, everything else is refused.
     if not header:
-        raise _error(401, "authentication_required")
+        raise _error(401, "authentication_required" if digests else "auth_not_configured")
     if not bearer:
-        raise _error(401, "invalid_api_key")
+        raise _error(401, "invalid_api_key" if digests else "auth_not_configured")
     digest = hash_token(token)
-    if _matches_any(digest, digests):
+    if digests and _matches_any(digest, digests):
         request.state.ctx = AuthContext(
             org_id=_superadmin_org(db, request),
             principal="superadmin",
@@ -360,4 +372,4 @@ async def authenticate(request: Request, db: Session = Depends(get_db)) -> None:
             request_id=request_id,
         )
         return
-    raise _error(401, "invalid_api_key")
+    raise _error(401, "invalid_api_key" if digests else "auth_not_configured")

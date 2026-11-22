@@ -6,8 +6,9 @@ import importlib.util
 import sys
 from pathlib import Path
 
-import numpy as np
 import pytest
+
+np = pytest.importorskip("numpy")
 
 ROOT = Path(__file__).resolve().parents[1]
 SAMPLES = ROOT / "bench" / "samples"

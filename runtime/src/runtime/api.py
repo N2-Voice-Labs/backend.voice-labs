@@ -40,6 +40,11 @@ _participant_directories: dict[str, ParticipantDirectory] = {}
 _terminal_session_order: OrderedDict[str, None] = OrderedDict()
 _TERMINAL_SESSION_STATES = {"ended", "failed", "cancelled"}
 _MAX_TERMINAL_SESSION_HISTORY = 1024
+# Bounded waits: /end answers within the Platform's patience-plus-margin even when a session
+# is slow to stop (the session keeps stopping in the background), and shutdown never hangs
+# on a stuck session.
+END_WAIT_TIMEOUT_SECONDS = 40.0
+SHUTDOWN_WAIT_TIMEOUT_SECONDS = 30.0
 
 
 def _remember_terminal_session(session_key: str) -> None:
@@ -73,7 +78,12 @@ async def lifespan(_: FastAPI):
         if runtime_session is None or not await runtime_session.request_end():
             task.cancel()
     if tasks:
-        await asyncio.gather(*(task for _, task in tasks), return_exceptions=True)
+        _, pending = await asyncio.wait(
+            {task for _, task in tasks}, timeout=SHUTDOWN_WAIT_TIMEOUT_SECONDS
+        )
+        for task in pending:
+            logger.warning("Session task %s did not stop before shutdown; cancelling", task.get_name())
+            task.cancel()
 
 
 logger = logging.getLogger(__name__)
@@ -196,6 +206,8 @@ async def run_session(request: SessionStart) -> None:
         _session_states[session_key] = (
             "failed" if event_delivery_failed else "cancelled"
         )
+        if event_delivery_failed:
+            logger.exception("Session %s failed: Platform event delivery failed", session_key)
         if runtime_session and event_client and not pipeline_managed_lifecycle:
             await event_client.emit(
                 runtime_session.event(
@@ -212,6 +224,7 @@ async def run_session(request: SessionStart) -> None:
         raise
     except Exception as exc:
         _session_states[session_key] = "failed"
+        logger.exception("Session %s failed (%s)", session_key, type(exc).__name__)
         if runtime_session and event_client and not pipeline_managed_lifecycle:
             await event_client.emit(
                 runtime_session.event(
@@ -346,8 +359,11 @@ def _build_participant_directory(payload: SessionStart) -> ParticipantDirectory:
 
 
 def _consume_session_result(task: asyncio.Task[None]) -> None:
-    if not task.cancelled():
-        task.exception()
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error("Session task %s ended with an error", task.get_name(), exc_info=exc)
 
 
 @app.get("/sessions/{session_id}")
@@ -393,9 +409,13 @@ async def end_session(
         runtime_session = _runtime_sessions.get(key)
         if runtime_session is None or not await runtime_session.request_end():
             task.cancel()
-        results = await asyncio.gather(task, return_exceptions=True)
-        failed = _session_states.get(key) == "failed" or any(
-            isinstance(result, Exception) for result in results
+        # asyncio.wait neither cancels the session on timeout nor re-raises its error.
+        done, _ = await asyncio.wait({task}, timeout=END_WAIT_TIMEOUT_SECONDS)
+        if not done:
+            logger.warning("Session %s is still stopping after %.0fs", key, END_WAIT_TIMEOUT_SECONDS)
+            return {"status": "ending"}
+        failed = _session_states.get(key) == "failed" or (
+            not task.cancelled() and task.exception() is not None
         )
         _session_states[key] = "failed" if failed else "ended"
     elif _session_states.get(key) != "failed":

@@ -17,11 +17,11 @@ from pydantic import (
     StrictBool,
     field_validator,
 )
-from sqlalchemy import or_, select
+from sqlalchemy import and_, or_, select, update
 from sqlalchemy.orm import Session
 
 from . import audit, storage
-from .context import AuthContext, get_ctx, require, role_at_least
+from .context import AuthContext, get_ctx, is_superadmin, require, role_at_least
 from .models import Agent as AgentRecord, ProviderConfig, Voice as VoiceRecord, utcnow
 from .tenancy import bypass, get_owned, get_scoped_db, link_check, scoped
 
@@ -155,7 +155,7 @@ def get_voice_or_404(
 
 
 def require_superadmin(ctx: AuthContext = Depends(get_ctx)) -> AuthContext:
-    if ctx.principal not in {"superadmin", "dev"}:
+    if not is_superadmin(ctx):
         raise HTTPException(status_code=403, detail={"code": "superadmin_required"})
     return ctx
 
@@ -662,9 +662,28 @@ async def provision_voice(
         "sample_url": sample_reference,
     }
 
-    record.status = "processing"
-    record.failure_reason = None
+    # Claim the voice atomically: of two concurrent requests only one UPDATE matches, so
+    # only one clones at the provider (the status check above is just an early refusal).
+    claimed = db.execute(
+        update(VoiceRecord)
+        .where(
+            VoiceRecord.id == record.id,
+            or_(
+                VoiceRecord.status.in_(("pending", "failed")),
+                and_(
+                    VoiceRecord.status == "processing",
+                    VoiceRecord.updated_at < utcnow() - PROVISION_STALE_AFTER,
+                ),
+            ),
+        )
+        .values(status="processing", failure_reason=None, updated_at=utcnow())
+        .execution_options(synchronize_session=False)
+    )
+    if not claimed.rowcount:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="invalid_voice_status_transition")
     db.commit()
+    db.refresh(record)
 
     failure_reason: str | None = None
     provider_voice_id: str | None = None

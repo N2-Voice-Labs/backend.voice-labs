@@ -295,3 +295,121 @@ def test_start_warns_when_the_mode_is_left_to_the_agent_default(
     assert response.status_code == 422
     warned = any("without an explicit mode" in record.message for record in caplog.records)
     assert warned is (not mode_given)
+
+
+def test_failed_session_is_logged_with_its_id_and_no_secrets(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setenv("RUNTIME_PLATFORM_TOKEN", "platform-token-SECRET")
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-key-SECRET")
+    for name in ("LIVEKIT_URL", "RUNTIME_LIVEKIT_TOKEN", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET"):
+        monkeypatch.delenv(name, raising=False)
+
+    class EventClient:
+        async def emit(self, runtime_event) -> None:
+            return None
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr(api, "PlatformEventClient", lambda *_a, **_k: EventClient())
+    request = api.SessionStart(
+        session_id=uuid4(), conversation_id=uuid4(), agent_id=uuid4(), room_name="voice-test-room"
+    )
+
+    with caplog.at_level("ERROR", logger=api.logger.name):
+        with pytest.raises(RuntimeError):
+            asyncio.run(api.run_session(request))
+
+    records = [r for r in caplog.records if str(request.session_id) in r.getMessage()]
+    assert records and records[0].exc_info is not None
+    assert "SECRET" not in caplog.text.replace("OPENAI_API_KEY", "")
+
+
+def test_consume_session_result_logs_the_task_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def boom() -> None:
+        raise ValueError("pipeline exploded")
+
+    async def scenario() -> None:
+        task = asyncio.create_task(boom(), name="voice-session-abc")
+        task.add_done_callback(api._consume_session_result)
+        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.sleep(0)
+
+    with caplog.at_level("ERROR", logger=api.logger.name):
+        asyncio.run(scenario())
+
+    record = next(r for r in caplog.records if "voice-session-abc" in r.getMessage())
+    assert record.exc_info and record.exc_info[0] is ValueError
+
+
+def test_end_session_returns_without_waiting_forever_for_a_stuck_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("RUNTIME_PLATFORM_TOKEN", "test-runtime-token")
+    monkeypatch.setattr(api, "END_WAIT_TIMEOUT_SECONDS", 0.05)
+    session_id = uuid4()
+    key = str(session_id)
+
+    async def scenario() -> None:
+        release = asyncio.Event()
+
+        async def stubborn() -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await release.wait()  # slow to stop
+
+        task = asyncio.create_task(stubborn())
+        await asyncio.sleep(0)
+        api._active_sessions[key] = task
+        try:
+            result = await asyncio.wait_for(
+                api.end_session(session_id, x_runtime_token="test-runtime-token"), 2
+            )
+            assert result == {"status": "ending"}
+            assert not task.done()  # the wait timeout did not cancel it again
+        finally:
+            release.set()
+            await asyncio.gather(task, return_exceptions=True)
+            api._active_sessions.pop(key, None)
+            api._session_states.pop(key, None)
+
+    asyncio.run(scenario())
+
+
+def test_shutdown_is_bounded_when_a_session_will_not_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(api, "SHUTDOWN_WAIT_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(api.sip_transfer, "install_if_configured", lambda: None)
+
+    async def idle() -> None:
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(api.provider_health, "refresh_forever", idle)
+    key = str(uuid4())
+
+    async def scenario() -> None:
+        release = asyncio.Event()
+
+        async def stubborn() -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await release.wait()  # swallows the first cancellation and never stops alone
+
+        task = asyncio.create_task(stubborn())
+        await asyncio.sleep(0)
+        api._active_sessions[key] = task
+        try:
+            async with api.lifespan(api.app):
+                pass
+        finally:
+            release.set()
+            await asyncio.gather(task, return_exceptions=True)
+            api._active_sessions.pop(key, None)
+
+    asyncio.run(asyncio.wait_for(scenario(), 3))

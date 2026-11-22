@@ -6,6 +6,7 @@
 #   docker build -f runtime/Dockerfile -t voice-labs-runtime .
 #
 # Runtime keeps session ownership in process memory: run exactly ONE replica / ONE worker.
+# Graceful shutdown: uvicorn waits up to 40 s for live calls; compose sets stop_grace_period: 45s.
 
 ARG PYTHON_VERSION=3.11
 ARG UV_VERSION=0.13.6
@@ -94,4 +95,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
 
 ENTRYPOINT ["tini", "--"]
 # Single uvicorn worker on purpose (process-local session state). PORT is overridable.
-CMD ["sh", "-c", "exec uvicorn runtime.api:app --host 0.0.0.0 --port ${PORT:-8001} --timeout-graceful-shutdown 30"]
+CMD ["sh", "-c", "exec uvicorn runtime.api:app --host 0.0.0.0 --port ${PORT:-8001} --timeout-graceful-shutdown 40"]

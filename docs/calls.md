@@ -83,8 +83,8 @@ The keys in `backend.voice-labs/.env` can be loaded with `set -a; . ./.env; set 
 (or `localhost`). Put the frontend and the Platform behind HTTPS (a tunnel such as `cloudflared tunnel --url http://localhost:3000`
 and another for port 8000, or a deployment), set `NEXT_PUBLIC_PLATFORM_URL` to the Platform's HTTPS URL, and add the
 frontend's HTTPS origin to `PLATFORM_WEB_ORIGIN`. LiveKit Cloud is already `wss://`. A local `ws://localhost:7880` LiveKit
-server is unreachable from a phone; use LiveKit Cloud or expose it. Behind a proxy you run, set `PLATFORM_TRUST_PROXY=1`
-so the per-address limits see the real client address.
+server is unreachable from a phone; use LiveKit Cloud or expose it. Behind a proxy you run, set `FORWARDED_ALLOW_IPS` to the proxy's
+address range (see [Deploy](deploy.md)) so the per-address limits see the real client address.
 
 ## 4. Configuration
 
@@ -96,7 +96,7 @@ so the per-address limits see the real client address.
 | `PLATFORM_CALL_INVITE_TTL_SECS` | 1800 | How long an invitation code works (minimum 30). |
 | `PLATFORM_CALLS_PER_IP_HOUR` | 6 | Calls a client address may start per hour (0 turns the limit off). |
 | `PLATFORM_CALL_OPEN_PER_IP_MINUTE` | 30 | Invitation lookups and joins per client address per minute. |
-| `PLATFORM_TRUST_PROXY` | off | Take the client address from `X-Forwarded-For` (only behind your own proxy). |
+| `FORWARDED_ALLOW_IPS` | compose subnet | Proxies uvicorn trusts for `X-Forwarded-For`; the client address comes from uvicorn. (`PLATFORM_TRUST_PROXY` is deprecated and ignored.) |
 | `PLATFORM_MAX_ACTIVE_SESSIONS_PER_ORG` | 10 | Simultaneous calls; more get 429 `too_many_active_sessions`. |
 | `PLATFORM_STALE_SESSION_SECS` | 300 | A call with no activity this long is closed by the reaper (a call nobody joined). |
 | `PLATFORM_API_KEYS` | none | **Set it on any server others can reach.** The three public routes work without it; everything else then requires a key. |
@@ -195,7 +195,7 @@ publisher's ~200 ms lead over real time and a loopback host clock: they validate
 6. Latency end to end: use `RUNTIME_TIMELINE_DIAG=1` (the timeline events are described in [Contracts](contracts.md)); the link adds nothing to the translation path.
 7. Interruptions, overlapping speech, short utterances, sentence splitting, translation accuracy.
 8. A link sent through KakaoTalk/WhatsApp/SMS: the in-app browser may not allow the microphone; the page should be opened in the system browser (not verified).
-9. Abuse: the per-address limits behind your real proxy (`PLATFORM_TRUST_PROXY`).
+9. Abuse: the per-address limits behind your real proxy (`FORWARDED_ALLOW_IPS`).
 
 ## 8. Limitations
 

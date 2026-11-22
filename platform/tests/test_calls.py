@@ -271,3 +271,111 @@ def test_calls_speaker_language_environment(runtime, livekit, monkeypatch, confi
         response = start(client)
         assert response.status_code == 201, response.text
     assert contract_for(response.json()["session_id"])["interpreter"]["speaker_language"] == expected
+
+
+def test_a_spoofed_forwarded_for_header_cannot_pick_the_rate_limit_bucket(runtime, livekit, monkeypatch) -> None:
+    # Even with the retired switch on: the header is never read.
+    monkeypatch.setenv("PLATFORM_TRUST_PROXY", "1")
+    monkeypatch.setenv("PLATFORM_CALLS_PER_IP_HOUR", "2")
+    with TestClient(app) as client:
+        codes = [start(client).status_code]
+        for n in range(3):
+            codes.append(
+                client.post(
+                    "/calls",
+                    json={"languages": ["ko", "en"]},
+                    headers={"X-Forwarded-For": f"203.0.113.{n}, 10.0.0.1"},
+                ).status_code
+            )
+    assert codes == [201, 201, 429, 429]
+
+
+def test_client_address_is_the_socket_peer_whatever_the_headers_say(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    monkeypatch.setenv("PLATFORM_TRUST_PROXY", "1")
+    request = SimpleNamespace(
+        client=SimpleNamespace(host="198.51.100.7"), headers={"x-forwarded-for": "203.0.113.9"}
+    )
+    assert calls.client_address(request) == "198.51.100.7"
+    assert calls.client_address(SimpleNamespace(client=None, headers={})) == "unknown"
+
+
+def test_trust_proxy_is_deprecated_and_logged_at_startup(monkeypatch, caplog) -> None:
+    monkeypatch.setenv("PLATFORM_TRUST_PROXY", "1")
+    with caplog.at_level("WARNING", logger="src.platform.calls"):
+        with TestClient(app):
+            pass
+    assert sum("PLATFORM_TRUST_PROXY is deprecated" in r.message for r in caplog.records) == 1
+    caplog.clear()
+    monkeypatch.delenv("PLATFORM_TRUST_PROXY")
+    with caplog.at_level("WARNING", logger="src.platform.calls"):
+        with TestClient(app):
+            pass
+    assert not [r for r in caplog.records if r.name == "src.platform.calls"]
+
+
+def test_a_public_call_creator_token_cannot_dial_a_phone(runtime, livekit, monkeypatch) -> None:
+    monkeypatch.setenv("PLATFORM_API_KEYS", ADMIN)
+    with TestClient(app) as client:
+        call = start(client).json()
+        response = client.post(
+            f"/voice/sessions/{call['session_id']}/phone-participants",
+            json={"language": "en", "phone_number": "+821012345678"},
+            headers=bearer(call["session_token"]),
+        )
+    assert (response.status_code, response.json()) == (403, {"detail": "forbidden"})
+
+
+def _age_call(session_id: str, seconds: int) -> None:
+    from datetime import timedelta
+
+    from src.platform.models import utcnow
+
+    with SessionLocal() as db:
+        record = db.get(VoiceSession, session_id)
+        record.started_at = utcnow() - timedelta(seconds=seconds)
+        record.last_event_at = utcnow()  # healthy: only the hard cap can end it
+        db.commit()
+
+
+def test_public_calls_are_marked_and_ended_at_the_duration_cap(runtime, livekit, monkeypatch) -> None:
+    from sqlalchemy import select
+
+    from src.platform import reaper
+    from src.platform.models import RuntimeEvent
+
+    monkeypatch.delenv("PLATFORM_PUBLIC_CALL_MAX_SECONDS", raising=False)
+    with TestClient(app) as client:
+        young, old = start(client).json(), start(client).json()
+        authenticated = client.post(
+            "/voice/sessions", json={"agent_id": client.post("/agents", json={"name": "plain"}).json()["id"]}
+        ).json()
+    assert contract_for(old["session_id"])["public_call"] is True
+    assert "public_call" not in contract_for(authenticated["session_id"])  # only public calls are capped
+    _age_call(young["session_id"], 1700)
+    _age_call(old["session_id"], 1801)
+    _age_call(authenticated["session_id"], 7200)
+    with SessionLocal() as db:
+        reaped = reaper.reap_stale_sessions(db)
+        assert old["session_id"] in reaped
+        assert young["session_id"] not in reaped and authenticated["session_id"] not in reaped
+        event = db.scalars(
+            select(RuntimeEvent).where(RuntimeEvent.event_id == f"platform-stale-{old['session_id']}")
+        ).one()
+        assert event.payload["reason"] == "public_call_max_duration"
+        assert db.get(VoiceSession, old["session_id"]).status == "failed"
+
+
+def test_public_call_cap_is_configurable_and_survives_a_bad_value(runtime, livekit, monkeypatch) -> None:
+    from src.platform import reaper
+
+    with TestClient(app) as client:
+        call = start(client).json()
+    _age_call(call["session_id"], 120)
+    monkeypatch.setenv("PLATFORM_PUBLIC_CALL_MAX_SECONDS", "not-a-number")  # falls back to 1800
+    with SessionLocal() as db:
+        assert call["session_id"] not in reaper.reap_stale_sessions(db)
+    monkeypatch.setenv("PLATFORM_PUBLIC_CALL_MAX_SECONDS", "60")
+    with SessionLocal() as db:
+        assert call["session_id"] in reaper.reap_stale_sessions(db)

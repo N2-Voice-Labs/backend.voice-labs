@@ -21,6 +21,19 @@ configuration. Follow those member instructions when working within a project.
 
 See [`docs/`](docs/README.md) for contracts, status and plans.
 
+## Deploy
+
+One Ubuntu VPS, Docker Compose (Postgres + Platform + Runtime), a Cloudflare named
+tunnel for HTTPS, LiveKit Cloud for media; frontends stay on Cloudflare Workers:
+
+```sh
+git clone <repo-url> backend && cd backend
+scripts/deploy.sh        # installs Docker (asks first), writes .env, builds, starts, checks /health
+```
+
+`scripts/backup_db.sh` takes Postgres backups. Full guide: [`docs/deploy.md`](docs/deploy.md);
+every setting is documented in [`.env.example`](.env.example).
+
 ## Checks
 
 From this directory (the `pythonpath` pytest setting makes the existing `src.*`

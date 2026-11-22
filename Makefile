@@ -2,7 +2,7 @@ COMPOSE ?= docker compose
 PLATFORM_URL ?= http://localhost:8000
 PYTHON ?= python
 .DEFAULT_GOAL := up
-.PHONY: up down logs seed test
+.PHONY: up down logs seed test deploy backup
 up:
 	$(COMPOSE) up -d --build
 down:
@@ -16,3 +16,7 @@ test:
 	cd platform && $(PYTHON) -m pytest -q
 	cd runtime && $(PYTHON) -m pytest -q
 	cd evals && $(PYTHON) -m pytest -q
+deploy:
+	scripts/deploy.sh
+backup:
+	scripts/backup_db.sh

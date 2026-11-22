@@ -1,0 +1,93 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  UV_VERSION: "0.13.6"
+
+jobs:
+  pytest:
+    name: pytest (${{ matrix.suite.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        suite:
+          - {name: platform, extras: "--extra test"}
+          - {name: runtime, extras: "--extra test --extra voice"}
+          - {name: evals, extras: "--extra test"}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: "3.11"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      # `uv run --locked` syncs the member's environment from the root uv.lock and fails if
+      # the lock is out of date.
+      - name: Install and test ${{ matrix.suite.name }}
+        run: uv run --directory ${{ matrix.suite.name }} --locked ${{ matrix.suite.extras }} pytest -q
+
+  lock:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: "3.11"
+      - run: uv lock --check
+
+  compose:
+    name: docker compose config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate compose.yml with a dummy .env
+        run: |
+          cat > .env <<'EOF'
+          POSTGRES_PASSWORD=dummy
+          PLATFORM_DATABASE_URL=postgresql+psycopg://voice_labs:dummy@postgres:5432/voice_labs
+          PLATFORM_RUNTIME_TOKEN=dummy-token
+          RUNTIME_PLATFORM_TOKEN=dummy-token
+          PLATFORM_API_KEYS=dummy-admin
+          PLATFORM_STAFF_KEY=dummy-staff
+          PLATFORM_WEB_ORIGIN=https://portal.example.com
+          LIVEKIT_URL=wss://dummy.livekit.cloud
+          LIVEKIT_API_KEY=dummy
+          LIVEKIT_API_SECRET=dummy
+          EOF
+          docker compose config -q
+          docker compose --profile '*' config -q
+          rm .env
+
+  docker-build:
+    name: docker build (${{ matrix.image }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [platform, runtime]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      # Build only (no push). Context is the repository root, as in compose.yml.
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.image }}/Dockerfile
+          push: false
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}

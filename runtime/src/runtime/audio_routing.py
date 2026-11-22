@@ -81,6 +81,17 @@ from .participants import MAX_PARTICIPANTS, ParticipantDirectory, translation_de
 
 _logger = logging.getLogger(__name__)
 
+
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _background_done(task: asyncio.Task) -> None:
+    """Drop the finished task and log what went wrong (nothing else awaits it)."""
+
+    _background_tasks.discard(task)
+    if not task.cancelled() and task.exception() is not None:
+        _logger.error("Background task failed", exc_info=task.exception())
+
 # Re-apply schedule after something changed (seconds between consecutive applications).
 SYNC_BURST = (0.0, 0.1, 0.1, 0.1, 0.2, 0.3, 0.5, 1.0, 2.0)
 
@@ -409,7 +420,9 @@ class ListenerAudioRouter:
             return None
         stream, task = entry
         task.cancel()
-        asyncio.get_running_loop().create_task(_close_quietly(stream))
+        close = asyncio.get_running_loop().create_task(_close_quietly(stream))
+        _background_tasks.add(close)  # keep a reference so the task is not garbage collected
+        close.add_done_callback(_background_done)
         return task
 
     async def _publish(self, room: Any, identity: str) -> None:

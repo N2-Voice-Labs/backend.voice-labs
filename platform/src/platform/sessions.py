@@ -21,6 +21,7 @@ from .livekit import (
     listen_room_name,
     phone_room_name,
     private_listening_enabled,
+    public_livekit_url,
 )
 from .knowledge import agent_knowledge_text
 from .models import Agent as AgentRecord
@@ -230,7 +231,7 @@ def participant_connection(
     """
 
     connection: dict[str, Any] = {
-        "url": os.getenv("LIVEKIT_URL", ""),
+        "url": public_livekit_url(),
         "token": (
             create_participant_token(room_name, identity, can_subscribe=not private)
             if configured
@@ -783,7 +784,9 @@ async def withdraw_runtime_participant(session_id: str, identity: str) -> None:
 async def add_voice_session_phone_participant(
     session_id: UUID,
     payload: PhoneParticipantIn,
-    ctx: AuthContext = Depends(member_or_session),
+    # Dialling costs money and reaches any number: never a session token (the anonymous
+    # creator of a public call holds one), only an org principal with a member+ role.
+    ctx: AuthContext = Depends(require("member")),
     db: Session = Depends(get_scoped_db),
 ) -> dict[str, Any]:
     """Dial the second person of a two-person interpreter call by phone.
@@ -820,6 +823,7 @@ async def add_voice_session_phone_participant(
     dial_room = (
         phone_room_name(session.room_name, identity) if private else session.room_name
     )
+    limits.check_dial_rate(ctx)
 
     await notify_runtime_participant(session.id, identity, entry)
     try:

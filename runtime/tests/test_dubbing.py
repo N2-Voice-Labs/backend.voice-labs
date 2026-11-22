@@ -3,9 +3,9 @@
 import asyncio
 import math
 
-import numpy as np
 import pytest
 
+np = pytest.importorskip("numpy")
 pytest.importorskip("pipecat")
 livekit_rtc = pytest.importorskip("livekit.rtc")
 

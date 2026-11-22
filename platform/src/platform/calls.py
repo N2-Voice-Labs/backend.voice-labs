@@ -28,6 +28,7 @@ principal of ``PLATFORM_CALLS_ORG_ID`` (default organisation) and call only the 
 from __future__ import annotations
 
 import hashlib
+import logging
 import math
 import os
 import secrets
@@ -49,10 +50,18 @@ from .translations import TranslationIn, create_translation
 from .validation import DEFAULT_LATENCY_MODE
 
 router = APIRouter(tags=["calls"])
+logger = logging.getLogger(__name__)
 
 DEFAULT_INVITE_TTL_SECS = 30 * 60
 DEFAULT_CREATE_PER_IP = 6  # calls per client address per hour
 DEFAULT_OPEN_PER_IP = 30  # invitation lookups and joins per client address per minute
+DEFAULT_PUBLIC_CALL_MAX_SECONDS = 1800
+
+
+def public_call_max_seconds() -> int:
+    """Hard cap on a call opened without an account (``PLATFORM_PUBLIC_CALL_MAX_SECONDS``)."""
+
+    return max(1, _limit("PLATFORM_PUBLIC_CALL_MAX_SECONDS", DEFAULT_PUBLIC_CALL_MAX_SECONDS))
 
 _create_bucket = limits.TokenBucket()
 _open_bucket = limits.TokenBucket()
@@ -116,14 +125,25 @@ def _limit(name: str, default: int) -> int:
 
 
 def client_address(request: Request) -> str:
-    """The caller's address. ``X-Forwarded-For`` counts only behind a proxy you run
-    (``PLATFORM_TRUST_PROXY=1``): otherwise anyone could pick their own bucket."""
+    """The caller's address, as the server sees it.
 
-    if os.getenv("PLATFORM_TRUST_PROXY", "").strip().lower() in {"1", "true", "yes", "on"}:
-        forwarded = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
-        if forwarded:
-            return forwarded
+    Never read from ``X-Forwarded-For`` here: any client can send that header and pick its
+    own bucket. Behind a trusted proxy uvicorn (``--proxy-headers --forwarded-allow-ips``,
+    see ``docker-entrypoint.sh``) already rewrites ``request.client.host`` to the real
+    client address, and only for proxies it was told to trust.
+    """
+
     return request.client.host if request.client else "unknown"
+
+
+def warn_trust_proxy_deprecated() -> None:
+    """Log once at startup if the retired ``PLATFORM_TRUST_PROXY`` is still set."""
+
+    if os.getenv("PLATFORM_TRUST_PROXY", "").strip():
+        logger.warning(
+            "PLATFORM_TRUST_PROXY is deprecated and ignored: X-Forwarded-For is no longer read. "
+            "Configure uvicorn --forwarded-allow-ips for your proxy instead."
+        )
 
 
 def public_ctx(request: Request) -> AuthContext:
@@ -259,7 +279,13 @@ async def create_call(
         dubbing="cinematic" if payload.experience == "cinematic" else None,
         **{f"{kind}_provider_id": record for kind, record in _provider_ids(db, ctx).items()},
     )
-    return await create_translation(translation, ctx, None, db)
+    result = await create_translation(translation, ctx, None, db)
+    # Marked like a demo session: the reaper ends it at PLATFORM_PUBLIC_CALL_MAX_SECONDS
+    # whatever else is happening. Handoff calls come through here too.
+    session = db.get(VoiceSession, str(result["session_id"]))
+    session.runtime_contract = {**(session.runtime_contract or {}), "public_call": True}
+    db.commit()
+    return result
 
 
 @router.post("/calls/{session_id}/invite")

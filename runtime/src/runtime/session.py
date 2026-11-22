@@ -3,13 +3,18 @@
 import asyncio
 import inspect
 import logging
+import time
+from collections import Counter
 from collections.abc import Callable
 from enum import Enum
 from typing import TYPE_CHECKING
 from uuid import UUID
 
+import httpx
+
 from .apology import MAX_PLAYBACK_SECONDS, PLAYBACK_MARGIN_SECONDS, apology_plans, speaker_plans
-from .events import RuntimeEvent, RuntimeEventType
+from .events import RuntimeEvent, RuntimeEventType, is_critical_event
+from .events_client import is_retryable_status
 from .lifecycle import EndReason, classify_end_reason, terminal_payload
 from .participants import ParticipantDirectory
 from .provider_failures import FALLBACK_REASON, cascaded_fallback_config
@@ -17,6 +22,7 @@ from .provider_failures import FALLBACK_REASON, cascaded_fallback_config
 _EVENT_QUEUE_CAPACITY = 128
 _EVENT_DRAIN_TIMEOUT_SECONDS = 5
 _EVENT_WORKER_STOP_TIMEOUT_SECONDS = 1
+_DROP_LOG_INTERVAL_SECONDS = 10.0
 _logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
@@ -76,6 +82,10 @@ class RuntimeSession:
         self._event_delivery_task: asyncio.Task[None] | None = None
         self._event_delivery_error: Exception | None = None
         self._accepting_events = True
+        # Best-effort telemetry that was dropped (queue pressure or failed delivery), by type.
+        self.dropped_events: Counter[str] = Counter()
+        self._drop_log_at: float | None = None
+        self._drops_since_log = 0
         self._event_shutdown_expired = False
         self._close_event_client_when_worker_stops = False
 
@@ -234,7 +244,12 @@ class RuntimeSession:
         )
 
     def enqueue_event(self, event: RuntimeEvent) -> None:
-        """Queue a Platform event without waiting for network delivery."""
+        """Queue a Platform event without waiting for network delivery.
+
+        Best-effort events are dropped (counted, warning rate-limited) when the queue is
+        full; a critical event first evicts the oldest queued best-effort event. Only a
+        queue full of critical events ends the call.
+        """
 
         if not self.event_client:
             return
@@ -243,15 +258,50 @@ class RuntimeSession:
         try:
             self._event_queue.put_nowait(event)
         except asyncio.QueueFull as exc:
-            self._event_delivery_error = RuntimeError("runtime event queue capacity exceeded")
-            self._accepting_events = False
-            if self._pipeline_worker:
-                self._pipeline_cancel_task = asyncio.create_task(
-                    self.request_end(reason="Runtime event queue capacity exceeded")
-                )
-            raise self._event_delivery_error from exc
+            if not is_critical_event(event.event_type):
+                self._drop_best_effort(event, "queue full")
+                return
+            if self._evict_best_effort_event():
+                self._event_queue.put_nowait(event)
+            else:
+                self._event_delivery_error = RuntimeError("runtime event queue capacity exceeded")
+                self._accepting_events = False
+                if self._pipeline_worker:
+                    self._pipeline_cancel_task = asyncio.create_task(
+                        self.request_end(reason="Runtime event queue capacity exceeded")
+                    )
+                raise self._event_delivery_error from exc
         if self._event_delivery_task is None:
             self._event_delivery_task = asyncio.create_task(self._deliver_events())
+
+    def _evict_best_effort_event(self) -> bool:
+        """Drop the oldest queued best-effort event to make room; False if none is queued."""
+
+        queued = self._event_queue._queue  # type: ignore[attr-defined]  # deque, no public API
+        for index, candidate in enumerate(queued):
+            if not is_critical_event(candidate.event_type):
+                del queued[index]
+                self._event_queue.task_done()
+                self._drop_best_effort(candidate, "evicted by critical event")
+                return True
+        return False
+
+    def _drop_best_effort(self, event: RuntimeEvent, reason: str) -> None:
+        self.dropped_events[event.event_type] += 1
+        self._drops_since_log += 1
+        now = time.monotonic()
+        if self._drop_log_at is None or now - self._drop_log_at >= _DROP_LOG_INTERVAL_SECONDS:
+            _logger.warning(
+                "Dropped %s best-effort Platform event(s) for session %s (latest: %s, %s); "
+                "total dropped by type: %s",
+                self._drops_since_log,
+                self.session_id,
+                event.event_type,
+                reason,
+                dict(self.dropped_events),
+            )
+            self._drop_log_at = now
+            self._drops_since_log = 0
 
     async def close_event_dispatcher(self) -> bool:
         """Drain queued events and stop the per-session delivery task."""
@@ -332,6 +382,10 @@ class RuntimeSession:
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
+                    if self._drop_undeliverable_event(event, exc):
+                        continue
+                    # A critical event could not be delivered even after the long retry
+                    # budget: the Platform would hold an incomplete record, so end the call.
                     self._event_delivery_error = exc
                     self._accepting_events = False
                     _logger.exception(
@@ -364,6 +418,30 @@ class RuntimeSession:
                     _logger.exception(
                         "Failed to close Platform event client for session %s", self.session_id
                     )
+
+    def _drop_undeliverable_event(self, event: RuntimeEvent, exc: Exception) -> bool:
+        """Log and drop a failed event when the call can carry on without it.
+
+        Best-effort events are always dropped. Any event the Platform permanently rejects
+        (a non-retryable 4xx) is dropped too: retrying or ending the call cannot fix it.
+        Returns False for a critical event whose delivery failed transiently past the
+        retry budget.
+        """
+
+        status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
+        rejected = status is not None and not is_retryable_status(status)
+        if is_critical_event(event.event_type):
+            if not rejected:
+                return False
+            _logger.warning(
+                "Platform rejected %s event with status %s for session %s; dropped",
+                event.event_type,
+                status,
+                self.session_id,
+            )
+            return True
+        self._drop_best_effort(event, f"delivery failed: {type(exc).__name__}")
+        return True
 
     def _discard_pending_events(self) -> int:
         discarded = 0
@@ -408,7 +486,7 @@ class RuntimeSession:
             from pipecat.workers.runner import WorkerRunner
 
             from .lifecycle import attach_lifecycle
-            from .pipeline import PipelineConfig, build_livekit_pipeline
+            from .pipeline import PipelineConfig, build_livekit_pipeline, refreshed_livekit_token
 
             if not isinstance(config, PipelineConfig):
                 raise TypeError("config must be a PipelineConfig")
@@ -477,6 +555,8 @@ class RuntimeSession:
                     break
                 # PR-30: the realtime engine failed; carry on with the cascaded pipeline.
                 config, self._next_config = self._next_config, None
+                # The runtime-minted LiveKit token is short-lived: re-mint for the restart.
+                config = refreshed_livekit_token(config)
                 await self._reset_for_restart()
                 if self._restart_cancelled:
                     break  # ended while the restart was being prepared
@@ -498,6 +578,7 @@ class RuntimeSession:
             reason = EndReason.CANCELLED
             raise
         except Exception as exc:
+            _logger.exception("Pipeline for session %s failed", self.session_id)
             event_type = "SessionFailed"
             outcome = "failed"
             reason = EndReason.RUNTIME_ERROR

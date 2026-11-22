@@ -4,6 +4,7 @@ PLATFORM_DEMO_AGENTS maps public keys to agent IDs ("key=id,key2=id2").
 PLATFORM_DEMO_MAX_SECONDS defaults to 300; the session reaper enforces the limit
 on its next pass, even if Runtime events keep arriving.
 """
+import logging
 import os
 import re
 from datetime import timedelta
@@ -17,6 +18,7 @@ from starlette.concurrency import run_in_threadpool
 from sqlalchemy.orm import Session
 
 from . import limits, rag
+from .calls import _limit as env_int
 from .calls import client_address, limit_create, limit_open
 from .context import AuthContext, get_ctx
 from .knowledge import agent_knowledge_text, search_agent_knowledge
@@ -25,6 +27,8 @@ from .sessions import open_voice_session
 from .tenancy import get_scoped_db, scoped
 
 router = APIRouter(tags=["demo"])
+logger = logging.getLogger(__name__)
+_anthropic_missing_logged = False
 _chat_bucket = limits.TokenBucket()
 CHAT_INSTRUCTION = (
     "This is a text chat, not a voice call: the voice-only rules above about reply length, lists and not "
@@ -36,6 +40,13 @@ CHAT_INSTRUCTION = (
     "If the user needs a person, say they can ask to be connected to a staff member. "
     "Append [HANDOFF] when the user asks for a person or the answer is not in the knowledge."
 )
+
+
+def env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, "").strip() or default)
+    except ValueError:
+        return default
 
 
 def configured_agents() -> dict[str, str]:
@@ -68,7 +79,7 @@ class ChatIn(BaseModel):
 
 
 def limit_chat(request: Request) -> None:
-    per_minute = max(0, int(os.getenv("PLATFORM_CHAT_PER_IP_MINUTE", "20")))
+    per_minute = env_int("PLATFORM_CHAT_PER_IP_MINUTE", 20)
     if per_minute <= 0:
         return
     wait = _chat_bucket.take(client_address(request), per_minute)
@@ -82,7 +93,14 @@ def limit_chat(request: Request) -> None:
 
 async def anthropic_completion(messages: list[dict[str, str]]) -> str:
     """Claude via the Anthropic SDK (PLATFORM_CHAT_LLM_PROVIDER=anthropic, e.g. for demo day)."""
-    import anthropic  # optional dependency: only needed when this provider is selected
+    global _anthropic_missing_logged
+    try:
+        import anthropic  # optional dependency: only needed when this provider is selected
+    except ImportError:
+        if not _anthropic_missing_logged:
+            _anthropic_missing_logged = True
+            logger.error("PLATFORM_CHAT_LLM_PROVIDER=anthropic but the anthropic package is not installed")
+        raise HTTPException(status_code=503, detail="chat_unavailable") from None
 
     key = os.getenv("ANTHROPIC_API_KEY")
     if not key:
@@ -93,7 +111,7 @@ async def anthropic_completion(messages: list[dict[str, str]]) -> str:
         async with anthropic.AsyncAnthropic(api_key=key, timeout=30.0) as client:
             response = await client.messages.create(
                 model=os.getenv("PLATFORM_CHAT_LLM_MODEL", "claude-haiku-5-5"),
-                max_tokens=int(os.getenv("PLATFORM_CHAT_LLM_MAX_TOKENS", "2000")),
+                max_tokens=env_int("PLATFORM_CHAT_LLM_MAX_TOKENS", 2000) or 2000,
                 output_config={"effort": os.getenv("PLATFORM_CHAT_LLM_EFFORT", "low")},
                 system=system, messages=turns,
             )
@@ -115,10 +133,10 @@ async def chat_completion(messages: list[dict[str, str]]) -> str:
     base_url = os.getenv("PLATFORM_CHAT_LLM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai").rstrip("/")
     url = f"{base_url}/chat/completions"
     payload = {"model": os.getenv("PLATFORM_CHAT_LLM_MODEL", "gemini-3.5-flash-lite"), "messages": messages,
-               "temperature": float(os.getenv("PLATFORM_CHAT_LLM_TEMPERATURE", "0.4")),
-               "max_tokens": int(os.getenv("PLATFORM_CHAT_LLM_MAX_TOKENS", "700"))}
+               "temperature": env_float("PLATFORM_CHAT_LLM_TEMPERATURE", 0.4),
+               "max_tokens": env_int("PLATFORM_CHAT_LLM_MAX_TOKENS", 700) or 700}
     try:
-        async with httpx.AsyncClient(timeout=float(os.getenv("PLATFORM_CHAT_LLM_TIMEOUT", "20"))) as client:
+        async with httpx.AsyncClient(timeout=env_float("PLATFORM_CHAT_LLM_TIMEOUT", 20.0)) as client:
             response = await client.post(url, json=payload, headers={"Authorization": f"Bearer {key}"})
             response.raise_for_status()
             return response.json()["choices"][0]["message"]["content"]
@@ -161,7 +179,7 @@ async def chat(key: str, payload: ChatIn, ctx: AuthContext = Depends(public_ctx)
     system_parts = [agent.system_prompt or "", CHAT_INSTRUCTION]
     hits = []
     if os.getenv("PLATFORM_CHAT_KNOWLEDGE_MODE", "rag") == "inline":
-        max_chars = max(0, int(os.getenv("PLATFORM_INLINE_KNOWLEDGE_MAX_CHARS", "60000")))
+        max_chars = env_int("PLATFORM_INLINE_KNOWLEDGE_MAX_CHARS", 60000)
         knowledge = agent_knowledge_text(db, ctx.org_id, agent.id)
         if knowledge and len(knowledge) > max_chars:
             snippets = search_agent_knowledge(db, ctx.org_id, agent.id, query=payload.message, limit=5)

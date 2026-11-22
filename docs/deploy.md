@@ -1,138 +1,188 @@
-# UNAI MVP demo deployment
+# Deploying the backend on one VPS
 
-This kit runs Platform, Runtime and Postgres on one Docker host, using LiveKit
-Cloud for media. The two frontends deploy separately to Cloudflare Workers.
-Run commands from the backend repository root unless stated otherwise. Do not
-merge the old deployment branch. Images use the root workspace lock with
-`uv sync --locked`; Platform runs `alembic upgrade head` before serving, including
-`0015_handoffs`. Keep one Platform instance and one Runtime worker for this demo;
-session ownership and throttling include process-local state.
+Platform, Runtime and Postgres run with Docker Compose on a single Ubuntu VPS.
+Media goes through LiveKit Cloud; HTTPS comes from a Cloudflare named tunnel (the
+VPS opens no inbound ports besides SSH). The two frontends are separate Cloudflare
+Workers. Run everything from the repository root.
 
-1. Prepare a server or laptop with Docker Engine/Desktop and Docker Compose.
-   For seeding, also install Python 3.11+ with `httpx` (the Platform environment
-   already includes it). Keep the existing `agents/inha-admissions` seed pack
-   and `scripts/seed_demo_agent.py` in the host checkout. They are not image assets.
-   Back up any existing database before migrating; initial demo setup should use
-   the new Compose-managed Postgres volume.
+Keep exactly one Platform and one Runtime container: session ownership and rate
+limiting live in process memory.
 
-2. Copy `.env.example` to `.env` yourself and fill the blank required values.
-   Generate independent random Postgres, admin and staff secrets, plus one shared
-   Runtime token copied into both `PLATFORM_RUNTIME_TOKEN` and
-   `RUNTIME_PLATFORM_TOKEN`. Set `PLATFORM_DATABASE_URL` to
-   `postgresql+psycopg://voice_labs:<URL-encoded-password>@postgres:5432/voice_labs`
-   (adjust user/database if changed). Set the LiveKit Cloud `wss://` URL and its
-   API key/secret. Fill ElevenLabs key/voice ID, Gemini key and Google Translate
-   key with access to the corresponding APIs. Confirm the chat model and the
-   seed agent's configured model are available to your account. Chat can use the
-   optional `PLATFORM_CHAT_LLM_API_KEY`/`PLATFORM_CHAT_LLM_BASE_URL` overrides.
-   Leave `PLATFORM_DEMO_AGENTS` blank until seeded. No `LIVEKIT_PUBLIC_URL` is used:
-   current Platform returns `LIVEKIT_URL` directly to browsers.
+## 1. Rent a VPS
 
-3. Start the backend:
+Ubuntu 22.04 or 24.04, 4 vCPU / 8 GB RAM, 40 GB disk. Pick a region near the
+users, e.g. Seoul for the Inha demo. Add your SSH key. No firewall changes are
+needed; if you use `ufw`, allow only SSH, because the tunnel connects outbound.
 
-   ```sh
-   docker compose up -d
-   docker compose ps
-   docker compose logs --tail=100 platform runtime
-   ```
+Accounts you need before the next step: LiveKit Cloud (project `wss://` URL, API
+key and secret), ElevenLabs (API key and voice ID), Gemini API key, Google Cloud
+Translation API key, and a Cloudflare account with a domain on it.
 
-   Compose builds missing images; use `docker compose up -d --build` after source
-   changes. Platform waits for healthy Postgres and Runtime, then migrates before
-   becoming healthy. Image healthchecks call each service's `/health`; these are
-   liveness checks, not proof of provider credentials or working audio. Postgres
-   persists in `postgres-data`. `make down` keeps that volume.
+## 2. Clone and deploy
 
-4. Seed through the running Platform API with a key from `PLATFORM_API_KEYS`:
+```sh
+git clone <repo-url> backend && cd backend
+scripts/deploy.sh
+```
 
-   ```sh
-   python scripts/seed_demo_agent.py --platform-url http://localhost:8000 --api-key '<admin-key>'
-   ```
+The script is safe to re-run. It offers to install Docker (official convenience
+script, asks first), creates `.env` from `.env.example`, generates the random
+secrets (Postgres password, `PLATFORM_API_KEYS`, `PLATFORM_STAFF_KEY`, the shared
+Platform/Runtime token) and builds `PLATFORM_DATABASE_URL`.
 
-   Run this with the prepared Python environment; alternatively use
-   `uv run --locked --package platform-voice-labs python scripts/seed_demo_agent.py ...`.
-   `make seed API_KEY='<admin-key>'` is a shortcut. Paste the printed
-   `PLATFORM_DEMO_AGENTS=inha-admissions=<UUID>` line into `.env`, replacing the
-   blank line. Apply it with:
+- The **admin API key is printed once**, at the run that generates it. Store it in
+  a password manager; it is also in `.env` (mode 600). Never put it in a frontend
+  build variable.
+- It then stops and lists the required values still blank: `LIVEKIT_URL`,
+  `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`, `ELEVENLABS_API_KEY`,
+  `ELEVENLABS_VOICE_ID`, `GEMINI_API_KEY`, `GOOGLE_TRANSLATE_API_KEY` and
+  `PLATFORM_WEB_ORIGIN`. Edit `.env` (`nano .env`) and run `scripts/deploy.sh`
+  again. You can set `PLATFORM_WEB_ORIGIN` to a guess now and correct it in step 5.
+- Then it runs `docker compose up -d --build`, waits for health and calls
+  `http://127.0.0.1:8000/health`. The first build takes several minutes.
+- It offers to seed the demo agent (`agents/inha-admissions`) and prints the
+  `PLATFORM_DEMO_AGENTS=inha-admissions=<UUID>` line. Paste it into `.env`, then
+  apply it (a plain `restart` does not reload `.env`):
 
-   ```sh
-   docker compose up -d --force-recreate platform
-   ```
+  ```sh
+  docker compose up -d --force-recreate platform
+  ```
 
-   A plain `docker compose restart platform` does not reload changed environment
-   values. Keep the admin key out of browser build variables.
+Platform runs `alembic upgrade head` on every start, under a Postgres advisory
+lock, so restarts are safe. Healthchecks are liveness only; they do not prove that
+provider keys work.
 
-5. Expose only Platform over HTTPS. For a quick demo, run cloudflared on the host:
+## 3. Cloudflare named tunnel
 
-   ```sh
-   cloudflared tunnel --url http://localhost:8000
-   ```
+Create the tunnel once in the Cloudflare dashboard, then choose where cloudflared
+runs.
 
-   Keep that process running and record the assigned HTTPS URL. Quick tunnel
-   hostnames change when restarted; update frontend build variables and redeploy
-   if they change. For a stable URL use a named tunnel or a TLS reverse proxy on
-   the same host targeting `127.0.0.1:8000`. Runtime and Postgres have no published
-   host ports. LiveKit Cloud already provides `wss://` media signaling. The template
-   enables `PLATFORM_TRUST_PROXY=1` and Uvicorn forwarded headers; keep Platform's
-   host port loopback-bound and ensure the chosen proxy supplies trusted client IP
-   headers. A containerized proxy must share the Compose network and target
-   `http://platform:8000` instead.
+1. Cloudflare dashboard > **Zero Trust** > **Networks** > **Tunnels** > **Create a
+   tunnel** > **Cloudflared** > name it (e.g. `unai-backend`) > **Save tunnel**.
+2. Copy the **token** (the long string after `--token` / `service install` in the
+   shown command). You do not need to run the command it shows, except in option B.
+3. Open the tunnel's **Public Hostname** tab (newer dashboards call it *Published
+   application routes*) > **Add**: subdomain `api`, domain your domain, **Type
+   HTTP**, **URL** as below. Save. Cloudflare creates the DNS record for you.
 
-6. Build/deploy the frontends from their separate checkouts, following each repo's
-   existing Cloudflare configuration and authentication:
+**Option A, compose profile (default, recommended).** The URL is
+`http://platform:8000`. Put the token in `.env` and start:
 
-   - `frontend.voice-labs` (Inha portal), Worker `frontend-voice-labs`: configure
-     `NEXT_PUBLIC_PLATFORM_URL=<Platform HTTPS URL>` and
-     `NEXT_PUBLIC_PORTAL_AGENT_KEY=inha-admissions`, then run `npm run deploy`.
-   - `frontend` (marketing), Worker `voice-labs`: configure
-     `NEXT_PUBLIC_PORTAL_URL=<deployed portal URL>`, then run `npm run deploy`.
+```sh
+# .env
+TUNNEL_TOKEN=<token>
+COMPOSE_PROFILES=tunnel      # scripts/deploy.sh sets this automatically when TUNNEL_TOKEN is set
+```
 
-   These public variables must be present at build time. Worker names, deploy
-   scripts and frontend behavior are requested deployment targets and have not
-   been checked against the separate frontend repositories here.
+```sh
+docker compose up -d         # starts cloudflared after Platform is healthy
+docker compose logs --tail=20 cloudflared   # look for "Registered tunnel connection"
+```
 
-7. Set `PLATFORM_WEB_ORIGIN` to the actual portal and marketing origins, e.g.
-   `https://frontend-voice-labs.<subdomain>.workers.dev,https://voice-labs.<subdomain>.workers.dev` (use actual
-   account subdomains or custom domains). Current Platform splits on commas and
-   trims whitespace. Origins include scheme and hostname, without paths or a
-   trailing slash. The portal origin is required. Recreate Platform as in step 4
-   after changing this setting. CORS does not replace API authentication.
+**Option B, cloudflared on the host.** The URL is `http://localhost:8000`. Platform's
+port is published on `127.0.0.1:8000` only. Install cloudflared from Cloudflare's
+package repository (see developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads),
+then `sudo cloudflared service install <token>`. Leave `TUNNEL_TOKEN` and
+`COMPOSE_PROFILES` blank.
 
-8. Complete the smoke checklist:
+Check from anywhere: `curl https://api.example.com/health` returns 200.
 
-   - `curl --fail https://<platform-host>/health` returns 200.
-   - `curl --fail https://<platform-host>/demo/agents/inha-admissions` returns the
-     seeded public agent. Check portal chat and knowledge-grounded answers.
-   - Open `<portal-url>/staff` and enter the staff key. The backing API is
-     `GET /staff/handoffs` with `X-Staff-Key`, not a backend `/staff` webpage.
-     Verify an absent/incorrect key fails.
-   - Start a voice call from the portal, allow microphone access, speak and hear
-     an answer; verify transcript and hangup. Confirm provider errors in logs.
-   - Request human handoff on device one; on device two open the staff page,
-     accept/join, and verify bidirectional translated audio (different languages).
-   - Repeat on mobile over HTTPS, including permission prompts, speaker output,
-     reconnect/end behavior and session cleanup after the configured demo cap.
+**Client IPs.** Per-IP rate limits use the address uvicorn derives from `X-Forwarded-For`. `.env` pins the compose network to `COMPOSE_SUBNET=172.29.0.0/24` and sets
+`FORWARDED_ALLOW_IPS` to the same subnet. Both topologies connect from inside it
+(option A from the cloudflared container, option B through the published port as the
+network gateway `172.29.0.1`), so Platform trusts `X-Forwarded-For` from exactly the
+tunnel and nothing else. Do not set `127.0.0.1` (nothing connects from there). `*`
+also works only because the host port is loopback-bound, but it trusts a
+client-controlled header value, so prefer the subnet. Change both values together if
+that subnet clashes with your network.
 
-`make up`, `make down`, `make logs S=platform`, `make seed` and `make test`
-provide shortcuts. `make test` runs each member's pytest suite from its directory;
-install each member's test dependencies first. Never use volume deletion as a
-routine restart.
+## 4. Frontends and CORS
 
-For optional local LiveKit, set `COMPOSE_PROFILES=local-livekit`, provide local
-LiveKit credentials, set `LIVEKIT_URL=ws://<Docker-host-LAN-IP>:7880`, and set
-`rtc.node_ip` in `docker/livekit.yaml` to the same reachable IP. This avoids a
-container-only hostname being returned to browsers. Local non-TLS signaling is
-for local development; use Cloud for the HTTPS demo. The local LiveKit profile
-has a restart policy but no image-bundled healthcheck; app healthchecks do not
-validate its media connectivity.
+Set the frontend's Platform URL to the tunnel hostname and redeploy each Worker
+(the variables are baked in at build time):
 
-Verification boundary: Compose validation and image-build results are reported
-with the delivery. Live migrations against Postgres, seeding, provider access,
-tunnel publication, both Worker deployments, browser audio, two-device handoff
-and mobile behavior require operator verification with real credentials/devices.
+- Portal (`frontend.voice-labs`): `NEXT_PUBLIC_PLATFORM_URL=https://api.example.com`,
+  `NEXT_PUBLIC_PORTAL_AGENT_KEY=inha-admissions`, `npm run deploy`.
+- Marketing site (`frontend`): `NEXT_PUBLIC_PORTAL_URL=<portal URL>`, `npm run deploy`.
 
-Local delivery checks: both default and `local-livekit` Compose configurations
-validated with a dummy env file; both image dependency selections passed
-`uv sync --locked --dry-run`. Image builds were attempted but could not connect
-to `/var/run/docker.sock` (permission denied), so neither image is build-verified.
-The committable template is `.env.example` (the ignore rules allow it); the local
-`.env.deploy.example`/`.env.public.example` copies are ignored and not needed.
+Then set `PLATFORM_WEB_ORIGIN` in `.env` to the exact frontend origins,
+comma-separated, scheme and host only (no path, no trailing slash), e.g.
+`https://frontend-voice-labs.<acct>.workers.dev,https://voice-labs.<acct>.workers.dev`,
+and apply it with `docker compose up -d --force-recreate platform`. Staff open
+`<portal URL>/staff` and enter `PLATFORM_STAFF_KEY`.
+
+## 5. Test from a phone
+
+Switch the phone to mobile data (not the office Wi-Fi), open the portal over HTTPS,
+allow the microphone, start a call, speak and listen for the answer, hang up. For
+the handoff flow, use two devices in different languages and check both directions.
+`docker compose logs -f platform runtime` while testing shows provider errors.
+
+Venue note: the audience shares one public IP, so per-IP limits default high
+(`PLATFORM_CALLS_PER_IP_HOUR=60`, `PLATFORM_CHAT_PER_IP_MINUTE=60`). Keep
+`PLATFORM_MAX_ACTIVE_SESSIONS_PER_ORG` at or below `RUNTIME_MAX_SESSIONS` (4 fits
+this VPS) and lower the per-IP limits again after the event.
+
+## 6. Backups
+
+```sh
+scripts/backup_db.sh        # ./backups/voice_labs-<UTC time>.sql.gz, keeps the newest 14
+```
+
+Cron (daily 03:15 server time, keep 30; adjust the path, `crontab -e`):
+
+```cron
+15 3 * * * cd /home/ubuntu/backend && KEEP=30 scripts/backup_db.sh >> backups/backup.log 2>&1
+```
+
+Copy `backups/` off the VPS (e.g. `rclone` or `scp`) because the volume and the dumps
+live on the same disk. Restore (stop Platform first, start it again afterwards):
+
+```sh
+docker compose stop platform
+gunzip -c backups/<file>.sql.gz | docker compose exec -T postgres psql -U voice_labs -d voice_labs
+docker compose start platform
+```
+
+Never delete the `postgres-data` volume as a routine restart.
+
+## 7. Updating
+
+```sh
+git pull && docker compose up -d --build
+```
+
+Migrations run on start. Take a backup first when a release adds migrations.
+`docker compose logs --tail=50 platform` confirms the new version started.
+Runtime waits up to 45 s for live calls to finish when it stops, so an update
+briefly interrupts calls in progress.
+
+## Troubleshooting
+
+- **Logs and state:** `docker compose ps`; `docker compose logs -f --tail=100 platform runtime cloudflared`
+  (`make logs S=platform`). Raise detail with `PLATFORM_LOG_LEVEL=DEBUG`, then recreate.
+- **Health:** `curl -s http://127.0.0.1:8000/health` on the VPS; if that works but
+  the public hostname does not, the problem is the tunnel (hostname route, token,
+  `docker compose logs cloudflared`). Platform has `restart: unless-stopped`, and a
+  crash loop on start usually shows a missing/invalid `.env` value or failed migration.
+- **Browser CORS error:** the page's origin is not in `PLATFORM_WEB_ORIGIN`. Compare
+  it to the address bar exactly (scheme, host, no trailing slash), edit `.env`,
+  and `docker compose up -d --force-recreate platform`. A 401 shown as a CORS
+  error means the API key/staff key is wrong or missing.
+- **LiveKit connection fails in the browser:** `LIVEKIT_URL` must be the `wss://`
+  project URL from LiveKit Cloud (not `https://`, not `ws://` on an HTTPS page). If
+  browsers need a different URL than the server uses, set `LIVEKIT_PUBLIC_URL`
+  (it defaults to `LIVEKIT_URL`). Check the key/secret belong to the same project.
+- **Provider quota or key errors (429, 401, "provider unavailable"):** check the
+  Runtime logs for the failing provider; confirm the key and quota in the
+  ElevenLabs / Gemini / Google Cloud / LiveKit consoles. Providers marked down
+  are reported by Platform; set `PLATFORM_ALERT_WEBHOOK_URL` for notifications.
+- **Platform returns 401 everywhere:** `PLATFORM_API_KEYS` is blank or the client
+  sends another key. `PLATFORM_AUTH_DISABLED=1` bypasses auth: never use it in prod.
+- **Chat with Claude:** set `PLATFORM_CHAT_LLM_PROVIDER=anthropic`, `ANTHROPIC_API_KEY`
+  and `PLATFORM_CHAT_LLM_MODEL=claude-haiku-5-5`; the image already contains the SDK.
+- **Disk filling up:** `docker system df`, `docker image prune -f`; prune old backups.
+
+Local LiveKit (development only): `COMPOSE_PROFILES=local-livekit`,
+`LIVEKIT_URL=ws://<LAN-IP>:7880` and `rtc.node_ip` in `docker/livekit.yaml` set to the
+same IP. Use LiveKit Cloud for the HTTPS/mobile demo.

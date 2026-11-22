@@ -1,9 +1,25 @@
-# LiveKit Cloud by default. Copy .env.example to .env and fill required values.
+# Single-host deployment: LiveKit Cloud for media, Cloudflare tunnel for HTTPS.
+# Copy .env.example to .env (or run scripts/deploy.sh) and fill the required values.
+#
+# Every environment variable the code reads is either forwarded below or deliberately
+# omitted (see the "Not forwarded" note at the end of each service). Secrets are scoped
+# per service: Runtime never receives admin/staff keys or the database URL; Platform
+# never receives speech-provider keys (ElevenLabs/Cartesia/Deepgram/OpenAI/Google Translate).
 name: unai-mvp
 x-livekit-env: &livekit-env
   LIVEKIT_URL: ${LIVEKIT_URL:?Set the LiveKit Cloud wss URL}
   LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:?Set LiveKit API key}
   LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:?Set LiveKit API secret}
+
+# Fixed compose subnet so FORWARDED_ALLOW_IPS can trust exactly the proxy that fronts
+# Platform: a cloudflared container in this network, or cloudflared on the host (the
+# host reaches the published port through this network's gateway, 172.29.0.1).
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: ${COMPOSE_SUBNET:-172.29.0.0/24}
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -18,43 +34,78 @@ services:
       timeout: 5s
       retries: 20
     restart: unless-stopped
+
   platform:
     build: {context: ., dockerfile: platform/Dockerfile}
     environment:
       <<: *livekit-env
       PORT: "8000"
       PLATFORM_MIGRATE_ON_START: "1"
-      FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-127.0.0.1}
+      # Which peers may set X-Forwarded-For/Proto; Platform's per-IP rate limits use the
+      # client address uvicorn derives from it. Default: the compose subnet, which covers
+      # cloudflared in compose and cloudflared on the host. See .env.example.
+      FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-${COMPOSE_SUBNET:-172.29.0.0/24}}
       RUNTIME_API_URL: ${RUNTIME_API_URL:-http://runtime:8001}
       PLATFORM_DATABASE_URL: ${PLATFORM_DATABASE_URL:?Set PLATFORM_DATABASE_URL}
       PLATFORM_RUNTIME_TOKEN: ${PLATFORM_RUNTIME_TOKEN:?Set PLATFORM_RUNTIME_TOKEN}
       PLATFORM_API_KEYS: ${PLATFORM_API_KEYS:?Set PLATFORM_API_KEYS}
-      PLATFORM_WEB_ORIGIN: ${PLATFORM_WEB_ORIGIN:-https://frontend-voice-labs.<subdomain>.workers.dev,https://voice-labs.<subdomain>.workers.dev}
-      PLATFORM_TRUST_PROXY: ${PLATFORM_TRUST_PROXY:-1}
+      PLATFORM_STAFF_KEY: ${PLATFORM_STAFF_KEY:?Set PLATFORM_STAFF_KEY}
+      # Never set to 1 in production: it turns API authentication off.
+      PLATFORM_AUTH_DISABLED: ${PLATFORM_AUTH_DISABLED:-0}
+      PLATFORM_WEB_ORIGIN: ${PLATFORM_WEB_ORIGIN:?Set PLATFORM_WEB_ORIGIN to the frontend origin(s)}
+      PLATFORM_LOG_LEVEL: ${PLATFORM_LOG_LEVEL:-INFO}
+      # Browser-facing LiveKit URL; defaults to LIVEKIT_URL (the server-side URL).
+      LIVEKIT_PUBLIC_URL: ${LIVEKIT_PUBLIC_URL:-${LIVEKIT_URL}}
       PLATFORM_PUBLIC_CALLS: ${PLATFORM_PUBLIC_CALLS:-1}
+      PLATFORM_PUBLIC_CALL_MAX_SECONDS: ${PLATFORM_PUBLIC_CALL_MAX_SECONDS:-1800}
       PLATFORM_CALLS_PROVIDERS: ${PLATFORM_CALLS_PROVIDERS:-stt=elevenlabs,llm=google-translate,tts=elevenlabs}
+      PLATFORM_CALLS_SPEAKER_LANGUAGE: ${PLATFORM_CALLS_SPEAKER_LANGUAGE:-auto}
+      PLATFORM_CALLS_ORG_ID: ${PLATFORM_CALLS_ORG_ID:-}
+      PLATFORM_PRIVATE_LISTENING: ${PLATFORM_PRIVATE_LISTENING:-1}
       PLATFORM_DEMO_AGENTS: ${PLATFORM_DEMO_AGENTS:-}
       PLATFORM_DEMO_MAX_SECONDS: ${PLATFORM_DEMO_MAX_SECONDS:-300}
-      PLATFORM_STAFF_KEY: ${PLATFORM_STAFF_KEY:?Set PLATFORM_STAFF_KEY}
       PLATFORM_HANDOFF_STAFF_LANGUAGE: ${PLATFORM_HANDOFF_STAFF_LANGUAGE:-ko}
+      # Demo chat: Gemini through its OpenAI-compatible endpoint by default; Claude optional.
+      PLATFORM_CHAT_KNOWLEDGE_MODE: ${PLATFORM_CHAT_KNOWLEDGE_MODE:-rag}
+      PLATFORM_EMBEDDING_MODEL: ${PLATFORM_EMBEDDING_MODEL:-gemini-embedding-001}
       PLATFORM_INLINE_KNOWLEDGE_MAX_CHARS: ${PLATFORM_INLINE_KNOWLEDGE_MAX_CHARS:-60000}
+      PLATFORM_CHAT_LLM_PROVIDER: ${PLATFORM_CHAT_LLM_PROVIDER:-openai_compatible}
       PLATFORM_CHAT_LLM_MODEL: ${PLATFORM_CHAT_LLM_MODEL:-gemini-3.5-flash-lite}
+      PLATFORM_CHAT_LLM_API_KEY: ${PLATFORM_CHAT_LLM_API_KEY:-}
+      PLATFORM_CHAT_LLM_BASE_URL: ${PLATFORM_CHAT_LLM_BASE_URL:-https://generativelanguage.googleapis.com/v1beta/openai}
+      PLATFORM_CHAT_LLM_EFFORT: ${PLATFORM_CHAT_LLM_EFFORT:-low}
+      PLATFORM_CHAT_LLM_MAX_TOKENS: ${PLATFORM_CHAT_LLM_MAX_TOKENS:-700}
+      PLATFORM_CHAT_LLM_TEMPERATURE: ${PLATFORM_CHAT_LLM_TEMPERATURE:-0.4}
+      PLATFORM_CHAT_LLM_TIMEOUT: ${PLATFORM_CHAT_LLM_TIMEOUT:-20}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      # Limits (process-local: one Platform replica only).
       PLATFORM_MAX_ACTIVE_SESSIONS_PER_ORG: ${PLATFORM_MAX_ACTIVE_SESSIONS_PER_ORG:-3}
-      PLATFORM_SESSION_CREATE_RATE: ${PLATFORM_SESSION_CREATE_RATE:-10}
-      PLATFORM_CHAT_PER_IP_MINUTE: ${PLATFORM_CHAT_PER_IP_MINUTE:-20}
-      PLATFORM_CALLS_PER_IP_HOUR: ${PLATFORM_CALLS_PER_IP_HOUR:-10}
-      PLATFORM_CALL_OPEN_PER_IP_MINUTE: ${PLATFORM_CALL_OPEN_PER_IP_MINUTE:-30}
+      PLATFORM_MAX_TRANSLATION_CONFIGS: ${PLATFORM_MAX_TRANSLATION_CONFIGS:-50}
+      PLATFORM_SESSION_CREATE_RATE: ${PLATFORM_SESSION_CREATE_RATE:-30}
+      PLATFORM_DIAL_PER_ORG_HOUR: ${PLATFORM_DIAL_PER_ORG_HOUR:-30}
+      PLATFORM_CHAT_PER_IP_MINUTE: ${PLATFORM_CHAT_PER_IP_MINUTE:-60}
+      PLATFORM_CALLS_PER_IP_HOUR: ${PLATFORM_CALLS_PER_IP_HOUR:-60}
+      PLATFORM_CALL_OPEN_PER_IP_MINUTE: ${PLATFORM_CALL_OPEN_PER_IP_MINUTE:-60}
       PLATFORM_CALL_INVITE_TTL_SECS: ${PLATFORM_CALL_INVITE_TTL_SECS:-1800}
       PLATFORM_REAPER_INTERVAL_SECS: ${PLATFORM_REAPER_INTERVAL_SECS:-30}
       PLATFORM_STALE_SESSION_SECS: ${PLATFORM_STALE_SESSION_SECS:-900}
-      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
-      PLATFORM_CHAT_LLM_API_KEY: ${PLATFORM_CHAT_LLM_API_KEY:-}
-      PLATFORM_CHAT_LLM_BASE_URL: ${PLATFORM_CHAT_LLM_BASE_URL:-https://generativelanguage.googleapis.com/v1beta/openai}
+      # Optional: outbound SIP dialing (blank trunk id = SIP disabled) and provider alerts.
+      LIVEKIT_SIP_TRUNK_ID: ${LIVEKIT_SIP_TRUNK_ID:-}
+      LIVEKIT_SIP_KRISP: ${LIVEKIT_SIP_KRISP:-0}
+      LIVEKIT_SIP_RINGING_TIMEOUT_S: ${LIVEKIT_SIP_RINGING_TIMEOUT_S:-}
+      PLATFORM_ALERT_WEBHOOK_URL: ${PLATFORM_ALERT_WEBHOOK_URL:-}
+      # Not forwarded on purpose: PLATFORM_AUTO_CREATE_SCHEMA and PLATFORM_ALLOW_PRIVATE_NETWORK
+      # (dev only: Alembic owns the schema; browser-to-localhost opt-in), PLATFORM_TRUST_PROXY
+      # (retired, ignored by the code: trust is FORWARDED_ALLOW_IPS now).
+    # Bound to loopback: only a proxy on this host (or cloudflared in this compose project)
+    # can reach Platform. Never publish it on 0.0.0.0 while FORWARDED_ALLOW_IPS is wide.
     ports: ["127.0.0.1:8000:8000"]
     depends_on:
       postgres: {condition: service_healthy}
       runtime: {condition: service_healthy}
     restart: unless-stopped
+
   runtime:
     build: {context: ., dockerfile: runtime/Dockerfile}
     environment:
@@ -62,19 +113,57 @@ services:
       PORT: "8001"
       RUNTIME_PLATFORM_URL: ${RUNTIME_PLATFORM_URL:-http://platform:8000}
       RUNTIME_PLATFORM_TOKEN: ${RUNTIME_PLATFORM_TOKEN:?Set RUNTIME_PLATFORM_TOKEN}
+      # Speech/LLM providers. Which ones are needed depends on PLATFORM_CALLS_PROVIDERS and
+      # the agents' configured providers; blank keys just mark that provider unavailable.
       ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY:-}
       ELEVENLABS_VOICE_ID: ${ELEVENLABS_VOICE_ID:-}
+      CARTESIA_API_KEY: ${CARTESIA_API_KEY:-}
+      CARTESIA_VOICE_ID: ${CARTESIA_VOICE_ID:-}
+      DEEPGRAM_API_KEY: ${DEEPGRAM_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      OPENAI_HEALTH_MODEL: ${OPENAI_HEALTH_MODEL:-}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_BASE_URL: ${GEMINI_BASE_URL:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-}
+      GEMINI_TRANSLATION_MODEL: ${GEMINI_TRANSLATION_MODEL:-}
       GOOGLE_TRANSLATE_API_KEY: ${GOOGLE_TRANSLATE_API_KEY:-}
+      GOOGLE_TRANSLATE_BASE_URL: ${GOOGLE_TRANSLATE_BASE_URL:-}
+      GOOGLE_TRANSLATE_TIMEOUT_S: ${GOOGLE_TRANSLATE_TIMEOUT_S:-}
+      GOOGLE_TRANSLATE_KEEPALIVE_S: ${GOOGLE_TRANSLATE_KEEPALIVE_S:-}
+      # Session limits and echo guard.
       RUNTIME_MAX_SESSIONS: ${RUNTIME_MAX_SESSIONS:-4}
       RUNTIME_MAX_SESSION_SECS: ${RUNTIME_MAX_SESSION_SECS:-600}
       RUNTIME_IDLE_PROMPT_SECS: ${RUNTIME_IDLE_PROMPT_SECS:-30}
       RUNTIME_IDLE_END_SECS: ${RUNTIME_IDLE_END_SECS:-60}
-      GEMINI_MODEL: ${GEMINI_MODEL:-}
-      GEMINI_TRANSLATION_MODEL: ${GEMINI_TRANSLATION_MODEL:-}
+      RUNTIME_ECHO_GUARD: ${RUNTIME_ECHO_GUARD:-1}
+      RUNTIME_ECHO_GUARD_SECS: ${RUNTIME_ECHO_GUARD_SECS:-10}
+      # Agent HTTP tools may not call private/loopback addresses unless this is 1.
+      RUNTIME_TOOL_ALLOW_PRIVATE: ${RUNTIME_TOOL_ALLOW_PRIVATE:-0}
+      # Fallback transfer destination for SIP calls (blank = none).
+      SIP_TRANSFER_TO: ${SIP_TRANSFER_TO:-}
+      # Not forwarded on purpose: RUNTIME_SESSION_ID/CONVERSATION_ID/AGENT_ID/IDENTITY,
+      # RUNTIME_LIVEKIT_TOKEN and LIVEKIT_ROOM_NAME (set per spawned worker by the API),
+      # RUNTIME_TIMELINE_DIAG (benchmark-only; can put user speech in logs).
     # No host port: Platform reaches Runtime over the private Compose network.
-    stop_grace_period: 35s
+    # Graceful shutdown drains live calls: uvicorn waits up to 40 s (runtime/Dockerfile,
+    # --timeout-graceful-shutdown 40); keep this a few seconds longer so Docker does not SIGKILL.
+    stop_grace_period: 45s
     restart: unless-stopped
+
+  # Optional Cloudflare named tunnel (docker compose --profile tunnel up -d, or
+  # COMPOSE_PROFILES=tunnel). In the Cloudflare dashboard point the public hostname at
+  # http://platform:8000 . Alternative: run cloudflared on the host against http://localhost:8000.
+  cloudflared:
+    profiles: [tunnel]
+    image: cloudflare/cloudflared:2026.11.1
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:-}
+    depends_on:
+      platform: {condition: service_healthy}
+    restart: unless-stopped
+
   livekit:
     profiles: [local-livekit]
     image: livekit/livekit-server:v1.9.0
@@ -84,5 +173,6 @@ services:
     volumes: ["./docker/livekit.yaml:/etc/livekit.yaml:ro"]
     ports: ["7880:7880", "7881:7881", "7882:7882/udp"]
     restart: unless-stopped
+
 volumes:
   postgres-data:

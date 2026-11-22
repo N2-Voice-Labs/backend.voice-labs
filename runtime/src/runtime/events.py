@@ -32,6 +32,30 @@ RuntimeEventType = Literal[
 ]
 EVENT_TYPES: tuple[str, ...] = get_args(RuntimeEventType)
 
+# Delivery classes. Critical events carry state the Platform cannot reconstruct (call start,
+# transcript, tool/outcome/handoff results, terminal state): they are retried for a long
+# budget and, if delivery still fails, the call is ended (a call whose record is lost is
+# worse than a dropped call). Every other type is best-effort telemetry (latency, turn
+# debug, speech/turn timeline, provider diagnostics): it is dropped first under queue
+# pressure and a failed delivery never affects the call. New event types default to
+# best-effort.
+TERMINAL_EVENT_TYPES: frozenset[str] = frozenset(
+    {"SessionEnded", "SessionFailed", "RuntimeFailed"}
+)
+CRITICAL_EVENT_TYPES: frozenset[str] = TERMINAL_EVENT_TYPES | frozenset(
+    {
+        "RuntimeStarted",
+        "TranscriptFinal",
+        "ToolCalled",
+        "HandoffRequested",
+        "OutcomeRecorded",
+    }
+)
+
+
+def is_critical_event(event_type: str) -> bool:
+    return event_type in CRITICAL_EVENT_TYPES
+
 
 class RuntimeEvent(BaseModel):
     event_id: str = Field(default_factory=lambda: str(uuid4()))

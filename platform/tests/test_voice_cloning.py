@@ -340,3 +340,26 @@ def test_provision_retries_voice_stuck_in_processing(monkeypatch) -> None:
         response = provision(client, stale["id"])
         assert response.status_code == 200, response.text
         assert response.json()["status"] == "ready"
+
+
+def test_provision_loses_the_claim_to_a_concurrent_request(monkeypatch) -> None:
+    from src.platform import voices
+
+    calls = install_client(monkeypatch)
+    original = voices._voice_provider
+
+    def other_request_claims_first(db, ctx, record):
+        # The early status check already passed; another request now claims the voice.
+        _set_updated_at(record.id, "processing", timedelta(seconds=1))
+        return original(db, ctx, record)
+
+    monkeypatch.setattr(voices, "_voice_provider", other_request_claims_first)
+    with TestClient(app) as client:
+        voice = make_clone(client)
+        response = provision(client, voice["id"])
+        assert (response.status_code, response.json()) == (
+            409,
+            {"detail": "invalid_voice_status_transition"},
+        )
+        assert client.get(f"/voices/{voice['id']}").json()["status"] == "processing"
+    assert calls == []  # nothing was cloned at the provider by the loser

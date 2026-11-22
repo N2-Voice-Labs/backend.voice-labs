@@ -5,9 +5,9 @@ import json
 from uuid import uuid4
 
 import httpx
-import openai
 import pytest
 
+openai = pytest.importorskip("openai")
 pytest.importorskip("pipecat")
 
 from pipecat.frames.frames import TTSSpeakFrame
@@ -880,6 +880,60 @@ def test_session_restarts_the_pipeline_on_the_cascaded_engine(monkeypatch) -> No
     assert client.of("SessionEnded") == [
         {"outcome": "ended", "reason": "participant_disconnected"}
     ]
+
+
+@pytest.mark.parametrize(
+    "minted, expected",
+    [(True, ["token", "fresh-token"]), (False, ["token", "token"])],
+)
+def test_fallback_restart_remints_only_a_runtime_minted_livekit_token(
+    monkeypatch, minted, expected
+) -> None:
+    """A fallback after the 10-minute token expired must not reconnect with the old one."""
+
+    import pipecat.workers.runner
+
+    session = RuntimeSession(uuid4(), uuid4(), uuid4(), RecordingClient())
+    tokens: list[str] = []
+
+    class Worker:
+        def __init__(self) -> None:
+            self.cancelled: list[str | None] = []
+
+        def cancel(self, *, reason=None) -> None:
+            self.cancelled.append(reason)
+
+    def build(config, _session):
+        tokens.append(config.livekit_token)
+        return FakeTransport(), Worker()
+
+    monkeypatch.setattr(src.runtime.pipeline, "build_livekit_pipeline", build)
+    monkeypatch.setattr(src.runtime.pipeline, "create_runtime_token", lambda room: "fresh-token")
+    runs: list[int] = []
+
+    class Runner:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        async def add_workers(self, worker) -> None:
+            self.worker = worker
+
+        async def run(self) -> None:
+            runs.append(1)
+            if len(runs) == 1:
+                report_provider_failure(
+                    session, "realtime", "openai", "unavailable", fatal=True, allow_fallback=True
+                )
+                for _ in range(100):
+                    if self.worker.cancelled:
+                        break
+                    await asyncio.sleep(0.01)
+
+    monkeypatch.setattr(pipecat.workers.runner, "WorkerRunner", Runner)
+    config = realtime_config(livekit_token_minted=minted)
+    asyncio.run(asyncio.wait_for(session.run_pipeline(config), TIMEOUT))
+
+    assert tokens == expected
 
 
 def test_a_provider_failing_after_the_fallback_ends_the_session(monkeypatch) -> None:

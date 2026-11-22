@@ -159,7 +159,7 @@ def test_platform_event_failure_cancels_the_live_pipeline() -> None:
     assert pipeline_task.cancel_completed is True
 
 
-def test_event_queue_overflow_cancels_the_live_pipeline() -> None:
+def test_critical_event_queue_overflow_cancels_the_live_pipeline() -> None:
     class PipelineTask:
         def __init__(self) -> None:
             self.cancel_reason = None
@@ -177,7 +177,7 @@ def test_event_queue_overflow_cancels_the_live_pipeline() -> None:
         accepted = 0
         try:
             for _ in range(1024):
-                session.enqueue_event(session.event("SpeechStarted"))
+                session.enqueue_event(session.event("TranscriptFinal"))
                 accepted += 1
         except RuntimeError as exc:
             assert str(exc) == "runtime event queue capacity exceeded"
@@ -191,6 +191,28 @@ def test_event_queue_overflow_cancels_the_live_pipeline() -> None:
     assert 0 < accepted < 1024
     assert pipeline_task.cancel_reason == "Runtime event queue capacity exceeded"
     assert pipeline_task.cancel_completed is True
+
+
+def test_event_enqueue_failure_never_stops_the_frame() -> None:
+    """A closed/failed event queue raises RuntimeError; the frame must still go downstream."""
+
+    session = RuntimeSession(uuid4(), uuid4(), uuid4(), RecordingEventClient())
+    session._accepting_events = False  # enqueue_event now raises RuntimeError
+    processor = RuntimeEventProcessor(session)
+    processor.forwarded = []
+    frames = [
+        TranscriptionFrame("hello there", "participant-1", "now", finalized=True),
+        UserStartedSpeakingFrame(),
+        BotStartedSpeakingFrame(),
+    ]
+
+    async def run_frames() -> None:
+        for frame in frames:
+            await process(processor, frame)
+
+    asyncio.run(run_frames())
+
+    assert [frame for frame, _ in processor.forwarded] == frames
 
 
 def test_event_dispatcher_shutdown_bounds_wait_for_cancellation_resistant_client(
