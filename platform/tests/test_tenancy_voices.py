@@ -371,6 +371,50 @@ def test_status_clone_cannot_set_provider_voice_id(client, world):
     assert ready.status_code == 200 and ready.json()["provider_voice_id"] == "pv-ok"
 
 
+@pytest.mark.parametrize("provider_voice_id", ["bad id!", "a" * 129, "é"])
+def test_create_rejects_invalid_provider_voice_id(client, world, provider_voice_id):
+    response = client.post(
+        "/voices",
+        json={
+            "name": "Invalid voice",
+            "tts_provider_id": world["a_provider"],
+            "provider_voice_id": provider_voice_id,
+        },
+        headers=world["a"],
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize("provider_voice_id", ["bad id!", "a" * 129, "é"])
+def test_update_rejects_invalid_provider_voice_id(client, world, provider_voice_id):
+    voice = make_design(client, world["a"])
+    headers = {**SUPER, "X-Organization-Id": world["a_id"]}
+
+    response = client.post(
+        f"/voices/{voice['id']}/status",
+        json={"status": "processing"},
+        headers=headers,
+    )
+    assert response.status_code == 200
+
+    response = client.post(
+        f"/voices/{voice['id']}/status",
+        json={"status": "ready", "provider_voice_id": provider_voice_id},
+        headers=headers,
+    )
+    assert response.status_code == 422
+
+
+def test_valid_provider_voice_id_is_accepted(client, world):
+    voice = make_library(
+        client,
+        world["a"],
+        world["a_provider"],
+        provider_voice_id="abc_DEF-123",
+    )
+    assert voice["provider_voice_id"] == "abc_DEF-123"
+
+
 # ----------------------------------------------------------------------- audit
 
 
