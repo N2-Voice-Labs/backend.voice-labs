@@ -205,10 +205,51 @@ def test_elevenlabs_is_registered_with_honest_capabilities() -> None:
     assert parse_qs(url.query)["model_id"] == ["eleven_flash_v2_5"]
 
 
-@pytest.mark.parametrize("bad", ["../../v1/user", "a/b", "a?b=c", "%2e%2e", "", "a b", "x" * 129])
-def test_factory_rejects_a_voice_id_that_could_alter_the_websocket_path(bad) -> None:
+BAD_VOICE_IDS = ["../../v1/user", "a/b", "a?b=c", "%2e%2e", "", "a b", "x" * 129]
+
+
+@pytest.mark.parametrize("bad", BAD_VOICE_IDS)
+def test_factory_rejects_a_voice_id_that_could_alter_the_websocket_path(bad, monkeypatch) -> None:
+    monkeypatch.delenv("ELEVENLABS_VOICE_ID", raising=False)  # no default to fall back to
     with pytest.raises(RuntimeError, match="invalid elevenlabs voice id"):
         build_tts(make_config(elevenlabs_voice_id=bad), "en")
+
+
+@pytest.mark.parametrize("bad", BAD_VOICE_IDS)
+def test_factory_falls_back_to_the_default_voice_for_an_invalid_voice_id(
+    bad, monkeypatch, caplog
+) -> None:
+    monkeypatch.setenv("ELEVENLABS_VOICE_ID", "stock-voice")
+    with caplog.at_level("WARNING", logger="src.runtime.speech_providers"):
+        service = build_tts(make_config(elevenlabs_voice_id=bad), "en")
+    assert service._settings.voice == "stock-voice"
+    assert urlparse(service._build_websocket_url()).path == (
+        "/v1/text-to-speech/stock-voice/multi-stream-input"
+    )
+    assert any("falling back" in r.getMessage() for r in caplog.records)
+    assert bad not in "".join(r.getMessage() for r in caplog.records) or bad == ""
+
+
+@pytest.mark.parametrize("missing", ["", None])
+def test_factory_falls_back_to_the_default_voice_for_a_missing_voice_id(
+    missing, monkeypatch
+) -> None:
+    monkeypatch.setenv("ELEVENLABS_VOICE_ID", "stock-voice")
+    config = make_config(elevenlabs_voice_id=missing)
+    service = build_tts(config, "en")
+    assert service._settings.voice == "stock-voice"
+
+
+def test_factory_raises_when_the_default_voice_is_invalid_too(monkeypatch) -> None:
+    monkeypatch.setenv("ELEVENLABS_VOICE_ID", "../bad")
+    with pytest.raises(RuntimeError, match="invalid elevenlabs voice id"):
+        build_tts(make_config(elevenlabs_voice_id="a/b"), "en")
+
+
+def test_factory_keeps_a_valid_voice_id_even_when_a_default_exists(monkeypatch) -> None:
+    monkeypatch.setenv("ELEVENLABS_VOICE_ID", "stock-voice")
+    service = build_tts(make_config(elevenlabs_voice_id="cloned-voice"), "en")
+    assert service._settings.voice == "cloned-voice"
 
 
 def test_factory_builds_the_real_service_with_voice_model_language_and_destination() -> None:
@@ -844,12 +885,12 @@ def runtime_api(monkeypatch):
         yield client, calls
 
 
-def test_cloning_an_elevenlabs_voice_is_rejected_without_a_provider_call(runtime_api) -> None:
+def test_cloning_an_unknown_provider_is_rejected_without_a_provider_call(runtime_api) -> None:
     client, calls = runtime_api
     response = client.post(
         "/voices/clone",
         json={
-            "provider": "elevenlabs",
+            "provider": "nope",
             "name": "Anna",
             "language": "en",
             "sample_url": "https://example.com/sample.wav",
@@ -861,9 +902,9 @@ def test_cloning_an_elevenlabs_voice_is_rejected_without_a_provider_call(runtime
     assert calls == []
 
 
-def test_deleting_an_elevenlabs_voice_is_unknown_provider_without_a_provider_call(runtime_api) -> None:
+def test_deleting_an_unknown_provider_voice_makes_no_provider_call(runtime_api) -> None:
     client, calls = runtime_api
-    response = client.delete("/voices/elevenlabs/voice123", headers={"X-Runtime-Token": "token"})
+    response = client.delete("/voices/nope/voice123", headers={"X-Runtime-Token": "token"})
     assert response.status_code == 404
     assert response.json() == {"code": "unknown_provider"}
     assert calls == []

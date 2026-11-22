@@ -31,6 +31,7 @@ MISSING = "00000000-0000-4000-8000-0000000000ff"
 ISOLATION_CASES = [
     ("POST", "/voices"),
     ("POST", "/voices/clone"),
+    ("POST", "/voices/clone/upload"),  # covered in test_voice_clone_upload.py
     ("POST", "/voices/design"),
     ("GET", "/voices"),
     ("GET", "/voices/{voice_id}"),

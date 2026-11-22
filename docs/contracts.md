@@ -101,7 +101,8 @@ return `404` with `<object>_not_found`.
 
 ### Voices
 
-`POST /voices` (library), `POST /voices/clone`, `POST /voices/design`, `GET /voices`
+`POST /voices` (library), `POST /voices/clone`, `POST /voices/clone/upload`,
+`POST /voices/design`, `GET /voices`
 (filters `status`, `source`), `GET /voices/{id}`, `PATCH /voices/{id}` (`name`, `languages`,
 `style`; `null` is rejected), `POST /voices/{id}/status`, `POST /voices/{id}/provision`,
 `POST /voices/{id}/preview`, `DELETE /voices/{id}` (`204`, sets `status=disabled`). Voice
@@ -113,6 +114,7 @@ fields: `id`, `name`, `source` (`library|clone|design`), `status`, `tts_provider
 | --- | --- | --- |
 | `POST /voices` | `name`, `tts_provider_id`, `provider_voice_id` | `ready` |
 | `POST /voices/clone` | `name`, `sample_reference`, `consent` | `pending` |
+| `POST /voices/clone/upload` (multipart) | `name`, `language`, `consent`, `file` | `processing`, then `ready` or `failed` in the same request |
 | `POST /voices/design` | `name`, `design_prompt` (≤2000 chars) | `pending` |
 
 `style` accepts only `energy`, `warmth`, `speed` (floats in `[0, 1]`) and `style` (label,
@@ -169,7 +171,9 @@ Request timeout: 60 seconds. The voice is moved to `processing` before the reque
 Failure reasons (safe to expose):
 - `unsupported_sample_url`: sample URL is not HTTPS
 - `sample_unavailable`: sample host did not resolve, returned HTTP error, is private/loopback, or is too large (>10 MB)
-- `clone_provider_error`: the TTS provider (Cartesia) call failed. Cloning is Cartesia-only; a voice whose provider record is `elevenlabs` fails with `unsupported_tts_provider` (see [ElevenLabs](#elevenlabs-live-tts))
+- `clone_provider_error`: the TTS provider (Cartesia or ElevenLabs) call failed
+- `clone_plan_upgrade_required`: the provider account's plan does not allow voice cloning (ElevenLabs)
+- `invalid_sample`: Runtime rejected the sample audio (uploaded recordings)
 - `tts_not_configured`: provider credentials not set in Runtime
 - `unsupported_tts_provider`: provider name is not supported by Runtime
 - `invalid_runtime_token`: Platform runtime token is invalid
@@ -177,9 +181,90 @@ Failure reasons (safe to expose):
 - `runtime_unreachable`: network error reaching Runtime
 - `runtime_invalid_response`: Runtime response was malformed or had no provider voice ID
 
+The provider sent to Runtime is the `provider` of the voice's `tts_provider_id` record,
+else the `provider` recorded when the voice was created by upload, else `cartesia`. Both
+`cartesia` and `elevenlabs` can clone. `DELETE /voices/{id}` and `/preview` resolve the
+provider the same way, so an ElevenLabs clone is deleted through Runtime
+`DELETE /voices/elevenlabs/{provider_voice_id}`.
+
 **Status:** Implemented and tested with mocks. Not exercised against a real Cartesia
 trunk; sample download and clone upload shape follow
-`https://docs.cartesia.ai/api-reference/voices/clone`.
+`https://docs.cartesia.ai/api-reference/voices/clone`. The ElevenLabs clone/delete requests
+follow `https://elevenlabs.io/docs/api-reference/voices/ivc/create` (field names and response)
+and have not been run against the real API either.
+
+#### Runtime voice-cloning endpoints
+
+All require `X-Runtime-Token` (`401 invalid_runtime_token`). Providers: `cartesia`
+(`CARTESIA_API_KEY`) and `elevenlabs` (`ELEVENLABS_API_KEY`); any other provider is
+`422 unsupported_tts_provider`, an unset key `503 tts_not_configured`.
+
+- `POST /voices/clone` JSON `{provider, name, language (2 lowercase letters), sample_url,
+  description?}`: Runtime downloads the sample (https, public hosts only, ≤10 MiB, `audio/*`
+  or `application/octet-stream`, `User-Agent: VoiceLabs/1.0 (voice sample fetch)`) and clones
+  it. `200 {"provider_voice_id"}`; `422 unsupported_sample_url | sample_unavailable`.
+- `POST /voices/clone-upload` `multipart/form-data`: `provider`, `name` (1-200 chars),
+  `language`, optional `description`, `file` (audio, not stored). `200
+  {"provider_voice_id"}`; `422 invalid_sample` (empty, over 10 MiB, or a content type that is
+  not `audio/*` / `application/octet-stream`; the size is enforced while the body streams in);
+  `422 invalid_request` (not multipart, or a text field missing/out of range).
+- `DELETE /voices/{provider}/{provider_voice_id}`: `204` (a provider 404 counts as deleted);
+  `404 unknown_provider`; `502 {"code": "voice_provider_delete_failed", "retryable"}`.
+- Clone failures are `502 clone_provider_error`, or `502 clone_plan_upgrade_required` when the
+  provider says the plan does not allow cloning (HTTP 402 from either provider, or an
+  ElevenLabs 401/403 whose error code/message names the plan or subscription). Error
+  responses never contain the provider key or the upstream body.
+- ElevenLabs cloning is Instant Voice Cloning: `POST https://api.elevenlabs.io/v1/voices/add`
+  with `xi-api-key`, multipart `name`, optional `description`, `files`; the result is
+  `voice_id`. `language` is accepted but not sent (ElevenLabs voices are multilingual).
+- Live ElevenLabs sessions fall back to `ELEVENLABS_VOICE_ID` (with a warning log) when the
+  session's voice id is missing or not `^[A-Za-z0-9_-]{1,128}$`; the session fails only when
+  that default is unusable too.
+
+#### Recorded-sample cloning (upload)
+
+`POST /voices/clone/upload` (admin) clones a voice from an audio recording sent as
+`multipart/form-data`, for a browser or app that records the sample itself. Platform does
+not store the audio: it validates it, streams it to Runtime `POST /voices/clone-upload`
+(`X-Runtime-Token`; multipart `provider`, `name`, `language`, optional `description`,
+`file`) and keeps only the resulting `provider_voice_id`. The audio is never logged,
+audited or persisted; the voice has `sample_reference: null`.
+
+| Field | Required | Notes |
+| --- | --- | --- |
+| `name` | yes | 1-200 chars |
+| `language` | yes | ISO 639-1 primary subtag (`en`, `ru`, `en-US` is stored as `en`); `422 invalid_voice_language` otherwise |
+| `consent` | yes | one form field holding a JSON string of the same object as `/voices/clone`: `{"confirmed": true, "subject_name", "statement", "method": "self"\|"authorized"}`. Missing, malformed, or `confirmed` not `true` is `422 voice_consent_required` |
+| `file` | yes | audio bytes; content type must be `audio/*`, non-empty, at most 10 MiB (counted while reading, not from `Content-Length`) |
+| `description` | no | forwarded to Runtime only (max 500 chars); not stored |
+| `provider` | no | `cartesia` or `elevenlabs` (`422 unsupported_tts_provider` otherwise) |
+
+Provider rule: an explicit `provider` wins. When omitted, it is the provider of the
+organisation's oldest enabled `tts` provider record whose provider can clone
+(`cartesia`/`elevenlabs`), else `cartesia`. The voice's `tts_provider_id` is set to the
+organisation's oldest enabled `tts` record for the chosen provider, or left `null` when
+there is none (the provider is then kept as `consent.provider` so deletion still reaches
+the right provider).
+
+Flow: validate (consent, language, provider, file) before any row is created and before
+Runtime is called; create the voice (`source=clone`, `status=processing`, consent with
+`recorded_at`); call Runtime with a 90 second timeout; set `ready` and `provider_voice_id`,
+or `failed` and `failure_reason`. Responses: `201` with the `ready` Voice, `422 invalid_sample` (missing/empty/oversized/non-audio file),
+`422 voice_consent_required`, `503 runtime_not_configured` /
+`runtime_auth_not_configured`, and `502 voice_provisioning_failed` when Runtime fails
+(the voice is kept as `failed`; `failure_reason` uses the list above). A failed upload
+voice has no `sample_reference`, so it cannot be re-provisioned: upload again. A request
+that dies mid-flight leaves the voice in `processing`.
+
+#### Agent voice fallback
+
+A session takes the agent's `voice_profile_id` voice's `provider_voice_id` into the runtime
+contract `voice_id`. If that voice died after it was attached (`status` `deleted`,
+`deleting` or `failed`, or `ready` without a `provider_voice_id`) the session still starts:
+`voice_id` is `null` (Runtime's default voice) and Platform logs a warning. A voice that is
+`pending`, `processing` or `disabled`, another organisation's voice, or an unknown id still
+fails with `409 selected_voice_unavailable`, as does an explicitly chosen
+participant voice (`participant.voice_profile_id` on sessions, calls and translations).
 
 #### Voice preview
 
@@ -196,7 +281,7 @@ accepts `provider: "elevenlabs"` (key `ELEVENLABS_API_KEY`, default model `eleve
 PCM from ElevenLabs wrapped in a WAV by Runtime); the Runtime synthesis function was run against
 the real ElevenLabs API on 2026-11-05 (en/ru/ko, audible clips; see
 [ElevenLabs (live TTS)](#elevenlabs-live-tts)); the Platform route is mock-tested. The provider name comes from the voice's `tts_provider_id` record
-(`cartesia` when the voice has none); only `model` and `language` of that record's
+(else the provider recorded at upload, else `cartesia`); only `model` and `language` of that record's
 `configuration` are forwarded. Runtime sends `language_code` to ElevenLabs only for the models
 in a local table (`eleven_flash_v2_5`, `eleven_turbo_v2_5`, `eleven_v3`,
 `eleven_v3_conversational`) and only when the language is listed for that model; it never sends
