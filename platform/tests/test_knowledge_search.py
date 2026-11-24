@@ -163,8 +163,11 @@ def test_search_english_ranking(monkeypatch) -> None:
         assert len(results) >= 2
         assert results[0]["score"] >= results[1]["score"] if len(results) > 1 else True
 
-        # Top result should be from doc1 (has "language" in title and multiple in content)
-        assert results[0]["document_id"] == doc1["id"]
+        # Hybrid retrieval ranks by distinct-term overlap and (when configured) embeddings,
+        # not term frequency, so assert every relevant document is returned, best-first.
+        assert {r["document_id"] for r in results} == {doc1["id"], doc2["id"], doc3["id"]}
+        scores = [r["score"] for r in results]
+        assert scores == sorted(scores, reverse=True)
 
 
 def test_search_russian_support(monkeypatch) -> None:
@@ -346,11 +349,11 @@ def test_search_title_bonus(monkeypatch) -> None:
         )
         results = response.json()["results"]
 
-        # Both should match, but doc_with_title should score higher
-        assert len(results) >= 1
-        # First result should be from doc_with_title (has Python in title)
-        if len(results) > 1:
-            assert results[0]["document_id"] == doc_with_title["id"]
+        # Hybrid retrieval has no separate title bonus: a term in the title or the text counts once, so these
+        # two tie and their order is arbitrary. Assert both are returned, best score first.
+        assert {r["document_id"] for r in results} == {doc_with_title["id"], doc_without_title["id"]}
+        scores = [r["score"] for r in results]
+        assert scores == sorted(scores, reverse=True)
 
 
 def test_search_query_validation(monkeypatch) -> None:
@@ -390,3 +393,29 @@ def test_search_query_validation(monkeypatch) -> None:
             headers={"x-runtime-token": "secret"},
         )
         assert response.status_code == 422
+
+
+def test_voice_search_uses_shared_rag_and_returns_citation_fields(monkeypatch) -> None:
+    """Voice knowledge search goes through rag.retrieve and exposes heading and source for citing."""
+    monkeypatch.setenv("PLATFORM_RUNTIME_TOKEN", "secret")
+    with TestClient(app) as client:
+        agent = client.post("/agents", json={"name": "Search agent"}).json()
+        doc = make_doc(
+            client,
+            title="Tuition",
+            content="## Fees\nThe application fee is 100,000 won.\n\n## Dormitory\nRooms cost 600,000 won.",
+            source="https://example.test/tuition",
+        )
+        client.put(f"/agents/{agent['id']}/knowledge", json={"document_ids": [doc["id"]]})
+        response = client.post(
+            f"/runtime/agents/{agent['id']}/knowledge/search",
+            json={"query": "application fee", "limit": 3},
+            headers={"x-runtime-token": "secret"},
+        )
+        assert response.status_code == 200
+        top = response.json()["results"][0]
+        assert top["document_id"] == doc["id"]
+        assert top["title"] == "Tuition"
+        assert top["source"] == "https://example.test/tuition"
+        assert "application fee" in top["snippet"]
+        assert "heading" in top

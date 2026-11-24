@@ -178,6 +178,7 @@ def test_interruption_then_empty_response_speaks_exactly_one_fallback() -> None:
         LLMTextFrame("partial"),
         SleepFrame(sleep=0.02),
         InterruptionFrame(),
+        SleepFrame(sleep=0.4),  # a genuine later turn, not the cancelled one winding down
         *response(),
     ]
 
@@ -291,3 +292,16 @@ def test_outbound_reports_an_empty_sentence_translation_through_the_hook() -> No
     assert empty == [
         {"text": "Hello there.", "source_language": "en", "target_language": "ru"}
     ]
+
+
+def test_empty_response_right_after_an_interruption_is_not_apologised_for() -> None:
+    # A barge-in cancels the LLM turn; the service then emits an empty Start/End pair. The caller is
+    # already speaking, so the guard stays quiet instead of saying "could you say that again?".
+    empty = []
+    guard = AnswerGuard(language="en", on_empty=empty.append)
+
+    down = run(guard, [InterruptionFrame(), *response()])
+
+    assert speaks(down) == []
+    assert empty == []
+    assert any(isinstance(f, LLMFullResponseEndFrame) for f in down)

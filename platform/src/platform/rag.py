@@ -92,10 +92,11 @@ def _normalise(vector):
 
 
 def embed_texts(texts: list[str]) -> list[list[float]]:
-    key = os.getenv("PLATFORM_CHAT_LLM_API_KEY") or os.getenv("GEMINI_API_KEY")
+    key = os.getenv("PLATFORM_EMBEDDING_API_KEY") or os.getenv("PLATFORM_CHAT_LLM_API_KEY") or os.getenv("GEMINI_API_KEY")
     if not key:
         raise EmbeddingUnavailable("No embedding API key configured")
-    base = os.getenv("PLATFORM_CHAT_LLM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai").rstrip("/")
+    base = (os.getenv("PLATFORM_EMBEDDING_BASE_URL") or os.getenv("PLATFORM_CHAT_LLM_BASE_URL")
+            or "https://generativelanguage.googleapis.com/v1beta/openai").rstrip("/")
     result = []
     try:
         with httpx.Client(timeout=15.0) as client:

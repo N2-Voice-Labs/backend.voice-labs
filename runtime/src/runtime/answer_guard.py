@@ -16,6 +16,7 @@ from __future__ import annotations
 import copy
 import inspect
 import logging
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -39,6 +40,12 @@ _logger = logging.getLogger(__name__)
 MAX_SPOKEN_CHARS = 600
 SENTENCE_BOUNDARIES = frozenset(".!?。！？")
 
+# An empty response that starts within this long after an interruption is the cancelled turn winding
+# down (the LLM service emits its Start/End frames right after the InterruptionFrame), not a real empty
+# answer: the REPEAT line would be spoken over the caller who just barged in (seen live: 3-8 ms after
+# "User started speaking"). A genuine new turn starts after the caller has finished, seconds later.
+INTERRUPTION_GRACE_SECONDS = 0.25
+
 LanguageSource = str | Callable[[], str] | None
 LanguageCallback = Callable[[str], Any]
 TruncatedCallback = Callable[[int], Any]
@@ -60,6 +67,8 @@ class AnswerGuard(FrameProcessor):
         self._max_spoken_chars = max_spoken_chars
         self._on_empty = on_empty
         self._on_truncated = on_truncated
+        self._last_interruption = float("-inf")
+        self._after_interruption = False
         self._reset()
 
     def _reset(self) -> None:
@@ -77,15 +86,24 @@ class AnswerGuard(FrameProcessor):
             await self.push_frame(frame, direction)
             return
         if isinstance(frame, InterruptionFrame):
+            self._last_interruption = time.monotonic()
             self._reset()
             await self.push_frame(frame, direction)
         elif isinstance(frame, LLMFullResponseStartFrame):
             self._reset()
             self._in_response = True
+            self._after_interruption = (
+                time.monotonic() - self._last_interruption < INTERRUPTION_GRACE_SECONDS
+            )
             await self.push_frame(frame, direction)
         elif isinstance(frame, LLMFullResponseEndFrame):
-            if self._in_response and not (self._has_text or self._has_function_call):
+            if (
+                self._in_response
+                and not (self._has_text or self._has_function_call)
+                and not self._after_interruption
+            ):
                 await self._speak_fallback()
+            self._after_interruption = False
             self._reset()
             await self.push_frame(frame, direction)
         elif self._in_response and isinstance(
