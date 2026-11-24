@@ -471,7 +471,7 @@ def test_search_knowledge_calls_platform_with_runtime_token(monkeypatch) -> None
     assert result == {"status": "ok", "data": {"results": [{"title": "FAQ", "snippet": "Open 9-5"}]}}
     assert str(seen[0].url) == f"http://platform.test/runtime/agents/{session.agent_id}/knowledge/search"
     assert seen[0].headers["x-runtime-token"] == "secret-token"
-    assert json.loads(seen[0].content) == {"query": "hours", "limit": 3}
+    assert json.loads(seen[0].content) == {"query": "hours", "limit": 6}
     assert events[0].event_type == "ToolCalled"
     assert events[0].payload == {"tool_name": "search_knowledge", "arguments": {"query": "hours"}, "status": "ok"}
 

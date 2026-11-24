@@ -7,6 +7,7 @@ from typing import Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -235,6 +236,7 @@ class SearchResult(BaseModel):
     source: str
     snippet: str
     score: float
+    heading: str = ""
 
 
 class SearchResponse(BaseModel):
@@ -376,7 +378,7 @@ async def search_agent_knowledge_route(
     """Search through an agent's assigned knowledge documents.
 
     Returns snippets from enabled documents assigned to the agent,
-    ranked by keyword relevance.
+    ranked by hybrid keyword + vector relevance (keyword only when embeddings are unavailable).
     """
     # Runtime callbacks carry no organisation: resolve it from the agent, then require
     # documents to belong to that same organisation (defence against stale cross-org
@@ -388,7 +390,24 @@ async def search_agent_knowledge_route(
         if agent is None:
             raise HTTPException(status_code=404, detail="agent_not_found")
 
-    return {"results": search_agent_knowledge(db, agent.organization_id, str(agent_id), payload.query, payload.limit)}
+    # Same hybrid (keyword + vector) retrieval as chat, so voice and chat answer from one engine.
+    # Embedding calls are blocking HTTP: run off the event loop.
+    from .rag import retrieve
+
+    hits = await run_in_threadpool(retrieve, db, agent.organization_id, str(agent_id), payload.query, payload.limit)
+    return {
+        "results": [
+            {
+                "document_id": hit.document_id,
+                "title": hit.title,
+                "source": hit.url,
+                "heading": hit.heading,
+                "snippet": hit.text[:800],
+                "score": hit.score,
+            }
+            for hit in hits
+        ]
+    }
 
 
 @router.post("/agents/{agent_id}/knowledge/reindex")
