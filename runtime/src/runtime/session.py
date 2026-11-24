@@ -3,6 +3,7 @@
 import asyncio
 import inspect
 import logging
+import os
 import time
 from collections import Counter
 from collections.abc import Callable
@@ -491,6 +492,7 @@ class RuntimeSession:
             if not isinstance(config, PipelineConfig):
                 raise TypeError("config must be a PipelineConfig")
             started = False
+            greeted = False
             self._fallback_config = cascaded_fallback_config(config)
             while True:
                 transport, worker = build_livekit_pipeline(config, self)
@@ -533,6 +535,18 @@ class RuntimeSession:
                         _logger.info("LiveKit participant disconnected; ending voice session")
                         await self.request_end("participant_disconnected")
 
+                async def on_agent_greeting(_transport: object, _participant_id: str) -> None:
+                    # Opt-in: speak one opening line when the caller's microphone first connects,
+                    # so a plain agent call does not start in silence. Off unless the env var is set.
+                    nonlocal greeted
+                    text = os.getenv("RUNTIME_AGENT_GREETING", "").strip()
+                    if greeted or not text:
+                        return
+                    greeted = True
+                    from pipecat.frames.frames import TTSSpeakFrame
+
+                    await worker.queue_frame(TTSSpeakFrame(text))
+
                 transport.add_event_handler("on_connected", on_connected)
                 transport.add_event_handler("on_disconnected", on_disconnected)
                 transport.add_event_handler(
@@ -546,6 +560,12 @@ class RuntimeSession:
                     transport.add_event_handler(
                         "on_audio_track_subscribed", on_participant_present
                     )
+                elif (
+                    config.mode == "agent"
+                    and not getattr(config, "translation", None)
+                    and os.getenv("RUNTIME_AGENT_GREETING", "").strip()
+                ):
+                    transport.add_event_handler("on_audio_track_subscribed", on_agent_greeting)
                 runner = WorkerRunner(handle_sigint=False)
                 await runner.add_workers(worker)
                 await runner.run()
