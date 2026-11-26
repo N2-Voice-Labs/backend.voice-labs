@@ -158,7 +158,7 @@ class CascadedEngine:
         from .glossary import glossary_keyterms
         from .guard_events import translation_empty_hook
         from .interpreter import TranslationProcessor
-        from .language_capabilities import stt_language_for
+        from .language_capabilities import can_auto_detect, stt_language_for
         from .participants import MAX_PARTICIPANTS, translation_destination
 
         config, directory = context.config, context.directory
@@ -211,13 +211,15 @@ class CascadedEngine:
                 )
             )
 
+        stt_provider = config.providers.get("stt", "deepgram")
         if directory is None:
-            # Deepgram "multi" detects the language per utterance; one_way fixes the source.
-            stt_language = stt_language_for(settings.languages, settings.direction)
+            # "multi" detects the language (mixed-language speech included); one_way, or a
+            # pair the STT provider cannot detect, fixes the source.
+            stt_language = stt_language_for(settings.languages, settings.direction, stt_provider)
             if settings.direction == "auto" and stt_language != "multi":
                 _logger.warning(
-                    "languages %s are not all in Deepgram's multi set; "
-                    "transcribing %s only",
+                    "%s cannot auto-detect all of %s; transcribing %s only",
+                    stt_provider,
                     settings.languages,
                     stt_language,
                 )
@@ -229,15 +231,30 @@ class CascadedEngine:
             # language) and turn detection, fed only that participant's audio.
             from .participant_lanes import LaneTurnTagger, ParticipantLaneGate, TTSLaneGate
 
+            # speaker_language="auto": each lane detects the language, so a speaker may mix
+            # both languages in one sentence. When the STT provider cannot detect the pair
+            # (Deepgram "multi" has no Korean, for one) the lane stays in the speaker's
+            # declared language: a fixed language transcribes far better than "multi"
+            # applied to a language it does not know.
+            detect = settings.speaker_language == "auto" and can_auto_detect(
+                settings.languages, stt_provider
+            )
+            if settings.speaker_language == "auto" and not detect:
+                _logger.warning(
+                    "%s cannot auto-detect all of %s; each lane transcribes its "
+                    "speaker's declared language only",
+                    stt_provider,
+                    settings.languages,
+                )
             lanes = []
             for lane in range(MAX_PARTICIPANTS):
                 language = directory.language_for_lane(lane)
-                stt = make_stt("multi" if settings.speaker_language == "auto" else language)
+                stt = make_stt("multi" if detect else language)
                 lanes.append(
                     [
                         ParticipantLaneGate(
                             directory, lane, stt=stt, language=language,
-                            sync_language=settings.speaker_language == "declared",
+                            sync_language=not detect,
                         ),
                         make_vad(),
                         stt,

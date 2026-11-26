@@ -248,7 +248,7 @@ class PipelineConfig:
 
             if mode != "agent":
                 raise RuntimeError("translation is only supported for agent sessions")
-            AgentTranslationSettings.from_mapping(translation)
+            AgentTranslationSettings.from_mapping(translation, providers["stt"])
             translation = dict(translation)
         token_minted = False
         if not values["livekit_token"]:
@@ -410,7 +410,9 @@ def build_livekit_pipeline(config: PipelineConfig, session=None):
     if config.translation:
         from .agent_translation import AgentTranslationSettings
 
-        translation = AgentTranslationSettings.from_mapping(config.translation)
+        translation = AgentTranslationSettings.from_mapping(
+            config.translation, config.providers.get("stt", "deepgram")
+        )
     # "multi" detects the caller's language per utterance; otherwise it is fixed.
     stt_language = translation.stt_language if translation is not None else None
     keyterms = ()

@@ -22,6 +22,7 @@ from .models import ProviderConfig, Voice
 from .tenancy import bypass, get_owned, get_public_agent, get_scoped_db, scoped
 from .validation import (
     AUTO_DIRECTION_LANGUAGES,
+    auto_detect_languages,
     DEFAULT_LATENCY_MODE,
     INTERPRETER_LANGUAGES,
     LATENCY_MODES,
@@ -172,15 +173,16 @@ MAX_CALLER_LANGUAGES = 4
 
 
 def validate_agent_translation(
-    mode: str, translation: dict[str, Any] | None
+    mode: str, translation: dict[str, Any] | None, stt_provider: str | None = None
 ) -> dict[str, Any] | None:
     """Validate an agent's ``translation`` block (TR-040) and return it normalized.
 
     ``{"working_language": code, "caller_languages": [codes]}``: the agent reasons in
     the working language while callers speak 1-4 other languages. Caller languages are
-    detected per utterance only when every caller language and the working language are
-    in Deepgram's code-switching set (``AUTO_DIRECTION_LANGUAGES``); otherwise exactly
-    one (fixed) caller language is allowed. An optional ``glossary`` (NS-08, see
+    detected per utterance only when ``stt_provider`` (the agent's STT provider name; None
+    is Runtime's default, Deepgram) can detect every caller language and the working
+    language (``auto_detect_languages``); otherwise exactly one (fixed) caller language is
+    allowed. An optional ``glossary`` (NS-08, see
     ``validate_glossary``) is normalized and kept.
 
     Raises 422 ``translation_not_allowed_for_interpreter``, ``invalid_translation_config``
@@ -218,9 +220,8 @@ def validate_agent_translation(
         or working in callers
     ):
         raise invalid
-    automatic = working in AUTO_DIRECTION_LANGUAGES and all(
-        code in AUTO_DIRECTION_LANGUAGES for code in callers
-    )
+    detectable = auto_detect_languages(stt_provider)
+    automatic = working in detectable and all(code in detectable for code in callers)
     if not automatic and len(callers) != 1:
         raise invalid
     result: dict[str, Any] = {"working_language": working, "caller_languages": callers}
@@ -406,6 +407,15 @@ def provider_ids_for_agent(
 
     return values
 
+def _stt_provider_name(db: Session, provider_id: Any) -> str | None:
+    """The provider name of an (already validated) STT provider id; None when unset."""
+
+    if provider_id is None:
+        return None
+    provider = db.get(ProviderConfig, str(provider_id))
+    return provider.provider if provider is not None else None
+
+
 @router.post("/agents", response_model=Agent, status_code=status.HTTP_201_CREATED)
 async def create_agent(
     payload: AgentIn,
@@ -420,7 +430,7 @@ async def create_agent(
         ctx=ctx,
     )
     data["translation"] = validate_agent_translation(
-        data["mode"], data.get("translation")
+        data["mode"], data.get("translation"), _stt_provider_name(db, data.get("stt_provider_id"))
     )
     record = AgentRecord(**data, organization_id=ctx.org_id)
     db.add(record)
@@ -473,9 +483,13 @@ async def update_agent(
         raise HTTPException(status_code=422, detail="interpreter_config_required")
     if current_mode == "agent" and current_interpreter is not None:
         raise HTTPException(status_code=422, detail="interpreter_config_not_allowed")
-    if "translation" in changes or "mode" in changes:
+    # The STT provider decides which caller languages can be detected, so a provider
+    # change re-validates the stored translation block too.
+    if "translation" in changes or "mode" in changes or "stt_provider_id" in changes:
         changes["translation"] = validate_agent_translation(
-            current_mode, changes.get("translation", record.translation)
+            current_mode,
+            changes.get("translation", record.translation),
+            _stt_provider_name(db, changes.get("stt_provider_id", record.stt_provider_id)),
         )
 
     for key, value in changes.items():

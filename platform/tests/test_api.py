@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 
 from src.platform.main import app
 from src.platform.models import DEFAULT_ORGANIZATION_ID
+from src.platform.validation import reply_language_reminder
 from src.platform.db import SessionLocal
 from src.platform.models import Message, ProviderConfig, VoiceSession
 
@@ -62,6 +63,11 @@ def test_agent_patch_rejects_null_for_required_name() -> None:
         response = client.patch(f"/agents/{agent['id']}", json={"name": None})
 
         assert response.status_code == 422
+
+
+# Agents default to enabled_languages ["en", "ru"], so a conversational agent's
+# handed-off prompt ends with the reply-language reminder.
+DEFAULT_LANGUAGES_REMINDER = "\n\n" + reply_language_reminder(["en", "ru"])
 
 
 def test_session_creation_hands_off_exact_session_contract(monkeypatch) -> None:
@@ -136,7 +142,7 @@ def test_session_creation_hands_off_exact_session_contract(monkeypatch) -> None:
                 "agent_id": agent["id"],
                 "organization_id": DEFAULT_ORGANIZATION_ID,
                 "room_name": session["room_name"],
-                "system_prompt": "Be concise",
+                "system_prompt": "Be concise" + DEFAULT_LANGUAGES_REMINDER,
                 "voice_id": "voice-7",
                 "mode": "agent",
                 "interpreter": None,
@@ -365,7 +371,7 @@ def test_session_created_without_runtime_configuration_can_handoff_later(
             "agent_id": agent["id"],
             "organization_id": DEFAULT_ORGANIZATION_ID,
             "room_name": session["room_name"],
-            "system_prompt": "Resume this exact contract.",
+            "system_prompt": "Resume this exact contract." + DEFAULT_LANGUAGES_REMINDER,
             "voice_id": "deferred-voice",
             "mode": "agent",
             "interpreter": None,

@@ -39,7 +39,7 @@ from .models import (
     utcnow,
 )
 from .tenancy import get_owned, get_public_agent, get_scoped_db, scoped
-from .validation import validate_e164
+from .validation import reply_language_reminder, validate_e164
 
 _logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -496,6 +496,13 @@ async def open_voice_session(
             + knowledge_text
             if inline_knowledge
             else agent.system_prompt
+        )
+        + (
+            f"\n\n{reminder}"
+            # Interpreters relay speech; only a conversational agent replies itself.
+            if agent.mode == "agent"
+            and (reminder := reply_language_reminder(agent.enabled_languages))
+            else ""
         ),
         "voice_id": runtime_voice_id,
         "mode": agent.mode,

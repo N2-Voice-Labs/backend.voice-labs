@@ -137,3 +137,66 @@ def test_translation_model_provider_setting_reaches_the_runtime_contract() -> No
         session = client.post("/voice/sessions", json={"agent_id": agent["id"]}).json()
         llm = contract_for(session["session_id"])["provider_settings"]["llm"]
         assert llm == {"model": "gpt-4.1", "translation_model": "gpt-4.1-mini"}
+
+
+_created_providers: list[str] = []
+
+
+@pytest.fixture
+def cleanup_providers():
+    """Remove the provider (and agent) rows these tests add: other tests count providers."""
+
+    yield
+    from src.platform.models import Agent as AgentRecord, ProviderConfig
+
+    with SessionLocal() as db:
+        db.query(AgentRecord).filter(AgentRecord.stt_provider_id.in_(_created_providers)).delete(
+            synchronize_session=False
+        )
+        db.query(ProviderConfig).filter(ProviderConfig.id.in_(_created_providers)).delete(
+            synchronize_session=False
+        )
+        db.commit()
+    _created_providers.clear()
+
+
+def _stt_provider(client: TestClient, provider: str) -> str:
+    response = client.post(
+        "/providers",
+        json={"kind": "stt", "provider": provider, "configuration": {}, "enabled": True},
+    )
+    assert response.status_code == 201, response.text
+    _created_providers.append(response.json()["id"])
+    return response.json()["id"]
+
+
+@pytest.mark.usefixtures("cleanup_providers")
+def test_elevenlabs_stt_detects_korean_so_several_caller_languages_are_allowed() -> None:
+    translation = {"working_language": "en", "caller_languages": ["ko", "ru"]}
+    with TestClient(app) as client:
+        response = make_agent(client, translation, stt_provider_id=_stt_provider(client, "elevenlabs"))
+        assert response.status_code == 201, response.text
+        assert response.json()["translation"] == translation
+
+
+@pytest.mark.usefixtures("cleanup_providers")
+def test_switching_to_an_stt_provider_that_cannot_detect_the_callers_is_rejected() -> None:
+    translation = {"working_language": "en", "caller_languages": ["ko", "ru"]}
+    with TestClient(app) as client:
+        created = make_agent(client, translation, stt_provider_id=_stt_provider(client, "elevenlabs"))
+        assert created.status_code == 201, created.text
+        response = client.patch(
+            f"/agents/{created.json()['id']}",
+            json={"stt_provider_id": _stt_provider(client, "deepgram")},
+        )
+        assert response.status_code == 422
+        assert response.json()["detail"] == "invalid_translation_config"
+
+
+def test_reply_language_reminder_only_for_multilingual_agents() -> None:
+    from src.platform.demo import reply_language_reminder
+
+    assert reply_language_reminder(["en"]) == ""
+    assert reply_language_reminder(None) == ""
+    reminder = reply_language_reminder(["en", "ru", "ko"])
+    assert "English, Russian, Korean" in reminder and "otherwise in English" in reminder

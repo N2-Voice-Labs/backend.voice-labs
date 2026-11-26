@@ -44,11 +44,42 @@ INTERPRETER_LANGUAGES = _languages_where(lambda row: row["stt_fixed"] and row["t
 REALTIME_TRANSLATE_OUTPUT_LANGUAGES = _languages_where(lambda row: row["realtime_output"])
 # Deepgram nova-3 ``multi`` (code-switching) set: per-utterance language detection.
 AUTO_DIRECTION_LANGUAGES = _languages_where(lambda row: row["stt_multi"])
+# STT providers whose language detection covers every fixed-STT language (mirrors
+# Runtime's ``language_capabilities.auto_detect_languages``).
+_BROAD_DETECTION_STT_PROVIDERS = frozenset({"elevenlabs"})
+
+
+def auto_detect_languages(stt_provider: str | None = None) -> frozenset[str]:
+    """Languages ``stt_provider`` (None: Runtime's default, Deepgram) can auto-detect."""
+
+    if stt_provider in _BROAD_DETECTION_STT_PROVIDERS:
+        return _languages_where(lambda row: row["stt_fixed"])
+    return AUTO_DIRECTION_LANGUAGES
 # Interpreter latency modes (RM-011); mirrored by Runtime's ``latency_modes``.
 LATENCY_MODES = ("instant", "balanced", "accurate")
 DEFAULT_LATENCY_MODE = "balanced"
 E164_PATTERN = r"^\+[1-9]\d{6,14}$"
 _E164_RE = re.compile(E164_PATTERN)
+
+
+def reply_language_reminder(enabled_languages: list[str] | None) -> str:
+    """Last system line for a multilingual agent: answer in the caller's language.
+
+    The (English) knowledge or sources come after the agent's prompt and pull a small
+    model back into English, so the rule is repeated after them, in text chat and in
+    voice sessions. Agents with one language get nothing.
+    """
+
+    codes = [code for code in enabled_languages or [] if code in LANGUAGE_CAPABILITIES]
+    if len(codes) < 2:
+        return ""
+    names = ", ".join(str(LANGUAGE_CAPABILITIES[code]["name"]) for code in codes)
+    return (
+        "Reply in the language of the user's latest message when it is one of: "
+        f"{names} (even though the sources are in English); otherwise in "
+        f"{LANGUAGE_CAPABILITIES[codes[0]]['name']}. If the message mixes languages, use "
+        "the main one. Keep names, dates, numbers and amounts exactly as the sources write them."
+    )
 
 
 def contains_secret_key(value: Any) -> bool:

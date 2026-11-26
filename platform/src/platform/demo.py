@@ -25,6 +25,7 @@ from .knowledge import agent_knowledge_text, search_agent_knowledge
 from .models import Agent, Conversation, Message, VoiceSession, utcnow
 from .sessions import open_voice_session
 from .tenancy import get_scoped_db, scoped
+from .validation import reply_language_reminder
 
 router = APIRouter(tags=["demo"])
 logger = logging.getLogger(__name__)
@@ -194,6 +195,7 @@ async def chat(key: str, payload: ChatIn, ctx: AuthContext = Depends(public_ctx)
             "Put [n] after every sentence using source n. If sources do not contain the answer, say so and append [HANDOFF]. "
             "Express monetary amounts in won only.\n\nSources:\n" + "\n\n".join(
                 f"[{n}] {hit.title} — {hit.heading}\n{hit.text}" for n, hit in enumerate(hits, 1)))
+    system_parts.append(reply_language_reminder(agent.enabled_languages))
     messages = [{"role": "system", "content": "\n\n".join(p for p in system_parts if p)}]
     messages.extend({"role": row.role, "content": row.content} for row in history)
     try:
