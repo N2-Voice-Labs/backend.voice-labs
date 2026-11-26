@@ -930,3 +930,11 @@ def test_a_reply_cut_off_before_any_audio_hands_its_timing_to_the_next_reply() -
     )
     [queued] = list(tracker._queue)
     assert "vad" in queued.marks and queued.chunks_pushed == 1 and queued.speech_complete
+
+
+def test_elevenlabs_stt_auto_detects_callers_outside_deepgrams_set() -> None:
+    raw = {"working_language": "en", "caller_languages": ["ko", "ru"]}
+    settings = AgentTranslationSettings.from_mapping(raw, "elevenlabs")
+    assert settings.auto and settings.stt_language == "multi"
+    with pytest.raises(RuntimeError, match="automatic language detection"):
+        AgentTranslationSettings.from_mapping(raw)  # Deepgram "multi" has no Korean

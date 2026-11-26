@@ -101,8 +101,10 @@ _logger = logging.getLogger(__name__)
 
 MAX_CALLER_LANGUAGES = 4
 # Mirrors the Platform's AUTO_DIRECTION_LANGUAGES: Deepgram "multi" (code-switching)
-# detects these. Every caller language and the working language must be in the set for
-# per-utterance detection; otherwise the single caller language is fixed.
+# detects these. Every caller language and the working language must be detectable by the
+# session's STT provider (see ``auto_detect_languages``: ElevenLabs detects every
+# transcribable language) for per-utterance detection; otherwise the single caller
+# language is fixed.
 AUTO_DETECTION_LANGUAGES = auto_detect_languages()
 PROCESSOR_NAME = "agent_translation"
 # Small, fast, non-reasoning model for the two translation legs (each adds a round trip
@@ -122,9 +124,13 @@ class AgentTranslationSettings:
     caller_languages: tuple[str, ...]
     # NS-08: required renderings and never-translate terms; see ``glossary``.
     glossary: Glossary = ()
+    # The session's STT provider: it decides which languages can be auto-detected.
+    stt_provider: str = "deepgram"
 
     @classmethod
-    def from_mapping(cls, raw: Mapping[str, Any] | None) -> "AgentTranslationSettings":
+    def from_mapping(
+        cls, raw: Mapping[str, Any] | None, stt_provider: str = "deepgram"
+    ) -> "AgentTranslationSettings":
         if not isinstance(raw, Mapping):
             raise RuntimeError("translation must be an object")
         working = normalize_language(raw.get("working_language"))
@@ -150,6 +156,7 @@ class AgentTranslationSettings:
             working_language=working,
             caller_languages=callers,
             glossary=parse_glossary(raw.get("glossary")),
+            stt_provider=stt_provider,
         )
         if len(callers) > 1 and not settings.auto:
             raise RuntimeError(
@@ -159,11 +166,11 @@ class AgentTranslationSettings:
 
     @property
     def auto(self) -> bool:
-        """Per-utterance language detection (Deepgram ``multi``) is available."""
+        """Per-utterance language detection is available with this STT provider."""
 
+        detectable = auto_detect_languages(self.stt_provider)
         return all(
-            code in AUTO_DETECTION_LANGUAGES
-            for code in (self.working_language, *self.caller_languages)
+            code in detectable for code in (self.working_language, *self.caller_languages)
         )
 
     @property

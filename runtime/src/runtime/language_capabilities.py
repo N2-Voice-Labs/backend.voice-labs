@@ -7,6 +7,9 @@ One row per language code:
   the caller may switch between such languages and still be transcribed. Verified against
   https://developers.deepgram.com/docs/models-languages-overview (nova-3 "Multilingual":
   English, Spanish, French, German, Hindi, Russian, Portuguese, Japanese, Italian, Dutch).
+  With the ``elevenlabs`` STT provider (realtime Scribe, language detection on) every
+  ``stt_fixed`` language can be detected instead, so mixed-language speech is
+  transcribed for pairs Deepgram's set does not cover (e.g. Korean).
 * ``tts``: Cartesia can speak the language.
 * ``realtime_output``: OpenAI ``gpt-realtime-translate`` can speak the language as a
   target (13 output languages; verified 2026-10-18 against the OpenAI realtime
@@ -65,9 +68,20 @@ def _codes(flag: str) -> frozenset[str]:
     return frozenset(code for code, row in CAPABILITIES.items() if row[flag])
 
 
-def auto_detect_languages() -> frozenset[str]:
-    """Languages Deepgram ``multi`` (per-utterance detection) can transcribe."""
+# STT providers whose automatic language detection covers every ``stt_fixed`` language,
+# not only Deepgram's ``multi`` set. ``multi`` is passed to them as "detect the language"
+# (see ``speech_providers._elevenlabs_stt``).
+_BROAD_DETECTION_STT_PROVIDERS = frozenset({"elevenlabs"})
 
+
+def auto_detect_languages(provider: str = "deepgram") -> frozenset[str]:
+    """Languages ``provider`` can transcribe with automatic (mixed-language) detection.
+
+    Deepgram: its ``multi`` (code-switching) set. ElevenLabs: every ``stt_fixed`` language.
+    """
+
+    if provider in _BROAD_DETECTION_STT_PROVIDERS:
+        return _codes("stt_fixed")
     return _codes("stt_multi")
 
 
@@ -85,23 +99,25 @@ def realtime_output_languages() -> frozenset[str]:
     return _codes("realtime_output")
 
 
-def can_auto_detect(langs: Sequence[str]) -> bool:
-    """Whether every language in ``langs`` is in the ``multi`` set."""
+def can_auto_detect(langs: Sequence[str], provider: str = "deepgram") -> bool:
+    """Whether ``provider`` can auto-detect every language in ``langs``."""
 
-    detectable = auto_detect_languages()
+    detectable = auto_detect_languages(provider)
     return bool(langs) and all(code in detectable for code in langs)
 
 
-def stt_language_for(langs: Sequence[str], direction: str | None) -> str:
-    """The Deepgram language to request: ``"multi"`` or the fixed source language.
+def stt_language_for(
+    langs: Sequence[str], direction: str | None, provider: str = "deepgram"
+) -> str:
+    """The STT language to request: ``"multi"`` (detect) or the fixed source language.
 
-    ``multi`` is chosen only for ``direction == "auto"`` and when every language in
-    ``langs`` supports it; otherwise the first language (the source) is used.
+    ``multi`` is chosen only for ``direction == "auto"`` and when ``provider`` can detect
+    every language in ``langs``; otherwise the first language (the source) is used.
     """
 
     if not langs:
         raise ValueError("at least one language is required")
-    if direction == "auto" and can_auto_detect(langs):
+    if direction == "auto" and can_auto_detect(langs, provider):
         return "multi"
     return langs[0]
 

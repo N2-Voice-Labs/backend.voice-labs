@@ -114,6 +114,28 @@ def test_cascaded_engine_requests_multi_only_when_every_language_supports_it(
     assert build(["en", "ru"], "auto") == ["multi"]
     with caplog.at_level(logging.WARNING, logger="src.runtime.translation_engine"):
         assert build(["ko", "en"], "auto") == ["ko"]
-    assert "not all in Deepgram's multi set" in caplog.text
+    assert "deepgram cannot auto-detect all of ('ko', 'en')" in caplog.text
     assert build(["ko", "en"], "one_way") == ["ko"]
     assert build(["en", "ru"], "one_way") == ["en"]
+
+
+@pytest.mark.parametrize(
+    ("langs", "direction", "expected"),
+    [
+        (("ko", "en"), "auto", "multi"),
+        (("zh", "pl"), "auto", "multi"),
+        (("ko", "en"), "one_way", "ko"),
+        (("id", "en"), "auto", "id"),  # no STT for Indonesian at all
+    ],
+)
+def test_stt_language_for_elevenlabs_detects_every_transcribable_language(
+    langs, direction, expected
+) -> None:
+    assert stt_language_for(langs, direction, "elevenlabs") == expected
+
+
+def test_auto_detection_set_depends_on_the_provider() -> None:
+    assert auto_detect_languages("deepgram") == auto_detect_languages()
+    assert "ko" not in auto_detect_languages("deepgram")
+    assert {"ko", "zh", "tr", "pl"} <= auto_detect_languages("elevenlabs")
+    assert can_auto_detect(["en", "ko"], "elevenlabs")

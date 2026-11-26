@@ -1132,3 +1132,97 @@ def test_passthrough_timeline_tracks_tts_without_translation_marks():
     assert timeline.listener == BOB and timeline.destination == "translation-lane-1"
     assert set(timeline.marks) == {"tts_request"}
     assert all(e["turn_id"] == 7 for e in session.of("TranscriptFinal"))
+
+
+# -- mixed-language speech (code-switching within one sentence) -----------------------
+
+
+def test_mostly_listener_language_with_mixed_in_phrase_is_translated_not_passed_through():
+    directory = directory_with((ALICE, spec("en")), (BOB, spec("ru")), pair=("en", "ru"))
+    calls = []
+    processor = translator_with(directory, calls=calls, speaker_language="auto", route=True)
+    text = "Здравствуйте, мне нужна справка для dormitory"  # 30 Cyrillic, 9 Latin letters
+    down, _ = run(processor, turn(text, ALICE, "ru"))
+    assert len(calls) == 1
+    system = calls[0][0]["content"]
+    assert "mostly in Russian (ru)" in system and "switch languages mid-sentence" in system
+    assert [f.text for f in down if isinstance(f, TTSSpeakFrame)] == ["T:" + text]
+
+
+def test_a_brand_name_does_not_stop_passthrough():
+    directory = directory_with((ALICE, spec("en")), (BOB, spec("ru")), pair=("en", "ru"))
+    calls = []
+    processor = translator_with(directory, calls=calls, speaker_language="auto", route=True)
+    text = "Здравствуйте, я работаю в Google уже давно"  # 6 of 34 letters Latin
+    down, _ = run(processor, turn(text, ALICE, "ru"))
+    assert calls == []
+    assert [f.text for f in down if isinstance(f, TTSSpeakFrame)] == [text]
+
+
+def test_same_script_mix_reported_by_the_stt_is_translated():
+    from unittest.mock import AsyncMock
+    from src.runtime.interpreter import _Utterance
+
+    directory = directory_with((ALICE, spec("es")), (BOB, spec("en")), pair=("es", "en"))
+    calls = []
+    processor = translator_with(directory, calls=calls, speaker_language="auto", route=True)
+    processor.push_frame = AsyncMock()
+    utterance = _Utterance(
+        "I need the form para mañana por favor", "en", ALICE, "now",
+        language_shares={"en": 0.55, "es": 0.45},
+    )
+    asyncio.run(processor.process_utterance(utterance))
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("text,language,shares,expected", [
+    ("Hello there", "en", None, 0.0),
+    ("Привет", "en", None, 1.0),
+    ("Hi Привет", "ru", None, 2 / 8),
+    ("안녕하세요 hello", "ko", None, 0.5),
+    ("Hola amigo", "en", {"en": 0.7, "es": 0.3}, 0.3),
+    ("12345", "ru", None, 0.0),
+])
+def test_foreign_share(text, language, shares, expected):
+    from src.runtime.interpreter import foreign_share
+    assert foreign_share(text, language, shares) == pytest.approx(expected)
+
+
+def test_flushed_utterance_carries_language_shares():
+    directory = directory_with((ALICE, spec("en")), (BOB, spec("ru")), pair=("en", "ru"))
+    processor = translator_with(directory, speaker_language="auto")
+    seen = []
+    processor.enqueue_utterance = seen.append
+    started, stopped = UserStartedSpeakingFrame(), UserStoppedSpeakingFrame()
+    started.metadata["user_id"] = stopped.metadata["user_id"] = ALICE
+    run(processor, [
+        started, SleepFrame(sleep=0.02),
+        segment("abcdef", ALICE, language="en"), segment("абв", ALICE, language="ru"),
+        SleepFrame(sleep=0.02), stopped, SleepFrame(sleep=0.06),
+    ])
+    assert len(seen) == 1
+    assert seen[0].language == "en"
+    assert seen[0].language_shares == pytest.approx({"en": 6 / 9, "ru": 3 / 9})
+
+
+@pytest.mark.parametrize("provider", ["deepgram", "elevenlabs"])
+def test_builder_auto_lanes_detect_korean_only_with_a_provider_that_can(light_models, monkeypatch, provider):
+    monkeypatch.setenv("LIVEKIT_API_KEY", "key")
+    monkeypatch.setenv("LIVEKIT_API_SECRET", "secret")
+    config = pipeline_config(
+        mode="interpreter", interpreter={"languages": ["ko", "en"], "speaker_language": "auto"},
+        participants={ALICE: spec("ko")},
+        providers={"stt": provider, "llm": "openai", "tts": "cartesia"},
+        elevenlabs_api_key="test-key",
+    )
+    _, worker = build_livekit_pipeline(config)
+    from src.runtime.participants import normalize_language
+    for index, lane in enumerate(top_level(worker)[1].processors):
+        stt = next(p for p in lane._processors if type(p).__name__ in {"DeepgramSTTService", "VoiceLabsElevenLabsSTTService"})
+        gate = next(p for p in lane._processors if isinstance(p, ParticipantLaneGate))
+        if provider == "elevenlabs":
+            assert stt._settings.language is None and stt._include_language_detection
+            assert not gate._sync_declared_language
+        else:  # Deepgram "multi" has no Korean: each lane keeps its declared language
+            assert normalize_language(stt._settings.language) == ("ko", "en")[index]
+            assert gate._sync_declared_language
