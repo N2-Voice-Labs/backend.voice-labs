@@ -497,7 +497,13 @@ async def open_voice_session(
             if inline_knowledge
             else agent.system_prompt
         )
-        + (f"\n\n{reminder}" if (reminder := reply_language_reminder(agent.enabled_languages)) else ""),
+        + (
+            f"\n\n{reminder}"
+            # Interpreters relay speech; only a conversational agent replies itself.
+            if agent.mode == "agent"
+            and (reminder := reply_language_reminder(agent.enabled_languages))
+            else ""
+        ),
         "voice_id": runtime_voice_id,
         "mode": agent.mode,
         "interpreter": agent.interpreter,

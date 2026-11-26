@@ -63,7 +63,7 @@ _E164_RE = re.compile(E164_PATTERN)
 
 
 def reply_language_reminder(enabled_languages: list[str] | None) -> str:
-    """Last system line for a multilingual agent: answer in the student's language.
+    """Last system line for a multilingual agent: answer in the caller's language.
 
     The (English) knowledge or sources come after the agent's prompt and pull a small
     model back into English, so the rule is repeated after them, in text chat and in
@@ -75,7 +75,7 @@ def reply_language_reminder(enabled_languages: list[str] | None) -> str:
         return ""
     names = ", ".join(str(LANGUAGE_CAPABILITIES[code]["name"]) for code in codes)
     return (
-        "Reply in the language of the student's latest message when it is one of: "
+        "Reply in the language of the user's latest message when it is one of: "
         f"{names} (even though the sources are in English); otherwise in "
         f"{LANGUAGE_CAPABILITIES[codes[0]]['name']}. If the message mixes languages, use "
         "the main one. Keep names, dates, numbers and amounts exactly as the sources write them."
