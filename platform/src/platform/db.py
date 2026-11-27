@@ -14,6 +14,11 @@ engine_options: dict[str, Any] = (
     if DATABASE_URL.startswith("sqlite")
     else {}
 )
+if DATABASE_URL.startswith("postgresql"):
+    # Handlers use a synchronous Session inside async routes, so a row-lock wait blocks the whole
+    # event loop. Fail the waiting statement instead of hanging the Platform indefinitely.
+    lock_timeout = os.getenv("PLATFORM_DB_LOCK_TIMEOUT", "15s")
+    engine_options["connect_args"] = {"options": f"-c lock_timeout={lock_timeout}"}
 if DATABASE_URL in {"sqlite://", "sqlite:///:memory:"}:
     engine_options["poolclass"] = StaticPool
 engine = create_engine(DATABASE_URL, **engine_options)
