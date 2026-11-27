@@ -1,0 +1,34 @@
+# UNAI frontends on the AWS server. nginx on the host proxies the sslip.io names to these ports.
+# Compose project name: unai-frontends (deploy.sh passes -p). NEXT_PUBLIC_* are baked in at build.
+services:
+  # frontend main: marketing site, /inha portal, workspace. Deployed automatically.
+  site:
+    build:
+      context: /opt/unai/frontend
+      dockerfile: /opt/unai/backend/deploy/aws/Dockerfile.next
+      args:
+        NEXT_PUBLIC_PLATFORM_URL: https://api.13-55-24-212.sslip.io
+        NEXT_PUBLIC_SITE_URL: https://site.13-55-24-212.sslip.io
+        NEXT_PUBLIC_APP_URL: https://portal.13-55-24-212.sslip.io
+        NEXT_PUBLIC_PORTAL_URL: https://portal.13-55-24-212.sslip.io
+        NEXT_PUBLIC_PORTAL_AGENT_KEY: inha-admissions
+        NEXT_PUBLIC_DEMO_TOKEN_ENDPOINT: /api/demo/session
+        NEXT_PUBLIC_STAFF_LANGUAGE: ko
+    # PLATFORM_URL, PLATFORM_API_KEY, DEMO_AGENTS, WORKSPACE_PASSWORD (server only, mode 600)
+    env_file: [/opt/unai/site.env]
+    restart: unless-stopped
+    ports: ["127.0.0.1:3001:3000"]
+
+  # Legacy portal from the archived frontend.voice-labs repo (the portal now lives at
+  # site/inha). Kept running for existing links; never rebuilt by deploy.sh.
+  portal:
+    build:
+      context: /opt/unai/frontend.voice-labs
+      dockerfile: /opt/unai/backend/deploy/aws/Dockerfile.next
+      args:
+        NEXT_PUBLIC_PLATFORM_URL: https://api.13-55-24-212.sslip.io
+        NEXT_PUBLIC_SITE_URL: https://portal.13-55-24-212.sslip.io
+        NEXT_PUBLIC_PORTAL_AGENT_KEY: inha-admissions
+        NEXT_PUBLIC_STAFF_LANGUAGE: ko
+    restart: unless-stopped
+    ports: ["127.0.0.1:3000:3000"]
