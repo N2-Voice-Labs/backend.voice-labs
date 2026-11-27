@@ -78,6 +78,11 @@ async def create(payload: HandoffIn, request: Request, _limit: None = Depends(ca
     from .translations import TranslationIn, interpreter_config
     from .sessions import ParticipantIn
     interpreter_config(TranslationIn(languages=call_input.languages, creator=ParticipantIn(language=payload.language)))
+    # Release the FOR UPDATE row lock before ending the AI session. Ending it makes the Runtime post
+    # events back to /runtime/events, whose (synchronous) update of this same row would wait on the
+    # lock and block the event loop, so this request could never commit: the whole Platform hung
+    # (2026-11-27). A second concurrent handoff still fails on the unique from_session_id below.
+    db.commit()
     await end_session(db, ctx, payload.session_id)
     result = await calls.create_call(call_input, request, ctx, None, db)
     invite = await calls.create_invite(UUID(result["session_id"]), ctx, db)
